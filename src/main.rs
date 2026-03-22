@@ -972,6 +972,7 @@ async fn handle_client(
     state: Arc<ServerState>,
 ) {
     println!("Client connected: {addr}");
+    let _ = stream.set_nodelay(true);
     let client_id = state.input.allocate_client_id();
 
     let startup_prefs = match read_client_startup_prefs(&mut stream).await {
@@ -1160,6 +1161,7 @@ async fn handle_client(
     // Hold TCP open — read control messages from client
     let mut buf = [0u8; 64];
     let mut cursor_versions = CursorVersionCursor::default();
+    let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     loop {
         let mut cursor_write_failed = false;
         for message in state.input.cursor_messages(client_id, &mut cursor_versions) {
@@ -1191,6 +1193,22 @@ async fn handle_client(
                             );
                         }
                         ControlMessage::TransportFeedback(feedback) => {
+                            if (feedback.dropped_frames > 0
+                                || (feedback.lost_packets > 0 && feedback.completed_frames == 0))
+                                && last_transport_recovery_keyframe.elapsed()
+                                    >= Duration::from_millis(250)
+                            {
+                                sub.video_bc.request_keyframe();
+                                last_transport_recovery_keyframe = Instant::now();
+                                if trace_enabled() {
+                                    eprintln!(
+                                        "[trace][server] requested recovery keyframe from transport feedback: lost_packets={} dropped_frames={} completed_frames={}",
+                                        feedback.lost_packets,
+                                        feedback.dropped_frames,
+                                        feedback.completed_frames
+                                    );
+                                }
+                            }
                             let next_kbps = bitrate_controller.apply_feedback(feedback);
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                         }

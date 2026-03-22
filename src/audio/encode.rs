@@ -27,6 +27,14 @@ struct OpusEncoder {
 
 unsafe impl Send for OpusEncoder {}
 
+fn expected_audio_packet_loss_pct() -> u32 {
+    std::env::var("ST_AUDIO_PACKET_LOSS_PCT")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(5)
+        .min(100)
+}
+
 impl OpusEncoder {
     fn new(config: &AudioConfig) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
@@ -68,6 +76,23 @@ impl OpusEncoder {
             let vbr_key = std::ffi::CString::new("vbr").unwrap();
             let vbr_off = std::ffi::CString::new("off").unwrap();
             ffi::av_opt_set((*ctx).priv_data, vbr_key.as_ptr(), vbr_off.as_ptr(), 0);
+
+            let expected_loss = expected_audio_packet_loss_pct();
+            if expected_loss > 0 {
+                let packet_loss_key = std::ffi::CString::new("packet_loss").unwrap();
+                let packet_loss_value =
+                    std::ffi::CString::new(expected_loss.to_string()).unwrap();
+                ffi::av_opt_set(
+                    (*ctx).priv_data,
+                    packet_loss_key.as_ptr(),
+                    packet_loss_value.as_ptr(),
+                    0,
+                );
+
+                let fec_key = std::ffi::CString::new("fec").unwrap();
+                let fec_on = std::ffi::CString::new("1").unwrap();
+                ffi::av_opt_set((*ctx).priv_data, fec_key.as_ptr(), fec_on.as_ptr(), 0);
+            }
         }
 
         let ret = unsafe { ffi::avcodec_open2(ctx, codec, ptr::null_mut()) };
@@ -99,11 +124,17 @@ impl OpusEncoder {
         }
 
         println!(
-            "[audio] Opus encoder initialized: {}ch, {}Hz, {}kbps, frame={}",
+            "[audio] Opus encoder initialized: {}ch, {}Hz, {}kbps, frame={}, fec={} packet_loss={}%",
             config.channels,
             config.sample_rate,
             config.bitrate / 1000,
-            samples_per_frame
+            samples_per_frame,
+            if expected_audio_packet_loss_pct() > 0 {
+                "on"
+            } else {
+                "off"
+            },
+            expected_audio_packet_loss_pct()
         );
 
         Ok(Self {
