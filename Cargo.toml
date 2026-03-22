@@ -1,0 +1,28 @@
+[package]
+name = "st-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+st-protocol = { path = "../protocol" }
+crossbeam-channel = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "1.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ffmpeg-next = "8.1"
+ffmpeg-sys-next = "8.1"
+nvfbc = "0.2.0"
+pipewire = "0.9"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zvariant = "5"
+futures-lite = "2"
+drm = "0.14"
+drm-fourcc = "2.2"
+nix = { version = "0.29", features = ["ioctl", "fs", "mman"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+libc = "0.2"
