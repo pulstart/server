@@ -1,6 +1,7 @@
 use crate::server_control::{ConnectedClientSnapshot, ServerControl, UpdateStateSnapshot};
 use crate::updater;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::thread;
 use std::time::Duration;
 

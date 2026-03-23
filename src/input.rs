@@ -31,6 +31,7 @@ fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
 }
 
+#[cfg(target_os = "linux")]
 fn resize_rgba_premultiplied_nearest(
     src: &[u8],
     src_width: u16,
@@ -55,6 +56,7 @@ fn resize_rgba_premultiplied_nearest(
     out
 }
 
+#[cfg(target_os = "linux")]
 fn fit_cursor_shape_to_payload_budget(mut shape: CursorShape) -> (CursorShape, bool) {
     if shape.rgba.len() <= MAX_CURSOR_SHAPE_RGBA_BYTES {
         return (shape, false);
@@ -215,11 +217,12 @@ impl InputRuntime {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn control_active(&self) -> bool {
         self.inner.lock().unwrap().controller_id.is_some()
     }
 
-    pub fn refresh_backend(&self, capture_backend: &str, stream_width: u32, stream_height: u32) {
+    pub fn refresh_backend(&self, capture_backend: &str, _stream_width: u32, _stream_height: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.release_all_inputs();
         inner.controller_id = None;
@@ -232,7 +235,7 @@ impl InputRuntime {
 
         #[cfg(target_os = "linux")]
         {
-            let next = select_linux_backend(capture_backend, stream_width, stream_height);
+            let next = select_linux_backend(capture_backend, _stream_width, _stream_height);
             match next {
                 Ok((backend, capabilities, label)) => {
                     println!("[input] {label} input enabled for {capture_backend}");
@@ -411,9 +414,6 @@ impl InputRuntime {
             }
         }
     }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn update_cursor(&self, _cursor: Option<&()>) {}
 
     pub fn cursor_messages(
         &self,
@@ -1418,8 +1418,6 @@ const KCG_EVENT_MOUSE_MOVED: u32 = 5;
 const KCG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
 #[cfg(target_os = "macos")]
 const KCG_EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
-#[cfg(target_os = "macos")]
-const KCG_EVENT_SCROLL_WHEEL: u32 = 22;
 #[cfg(target_os = "macos")]
 const KCG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
 #[cfg(target_os = "macos")]

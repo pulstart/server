@@ -41,7 +41,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const UDP_PORT: u16 = 5000;
+const DEFAULT_APP_PORT: u16 = 28_480;
 const VIDEO_SUBSCRIBER_CAPACITY: usize = 120;
 static TRACE_ENCODE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -312,6 +312,7 @@ struct ServerState {
     pending_pipeline_stop: Mutex<Option<std::thread::JoinHandle<()>>>,
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
+    listen_port: u16,
 }
 
 #[cfg(target_os = "linux")]
@@ -900,7 +901,23 @@ fn client_media_port(display: Option<ClientDisplayInfo>) -> u16 {
     display
         .map(|info| info.udp_port)
         .filter(|port| *port != 0)
-        .unwrap_or(UDP_PORT)
+        .unwrap_or(DEFAULT_APP_PORT)
+}
+
+fn configured_listen_port() -> u16 {
+    match std::env::var("ST_PORT") {
+        Ok(value) => match value.parse::<u16>() {
+            Ok(port) if port != 0 => port,
+            _ => {
+                eprintln!(
+                    "[config] Invalid ST_PORT='{}', falling back to {}",
+                    value, DEFAULT_APP_PORT
+                );
+                DEFAULT_APP_PORT
+            }
+        },
+        Err(_) => DEFAULT_APP_PORT,
+    }
 }
 
 async fn read_client_startup_prefs(
@@ -1426,13 +1443,14 @@ fn get_screen_resolution() -> Option<(u32, u32)> {
 // ---------------------------------------------------------------------------
 
 async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
-    let listener = TcpListener::bind("0.0.0.0:8080")
+    let listen_addr = format!("0.0.0.0:{}", state.listen_port);
+    let listener = TcpListener::bind(&listen_addr)
         .await
-        .map_err(|err| format!("Failed to bind TCP listener on 0.0.0.0:8080: {err}"))?;
+        .map_err(|err| format!("Failed to bind TCP listener on {listen_addr}: {err}"))?;
 
-    println!("Server started. Waiting for clients on 0.0.0.0:8080...");
+    println!("Server started. Waiting for clients on {listen_addr}...");
     println!(
-        "  Overrides: ST_CODEC, ST_HDR, ST_BITRATE, ST_MIN_BITRATE, ST_MAX_BITRATE, ST_FPS, ST_GOP, ST_AUDIO, ST_CAPTURE"
+        "  Overrides: ST_PORT, ST_CODEC, ST_HDR, ST_BITRATE, ST_MIN_BITRATE, ST_MAX_BITRATE, ST_FPS, ST_GOP, ST_AUDIO, ST_CAPTURE"
     );
 
     while !state.control.shutdown_requested() {
@@ -1460,14 +1478,15 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
     Ok(())
 }
 
-fn build_server_state(control: Arc<ServerControl>) -> Arc<ServerState> {
+fn build_server_state(control: Arc<ServerControl>, listen_port: u16) -> Arc<ServerState> {
     let input = InputRuntime::new();
-    input.spawn_listener(UDP_PORT);
+    input.spawn_listener(listen_port);
     Arc::new(ServerState {
         pipeline: Mutex::new(None),
         pending_pipeline_stop: Mutex::new(None),
         input,
         control,
+        listen_port,
     })
 }
 
@@ -1506,8 +1525,9 @@ fn main() {
     #[cfg(target_os = "linux")]
     probe_backends();
 
+    let listen_port = configured_listen_port();
     let control = ServerControl::new();
-    let state = build_server_state(Arc::clone(&control));
+    let state = build_server_state(Arc::clone(&control), listen_port);
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if tray::should_run_tray() {

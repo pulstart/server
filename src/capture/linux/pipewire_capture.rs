@@ -18,6 +18,23 @@ const PIPEWIRE_CURSOR_META_SIZE: i32 = (std::mem::size_of::<pw::spa::sys::spa_me
     + std::mem::size_of::<pw::spa::sys::spa_meta_bitmap>()
     + 256 * 256 * 4) as i32;
 
+fn spa_meta_cursor_is_valid_local(cursor: *const pw::spa::sys::spa_meta_cursor) -> bool {
+    if cursor.is_null() {
+        return false;
+    }
+    let cursor = unsafe { &*cursor };
+    cursor.id != 0
+}
+
+fn spa_meta_bitmap_is_valid_local(bitmap: *const pw::spa::sys::spa_meta_bitmap) -> bool {
+    if bitmap.is_null() {
+        return false;
+    }
+    let bitmap = unsafe { &*bitmap };
+    let bitmap_header_size = std::mem::size_of::<pw::spa::sys::spa_meta_bitmap>() as u32;
+    bitmap.format != 0 && (bitmap.offset == 0 || bitmap.offset >= bitmap_header_size)
+}
+
 fn copy_dmabuf_bgrx_frame(
     fd: BorrowedFd<'_>,
     offset: u32,
@@ -248,7 +265,7 @@ fn extract_cursor(
     if cursor_ptr.is_null() {
         return cache.current_cursor();
     }
-    if !unsafe { pw::spa::sys::spa_meta_cursor_is_valid(cursor_ptr.cast_const()) } {
+    if !spa_meta_cursor_is_valid_local(cursor_ptr.cast_const()) {
         return cache.current_cursor();
     }
 
@@ -259,7 +276,7 @@ fn extract_cursor(
             (cursor_ptr as *const u8).add(cursor.bitmap_offset as usize)
                 as *const pw::spa::sys::spa_meta_bitmap
         };
-        if !bitmap_ptr.is_null() && unsafe { pw::spa::sys::spa_meta_bitmap_is_valid(bitmap_ptr) } {
+        if spa_meta_bitmap_is_valid_local(bitmap_ptr) {
             let bitmap = unsafe { &*bitmap_ptr };
             if bitmap.offset == 0 {
                 cache.x = cursor.position.x - cache.hotspot_x as i32;
