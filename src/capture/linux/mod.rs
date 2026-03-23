@@ -21,6 +21,10 @@ mod pipewire_capture;
 pub mod wl_capture;
 pub mod x11_capture;
 
+pub(crate) use pipewire_capture::{
+    active_remote_desktop_session, RemoteDesktopPortalSession,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisplayServer {
     X11,

@@ -4,6 +4,8 @@ use st_protocol::{
     MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
 };
 #[cfg(target_os = "linux")]
+use crate::capture::linux::{active_remote_desktop_session, RemoteDesktopPortalSession};
+#[cfg(target_os = "linux")]
 use std::fs::{File, OpenOptions};
 #[cfg(target_os = "linux")]
 use std::io::Write;
@@ -117,6 +119,8 @@ enum InputBackend {
     X11(X11InputController),
     #[cfg(target_os = "linux")]
     Uinput(UinputMouseController),
+    #[cfg(target_os = "linux")]
+    PortalRemoteDesktop(Arc<RemoteDesktopPortalSession>),
     #[cfg(target_os = "macos")]
     Macos(MacosMouseController),
 }
@@ -204,6 +208,8 @@ impl InputRuntime {
             InputBackend::X11(_) => ControllerState::Available,
             #[cfg(target_os = "linux")]
             InputBackend::Uinput(_) => ControllerState::Available,
+            #[cfg(target_os = "linux")]
+            InputBackend::PortalRemoteDesktop(_) => ControllerState::Available,
             #[cfg(target_os = "macos")]
             InputBackend::Macos(_) => ControllerState::Available,
         }
@@ -213,7 +219,7 @@ impl InputRuntime {
         self.inner.lock().unwrap().controller_id.is_some()
     }
 
-    pub fn refresh_backend(&self, capture_backend: &str) {
+    pub fn refresh_backend(&self, capture_backend: &str, stream_width: u32, stream_height: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.release_all_inputs();
         inner.controller_id = None;
@@ -226,7 +232,7 @@ impl InputRuntime {
 
         #[cfg(target_os = "linux")]
         {
-            let next = select_linux_backend(capture_backend);
+            let next = select_linux_backend(capture_backend, stream_width, stream_height);
             match next {
                 Ok((backend, capabilities, label)) => {
                     println!("[input] {label} input enabled for {capture_backend}");
@@ -559,6 +565,12 @@ impl InputRuntimeInner {
                     InputBackend::X11(controller) => controller.button(button, pressed),
                     #[cfg(target_os = "linux")]
                     InputBackend::Uinput(controller) => controller.button(button, pressed),
+                    #[cfg(target_os = "linux")]
+                    InputBackend::PortalRemoteDesktop(controller) => {
+                        if let Some(code) = linux_button_code(button) {
+                            let _ = controller.notify_pointer_button(code, pressed);
+                        }
+                    }
                     #[cfg(target_os = "macos")]
                     InputBackend::Macos(controller) => controller.button(button, pressed),
                 }
@@ -574,6 +586,10 @@ impl InputRuntimeInner {
             InputBackend::X11(controller) => controller.move_absolute(x, y),
             #[cfg(target_os = "linux")]
             InputBackend::Uinput(controller) => controller.move_absolute(x, y),
+            #[cfg(target_os = "linux")]
+            InputBackend::PortalRemoteDesktop(controller) => {
+                let _ = controller.notify_pointer_motion_absolute(x, y);
+            }
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.move_absolute(x, y),
         }
@@ -586,6 +602,10 @@ impl InputRuntimeInner {
             InputBackend::X11(controller) => controller.move_relative(dx, dy),
             #[cfg(target_os = "linux")]
             InputBackend::Uinput(controller) => controller.move_relative(dx, dy),
+            #[cfg(target_os = "linux")]
+            InputBackend::PortalRemoteDesktop(controller) => {
+                let _ = controller.notify_pointer_motion_relative(dx, dy);
+            }
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.move_relative(dx, dy),
         }
@@ -598,6 +618,10 @@ impl InputRuntimeInner {
             InputBackend::X11(controller) => controller.scroll(delta_x, delta_y),
             #[cfg(target_os = "linux")]
             InputBackend::Uinput(controller) => controller.scroll(delta_x, delta_y),
+            #[cfg(target_os = "linux")]
+            InputBackend::PortalRemoteDesktop(controller) => {
+                let _ = controller.notify_pointer_axis_discrete(delta_x, delta_y);
+            }
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.scroll(delta_x, delta_y),
         }
@@ -621,6 +645,12 @@ impl InputRuntimeInner {
                 InputBackend::X11(controller) => controller.key(key, now_pressed),
                 #[cfg(target_os = "linux")]
                 InputBackend::Uinput(controller) => controller.key(key, now_pressed),
+                #[cfg(target_os = "linux")]
+                InputBackend::PortalRemoteDesktop(controller) => {
+                    if let Some(code) = linux_key_code(key) {
+                        let _ = controller.notify_keyboard_keycode(code, now_pressed);
+                    }
+                }
                 #[cfg(target_os = "macos")]
                 InputBackend::Macos(controller) => controller.key(key, now_pressed),
             }
@@ -654,6 +684,8 @@ fn bgra_to_rgba_premultiplied(src: &[u8]) -> Vec<u8> {
 #[cfg(target_os = "linux")]
 fn select_linux_backend(
     capture_backend: &str,
+    stream_width: u32,
+    stream_height: u32,
 ) -> Result<(InputBackend, InputCapabilities, &'static str), String> {
     match capture_backend {
         "x11" => match X11InputController::new() {
@@ -723,19 +755,36 @@ fn select_linux_backend(
                 "uinput(rel)",
             )
         }),
-        "pipewire" => UinputMouseController::new().map(|controller| {
-            (
-                InputBackend::Uinput(controller),
-                InputCapabilities {
-                    mouse_absolute: false,
-                    mouse_relative: true,
-                    keyboard: true,
-                    separate_cursor: true,
-                    hover_capture: false,
-                },
-                "uinput(rel)",
-            )
-        }),
+        "pipewire" => {
+            if let Some(session) = active_remote_desktop_session() {
+                session.set_logical_size(stream_width, stream_height);
+                Ok((
+                    InputBackend::PortalRemoteDesktop(session),
+                    InputCapabilities {
+                        mouse_absolute: true,
+                        mouse_relative: true,
+                        keyboard: true,
+                        separate_cursor: true,
+                        hover_capture: true,
+                    },
+                    "portal/remote-desktop",
+                ))
+            } else {
+                UinputMouseController::new().map(|controller| {
+                    (
+                        InputBackend::Uinput(controller),
+                        InputCapabilities {
+                            mouse_absolute: false,
+                            mouse_relative: true,
+                            keyboard: true,
+                            separate_cursor: true,
+                            hover_capture: false,
+                        },
+                        "uinput(rel)",
+                    )
+                })
+            }
+        }
         "kms" => UinputMouseController::new().map(|controller| {
             (
                 InputBackend::Uinput(controller),

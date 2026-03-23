@@ -442,7 +442,11 @@ fn run_shared_pipeline(
     };
 
     let capture_backend_name = capture_backend.backend_name().to_string();
-    input.refresh_backend(&capture_backend_name);
+    input.refresh_backend(
+        &capture_backend_name,
+        stream_config.width,
+        stream_config.height,
+    );
     let session_debug = SessionDebugInfo {
         encoder_name: encoder_name(&encoder).to_string(),
         capture_backend: capture_backend_name,

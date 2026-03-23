@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::thread;
 
@@ -370,6 +370,513 @@ struct PortalSession {
     _runtime: tokio::runtime::Runtime,
 }
 
+enum EitherPortalSession {
+    ScreenCast(PortalSession),
+    RemoteDesktop {
+        session: Arc<RemoteDesktopPortalSession>,
+        pw_fd: OwnedFd,
+        node_id: u32,
+    },
+}
+
+struct PortalStreamInfo {
+    node_id: u32,
+    logical_width: f64,
+    logical_height: f64,
+}
+
+struct RemoteDesktopPortalState {
+    runtime: tokio::runtime::Runtime,
+    connection: zbus::Connection,
+}
+
+pub(crate) struct RemoteDesktopPortalSession {
+    state: Mutex<RemoteDesktopPortalState>,
+    session_path: String,
+    stream_node_id: u32,
+    logical_width: Mutex<f64>,
+    logical_height: Mutex<f64>,
+}
+
+impl RemoteDesktopPortalSession {
+    fn new(
+        runtime: tokio::runtime::Runtime,
+        connection: zbus::Connection,
+        session_path: String,
+        stream_info: PortalStreamInfo,
+    ) -> Self {
+        Self {
+            state: Mutex::new(RemoteDesktopPortalState { runtime, connection }),
+            session_path,
+            stream_node_id: stream_info.node_id,
+            logical_width: Mutex::new(stream_info.logical_width),
+            logical_height: Mutex::new(stream_info.logical_height),
+        }
+    }
+
+    pub(crate) fn set_logical_size(&self, width: u32, height: u32) {
+        if width > 0 {
+            *self.logical_width.lock().unwrap() = width as f64;
+        }
+        if height > 0 {
+            *self.logical_height.lock().unwrap() = height as f64;
+        }
+    }
+
+    fn with_remote_desktop_proxy<R>(
+        &self,
+        f: impl FnOnce(
+            &tokio::runtime::Runtime,
+            &zbus::Connection,
+            &str,
+        ) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let state = self.state.lock().unwrap();
+        f(&state.runtime, &state.connection, &self.session_path)
+    }
+
+    pub(crate) fn notify_pointer_motion_absolute(&self, x: u16, y: u16) -> Result<(), String> {
+        let width = (*self.logical_width.lock().unwrap()).max(1.0);
+        let height = (*self.logical_height.lock().unwrap()).max(1.0);
+        let abs_x = (x as f64 / 65535.0) * (width - 1.0).max(0.0);
+        let abs_y = (y as f64 / 65535.0) * (height - 1.0).max(0.0);
+        self.with_remote_desktop_proxy(|runtime, connection, session_path| {
+            runtime.block_on(async {
+                let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+                    .destination("org.freedesktop.portal.Desktop")
+                    .map_err(|e| format!("portal dest: {e}"))?
+                    .path("/org/freedesktop/portal/desktop")
+                    .map_err(|e| format!("portal path: {e}"))?
+                    .interface("org.freedesktop.portal.RemoteDesktop")
+                    .map_err(|e| format!("portal iface: {e}"))?
+                    .build()
+                    .await
+                    .map_err(|e| format!("portal proxy: {e}"))?;
+                let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
+                let session = zvariant::ObjectPath::try_from(session_path)
+                    .map_err(|e| format!("session path: {e}"))?;
+                let _: () = proxy
+                    .call(
+                        "NotifyPointerMotionAbsolute",
+                        &(&session, opts, self.stream_node_id, abs_x, abs_y),
+                    )
+                    .await
+                    .map_err(|e| format!("NotifyPointerMotionAbsolute: {e}"))?;
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn notify_pointer_motion_relative(&self, dx: i16, dy: i16) -> Result<(), String> {
+        self.with_remote_desktop_proxy(|runtime, connection, session_path| {
+            runtime.block_on(async {
+                let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+                    .destination("org.freedesktop.portal.Desktop")
+                    .map_err(|e| format!("portal dest: {e}"))?
+                    .path("/org/freedesktop/portal/desktop")
+                    .map_err(|e| format!("portal path: {e}"))?
+                    .interface("org.freedesktop.portal.RemoteDesktop")
+                    .map_err(|e| format!("portal iface: {e}"))?
+                    .build()
+                    .await
+                    .map_err(|e| format!("portal proxy: {e}"))?;
+                let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
+                let session = zvariant::ObjectPath::try_from(session_path)
+                    .map_err(|e| format!("session path: {e}"))?;
+                let _: () = proxy
+                    .call(
+                        "NotifyPointerMotion",
+                        &(&session, opts, dx as f64, dy as f64),
+                    )
+                    .await
+                    .map_err(|e| format!("NotifyPointerMotion: {e}"))?;
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn notify_pointer_button(&self, button: u16, pressed: bool) -> Result<(), String> {
+        self.with_remote_desktop_proxy(|runtime, connection, session_path| {
+            runtime.block_on(async {
+                let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+                    .destination("org.freedesktop.portal.Desktop")
+                    .map_err(|e| format!("portal dest: {e}"))?
+                    .path("/org/freedesktop/portal/desktop")
+                    .map_err(|e| format!("portal path: {e}"))?
+                    .interface("org.freedesktop.portal.RemoteDesktop")
+                    .map_err(|e| format!("portal iface: {e}"))?
+                    .build()
+                    .await
+                    .map_err(|e| format!("portal proxy: {e}"))?;
+                let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
+                let session = zvariant::ObjectPath::try_from(session_path)
+                    .map_err(|e| format!("session path: {e}"))?;
+                let _: () = proxy
+                    .call(
+                        "NotifyPointerButton",
+                        &(&session, opts, button as i32, if pressed { 1u32 } else { 0u32 }),
+                    )
+                    .await
+                    .map_err(|e| format!("NotifyPointerButton: {e}"))?;
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn notify_pointer_axis_discrete(
+        &self,
+        delta_x: i16,
+        delta_y: i16,
+    ) -> Result<(), String> {
+        self.with_remote_desktop_proxy(|runtime, connection, session_path| {
+            runtime.block_on(async {
+                let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+                    .destination("org.freedesktop.portal.Desktop")
+                    .map_err(|e| format!("portal dest: {e}"))?
+                    .path("/org/freedesktop/portal/desktop")
+                    .map_err(|e| format!("portal path: {e}"))?
+                    .interface("org.freedesktop.portal.RemoteDesktop")
+                    .map_err(|e| format!("portal iface: {e}"))?
+                    .build()
+                    .await
+                    .map_err(|e| format!("portal proxy: {e}"))?;
+                let session = zvariant::ObjectPath::try_from(session_path)
+                    .map_err(|e| format!("session path: {e}"))?;
+                let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
+                if delta_y != 0 {
+                    let _: () = proxy
+                        .call(
+                            "NotifyPointerAxisDiscrete",
+                            &(&session, opts.clone(), 0u32, delta_y as i32),
+                        )
+                        .await
+                        .map_err(|e| format!("NotifyPointerAxisDiscrete(vertical): {e}"))?;
+                }
+                if delta_x != 0 {
+                    let _: () = proxy
+                        .call(
+                            "NotifyPointerAxisDiscrete",
+                            &(&session, opts, 1u32, delta_x as i32),
+                        )
+                        .await
+                        .map_err(|e| format!("NotifyPointerAxisDiscrete(horizontal): {e}"))?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn notify_keyboard_keycode(
+        &self,
+        keycode: u16,
+        pressed: bool,
+    ) -> Result<(), String> {
+        self.with_remote_desktop_proxy(|runtime, connection, session_path| {
+            runtime.block_on(async {
+                let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+                    .destination("org.freedesktop.portal.Desktop")
+                    .map_err(|e| format!("portal dest: {e}"))?
+                    .path("/org/freedesktop/portal/desktop")
+                    .map_err(|e| format!("portal path: {e}"))?
+                    .interface("org.freedesktop.portal.RemoteDesktop")
+                    .map_err(|e| format!("portal iface: {e}"))?
+                    .build()
+                    .await
+                    .map_err(|e| format!("portal proxy: {e}"))?;
+                let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
+                let session = zvariant::ObjectPath::try_from(session_path)
+                    .map_err(|e| format!("session path: {e}"))?;
+                let _: () = proxy
+                    .call(
+                        "NotifyKeyboardKeycode",
+                        &(&session, opts, keycode as i32, if pressed { 1u32 } else { 0u32 }),
+                    )
+                    .await
+                    .map_err(|e| format!("NotifyKeyboardKeycode: {e}"))?;
+                Ok(())
+            })
+        })
+    }
+}
+
+static ACTIVE_REMOTE_DESKTOP_SESSION: OnceLock<Mutex<Option<Arc<RemoteDesktopPortalSession>>>> =
+    OnceLock::new();
+
+fn active_remote_desktop_slot() -> &'static Mutex<Option<Arc<RemoteDesktopPortalSession>>> {
+    ACTIVE_REMOTE_DESKTOP_SESSION.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn active_remote_desktop_session() -> Option<Arc<RemoteDesktopPortalSession>> {
+    active_remote_desktop_slot().lock().unwrap().clone()
+}
+
+fn set_active_remote_desktop_session(session: Arc<RemoteDesktopPortalSession>) {
+    *active_remote_desktop_slot().lock().unwrap() = Some(session);
+}
+
+fn clear_active_remote_desktop_session(session: &Arc<RemoteDesktopPortalSession>) {
+    let mut slot = active_remote_desktop_slot().lock().unwrap();
+    if slot
+        .as_ref()
+        .map(|active| Arc::ptr_eq(active, session))
+        .unwrap_or(false)
+    {
+        *slot = None;
+    }
+}
+
+fn request_remote_desktop_screencast(
+) -> Result<(Arc<RemoteDesktopPortalSession>, OwnedFd, u32), String> {
+    let restore_token = load_restore_token();
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+
+    let (conn, session_path, pw_fd, stream_info) = rt.block_on(async {
+        use futures_lite::StreamExt;
+        use std::collections::HashMap;
+        use zvariant::{ObjectPath, OwnedObjectPath, Value};
+
+        let conn = zbus::Connection::session()
+            .await
+            .map_err(|e| format!("D-Bus session bus: {e}"))?;
+
+        let unique_name = conn
+            .unique_name()
+            .ok_or("D-Bus connection has no unique name")?
+            .as_str()
+            .trim_start_matches(':')
+            .replace('.', "_");
+
+        let mut token_counter: u32 = 0;
+        let mut next_token = || -> String {
+            token_counter += 1;
+            format!("st{token_counter}")
+        };
+
+        let remote_desktop = zbus::proxy::Builder::<zbus::Proxy>::new(&conn)
+            .destination("org.freedesktop.portal.Desktop")
+            .map_err(|e| format!("proxy dest: {e}"))?
+            .path("/org/freedesktop/portal/desktop")
+            .map_err(|e| format!("proxy path: {e}"))?
+            .interface("org.freedesktop.portal.RemoteDesktop")
+            .map_err(|e| format!("proxy iface: {e}"))?
+            .build()
+            .await
+            .map_err(|e| format!("remote desktop proxy: {e}"))?;
+        let screen_cast = zbus::proxy::Builder::<zbus::Proxy>::new(&conn)
+            .destination("org.freedesktop.portal.Desktop")
+            .map_err(|e| format!("proxy dest: {e}"))?
+            .path("/org/freedesktop/portal/desktop")
+            .map_err(|e| format!("proxy path: {e}"))?
+            .interface("org.freedesktop.portal.ScreenCast")
+            .map_err(|e| format!("proxy iface: {e}"))?
+            .build()
+            .await
+            .map_err(|e| format!("screen cast proxy: {e}"))?;
+
+        let session_token = next_token();
+        let request_token = next_token();
+        let request_path =
+            format!("/org/freedesktop/portal/desktop/request/{unique_name}/{request_token}");
+        let request_proxy = zbus::proxy::Builder::<zbus::Proxy>::new(&conn)
+            .destination("org.freedesktop.portal.Desktop")
+            .map_err(|e| format!("req proxy: {e}"))?
+            .path(request_path.as_str())
+            .map_err(|e| format!("req path: {e}"))?
+            .interface("org.freedesktop.portal.Request")
+            .map_err(|e| format!("req iface: {e}"))?
+            .build()
+            .await
+            .map_err(|e| format!("req proxy build: {e}"))?;
+        let mut response_stream = request_proxy
+            .receive_signal("Response")
+            .await
+            .map_err(|e| format!("subscribe CreateSession Response: {e}"))?;
+
+        let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
+        opts.insert("handle_token", Value::from(request_token.as_str()));
+        opts.insert("session_handle_token", Value::from(session_token.as_str()));
+        let _reply: OwnedObjectPath = remote_desktop
+            .call("CreateSession", &(opts,))
+            .await
+            .map_err(|e| format!("CreateSession call: {e}"))?;
+
+        let signal = response_stream
+            .next()
+            .await
+            .ok_or("CreateSession: Response stream ended")?;
+        let (code, results) = parse_response(&signal)?;
+        if code != 0 {
+            return Err(format!("CreateSession denied (code {code})"));
+        }
+        drop(response_stream);
+        drop(request_proxy);
+
+        let session_path = results
+            .get("session_handle")
+            .and_then(|v| try_extract_string(v))
+            .unwrap_or_else(|| {
+                format!("/org/freedesktop/portal/desktop/session/{unique_name}/{session_token}")
+            });
+        let session_obj = ObjectPath::try_from(session_path.as_str())
+            .map_err(|e| format!("session path: {e}"))?;
+
+        let request_token = next_token();
+        let request_path =
+            format!("/org/freedesktop/portal/desktop/request/{unique_name}/{request_token}");
+        let request_proxy = zbus::proxy::Builder::<zbus::Proxy>::new(&conn)
+            .destination("org.freedesktop.portal.Desktop")
+            .map_err(|e| format!("req proxy: {e}"))?
+            .path(request_path.as_str())
+            .map_err(|e| format!("req path: {e}"))?
+            .interface("org.freedesktop.portal.Request")
+            .map_err(|e| format!("req iface: {e}"))?
+            .build()
+            .await
+            .map_err(|e| format!("req proxy build: {e}"))?;
+        let mut response_stream = request_proxy
+            .receive_signal("Response")
+            .await
+            .map_err(|e| format!("subscribe SelectDevices Response: {e}"))?;
+
+        let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
+        opts.insert("handle_token", Value::from(request_token.as_str()));
+        opts.insert("types", Value::U32(0b11));
+        opts.insert("persist_mode", Value::U32(2));
+        if let Some(ref token) = restore_token {
+            opts.insert("restore_token", Value::from(token.as_str()));
+        }
+        let _reply: OwnedObjectPath = remote_desktop
+            .call("SelectDevices", &(&session_obj, opts))
+            .await
+            .map_err(|e| format!("SelectDevices call: {e}"))?;
+
+        let signal = response_stream
+            .next()
+            .await
+            .ok_or("SelectDevices: Response stream ended")?;
+        let (code, _) = parse_response(&signal)?;
+        if code != 0 {
+            return Err(format!("SelectDevices denied (code {code})"));
+        }
+        drop(response_stream);
+        drop(request_proxy);
+
+        let request_token = next_token();
+        let request_path =
+            format!("/org/freedesktop/portal/desktop/request/{unique_name}/{request_token}");
+        let request_proxy = zbus::proxy::Builder::<zbus::Proxy>::new(&conn)
+            .destination("org.freedesktop.portal.Desktop")
+            .map_err(|e| format!("req proxy: {e}"))?
+            .path(request_path.as_str())
+            .map_err(|e| format!("req path: {e}"))?
+            .interface("org.freedesktop.portal.Request")
+            .map_err(|e| format!("req iface: {e}"))?
+            .build()
+            .await
+            .map_err(|e| format!("req proxy build: {e}"))?;
+        let mut response_stream = request_proxy
+            .receive_signal("Response")
+            .await
+            .map_err(|e| format!("subscribe SelectSources Response: {e}"))?;
+
+        let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
+        opts.insert("handle_token", Value::from(request_token.as_str()));
+        opts.insert("types", Value::U32(1));
+        opts.insert("cursor_mode", Value::U32(4));
+        opts.insert("multiple", Value::Bool(false));
+        let _reply: OwnedObjectPath = screen_cast
+            .call("SelectSources", &(&session_obj, opts))
+            .await
+            .map_err(|e| format!("SelectSources call: {e}"))?;
+
+        let signal = response_stream
+            .next()
+            .await
+            .ok_or("SelectSources: Response stream ended")?;
+        let (code, _) = parse_response(&signal)?;
+        if code != 0 {
+            return Err(format!("SelectSources denied (code {code})"));
+        }
+        drop(response_stream);
+        drop(request_proxy);
+
+        let request_token = next_token();
+        let request_path =
+            format!("/org/freedesktop/portal/desktop/request/{unique_name}/{request_token}");
+        let request_proxy = zbus::proxy::Builder::<zbus::Proxy>::new(&conn)
+            .destination("org.freedesktop.portal.Desktop")
+            .map_err(|e| format!("req proxy: {e}"))?
+            .path(request_path.as_str())
+            .map_err(|e| format!("req path: {e}"))?
+            .interface("org.freedesktop.portal.Request")
+            .map_err(|e| format!("req iface: {e}"))?
+            .build()
+            .await
+            .map_err(|e| format!("req proxy build: {e}"))?;
+        let mut response_stream = request_proxy
+            .receive_signal("Response")
+            .await
+            .map_err(|e| format!("subscribe Start Response: {e}"))?;
+
+        let opts: HashMap<&str, Value<'_>> =
+            [("handle_token", Value::from(request_token.as_str()))]
+                .into_iter()
+                .collect();
+        let _reply: OwnedObjectPath = remote_desktop
+            .call("Start", &(&session_obj, "", opts))
+            .await
+            .map_err(|e| format!("Start call: {e}"))?;
+
+        let signal = response_stream
+            .next()
+            .await
+            .ok_or("Start: Response stream ended")?;
+        let (code, start_results) = parse_response(&signal)?;
+        if code != 0 {
+            return Err(format!("Start denied (code {code})"));
+        }
+        drop(response_stream);
+        drop(request_proxy);
+
+        if let Some(token) = start_results
+            .get("restore_token")
+            .and_then(|v| try_extract_string(v))
+        {
+            save_restore_token(&token);
+        }
+
+        let stream_info = start_results
+            .get("streams")
+            .ok_or_else(|| "No streams in Start response".to_string())
+            .and_then(extract_first_stream_info)?;
+
+        let empty_opts: HashMap<&str, Value<'_>> = HashMap::new();
+        let reply = screen_cast
+            .call_method("OpenPipeWireRemote", &(&session_obj, empty_opts))
+            .await
+            .map_err(|e| format!("OpenPipeWireRemote: {e}"))?;
+        let pw_fd: OwnedFd = reply
+            .body()
+            .deserialize::<zvariant::OwnedFd>()
+            .map_err(|e| format!("OpenPipeWireRemote fd: {e}"))?
+            .into();
+
+        Ok((conn, session_path, pw_fd, stream_info))
+    })?;
+
+    let session = Arc::new(RemoteDesktopPortalSession::new(
+        rt,
+        conn,
+        session_path,
+        PortalStreamInfo {
+            node_id: stream_info.node_id,
+            logical_width: stream_info.logical_width,
+            logical_height: stream_info.logical_height,
+        },
+    ));
+    Ok((session, pw_fd, stream_info.node_id))
+}
+
 /// Call the xdg-desktop-portal ScreenCast API using raw zbus D-Bus calls.
 /// Properly handles restore_token (ashpd 0.13 has a bug where it's never deserialized).
 ///
@@ -637,24 +1144,38 @@ fn try_extract_string(v: &zvariant::OwnedValue) -> Option<String> {
     None
 }
 
-/// Extract the first stream's PipeWire node ID from the streams value.
-fn extract_first_stream_node_id(streams_val: &zvariant::OwnedValue) -> Result<u32, String> {
-    use zvariant::Value;
+fn extract_first_stream_info(
+    streams_val: &zvariant::OwnedValue,
+) -> Result<PortalStreamInfo, String> {
+    let value = zvariant::Value::try_from(streams_val).map_err(|e| format!("streams value: {e}"))?;
+    let streams: Vec<(u32, std::collections::HashMap<String, zvariant::OwnedValue>)> =
+        value
+            .try_into()
+            .map_err(|e| format!("streams value: {e}"))?;
 
-    let val = Value::try_from(streams_val).map_err(|e| format!("streams value: {e}"))?;
-
-    if let Value::Array(arr) = val {
-        for item in arr.iter() {
-            if let Value::Structure(s) = item {
-                let fields = s.fields();
-                if let Some(Value::U32(node_id)) = fields.first() {
-                    return Ok(*node_id);
+    for (node_id, props) in streams {
+        let mut logical_width = 0.0;
+        let mut logical_height = 0.0;
+        if let Some(size) = props.get("size") {
+            if let Ok(value) = zvariant::Value::try_from(size) {
+                if let Ok((width, height)) = <(i32, i32)>::try_from(value) {
+                    logical_width = width.max(0) as f64;
+                    logical_height = height.max(0) as f64;
                 }
             }
         }
+        return Ok(PortalStreamInfo {
+            node_id,
+            logical_width,
+            logical_height,
+        });
     }
 
-    Err("Could not extract PipeWire node ID from streams".into())
+    Err("Could not extract PipeWire stream info from streams".into())
+}
+
+fn extract_first_stream_node_id(streams_val: &zvariant::OwnedValue) -> Result<u32, String> {
+    Ok(extract_first_stream_info(streams_val)?.node_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -668,23 +1189,48 @@ impl CaptureBackend for PipeWireCapture {
         }
 
         println!("[capture] Requesting screen share via xdg-desktop-portal...");
-        let session = request_screencast()?;
+        let remote_desktop = match request_remote_desktop_screencast() {
+            Ok((session, pw_fd, node_id)) => {
+                println!("[capture] RemoteDesktop portal input enabled");
+                Some((session, pw_fd, node_id))
+            }
+            Err(err) => {
+                eprintln!(
+                    "[capture] RemoteDesktop portal input unavailable ({err}), falling back to screencast-only portal session"
+                );
+                None
+            }
+        };
+        let session = if let Some((remote_session, pw_fd, node_id)) = remote_desktop {
+            set_active_remote_desktop_session(Arc::clone(&remote_session));
+            EitherPortalSession::RemoteDesktop {
+                session: remote_session,
+                pw_fd,
+                node_id,
+            }
+        } else {
+            EitherPortalSession::ScreenCast(request_screencast()?)
+        };
 
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
         let (quit_tx, quit_rx) = pw::channel::channel();
 
         let handle = thread::spawn(move || {
-            // Move the entire PortalSession into this thread to keep the D-Bus
-            // connection alive for the duration of the PipeWire stream.
-            let _session_keepalive = session._runtime;
-            if let Err(e) =
-                run_pipewire_stream(session.pw_fd, session.node_id, tx, running, quit_rx)
-            {
+            let (pw_fd, node_id, remote_session) = match session {
+                EitherPortalSession::ScreenCast(session) => (session.pw_fd, session.node_id, None),
+                EitherPortalSession::RemoteDesktop {
+                    session,
+                    pw_fd,
+                    node_id,
+                } => (pw_fd, node_id, Some(session)),
+            };
+            if let Err(e) = run_pipewire_stream(pw_fd, node_id, tx, running, quit_rx) {
                 eprintln!("[capture] PipeWire stream error: {e}");
             }
-            // _session_keepalive is dropped here, closing the D-Bus connection
-            // and the portal session.
+            if let Some(session) = remote_session.as_ref() {
+                clear_active_remote_desktop_session(session);
+            }
         });
 
         self.quit_tx = Some(quit_tx);
@@ -700,6 +1246,7 @@ impl CaptureBackend for PipeWireCapture {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        *active_remote_desktop_slot().lock().unwrap() = None;
     }
 }
 
