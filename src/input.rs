@@ -252,7 +252,7 @@ impl InputRuntime {
                     inner.backend = InputBackend::Macos(controller);
                     inner.backend_label = "macos/quartz".to_string();
                     inner.capabilities = InputCapabilities {
-                        mouse_absolute: false,
+                        mouse_absolute: true,
                         mouse_relative: true,
                         keyboard: true,
                         separate_cursor: false,

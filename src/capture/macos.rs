@@ -69,6 +69,7 @@ impl CaptureBackend for PlatformCapture {
             .with_width(1920)
             .with_height(1080)
             .with_pixel_format(screencapturekit::prelude::PixelFormat::BGRA)
+            .with_shows_cursor(false)
             .with_minimum_frame_interval(&CMTime::new(1, target_fps() as i32));
 
         let mut stream = SCStream::new_with_delegate(
