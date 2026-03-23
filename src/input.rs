@@ -256,6 +256,7 @@ impl InputRuntime {
                         mouse_relative: true,
                         keyboard: true,
                         separate_cursor: false,
+                        hover_capture: true,
                     };
                 }
                 Err(err) => {
@@ -663,6 +664,7 @@ fn select_linux_backend(
                     mouse_relative: true,
                     keyboard: true,
                     separate_cursor: true,
+                    hover_capture: true,
                 },
                 "x11/xtest",
             )),
@@ -674,6 +676,7 @@ fn select_linux_backend(
                         mouse_relative: true,
                         keyboard: true,
                         separate_cursor: true,
+                        hover_capture: false,
                     },
                     "uinput(rel)",
                 )),
@@ -688,6 +691,7 @@ fn select_linux_backend(
                     mouse_relative: true,
                     keyboard: true,
                     separate_cursor: false,
+                    hover_capture: true,
                 },
                 "x11/xtest",
             )),
@@ -699,6 +703,7 @@ fn select_linux_backend(
                         mouse_relative: true,
                         keyboard: true,
                         separate_cursor: false,
+                        hover_capture: false,
                     },
                     "uinput(rel)",
                 )),
@@ -713,6 +718,7 @@ fn select_linux_backend(
                     mouse_relative: true,
                     keyboard: true,
                     separate_cursor: false,
+                    hover_capture: false,
                 },
                 "uinput(rel)",
             )
@@ -725,6 +731,7 @@ fn select_linux_backend(
                     mouse_relative: true,
                     keyboard: true,
                     separate_cursor: true,
+                    hover_capture: false,
                 },
                 "uinput(rel)",
             )
@@ -737,6 +744,7 @@ fn select_linux_backend(
                     mouse_relative: true,
                     keyboard: true,
                     separate_cursor: true,
+                    hover_capture: false,
                 },
                 "uinput(rel)",
             )
