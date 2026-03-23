@@ -14,13 +14,17 @@ mod encode_vaapi;
 #[cfg(target_os = "macos")]
 mod encode_vt;
 mod input;
+mod server_control;
 mod transport;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod tray;
 
 use adaptive_bitrate::{AdaptiveBitrateState, ClientRateController};
 use broadcast::Broadcaster;
 use capture::{CaptureBackend, PlatformCapture};
 use encode_config::EncoderConfig;
 use input::{CursorVersionCursor, InputRuntime};
+use server_control::ServerControl;
 use transport::{EncodedVideoFrame, UdpSender};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -306,6 +310,7 @@ struct ServerState {
     /// thread. New pipeline starts must wait for this to complete first.
     pending_pipeline_stop: Mutex<Option<std::thread::JoinHandle<()>>>,
     input: Arc<InputRuntime>,
+    control: Arc<ServerControl>,
 }
 
 #[cfg(target_os = "linux")]
@@ -977,6 +982,7 @@ async fn handle_client(
 ) {
     println!("Client connected: {addr}");
     let _ = stream.set_nodelay(true);
+    let registered_client = state.control.register_client(addr);
     let client_id = state.input.allocate_client_id();
 
     let startup_prefs = match read_client_startup_prefs(&mut stream).await {
@@ -986,6 +992,9 @@ async fn handle_client(
             return;
         }
     };
+    if registered_client.disconnect_requested() {
+        return;
+    }
     let client_requested_fps = client_display_fps_hint(startup_prefs.display);
     if let Some(display) = startup_prefs.display {
         println!(
@@ -1072,6 +1081,12 @@ async fn handle_client(
             return;
         }
     };
+    if registered_client.disconnect_requested() {
+        rate_control.unregister_client(sub.vid_sub_id);
+        let _ = state.input.release_control(client_id);
+        unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+        return;
+    }
     rate_control.register_client(sub.vid_sub_id);
     let mut bitrate_controller = ClientRateController::from_state(rate_control.as_ref());
     let controller_state = state.input.controller_state_for(client_id);
@@ -1126,6 +1141,12 @@ async fn handle_client(
             return;
         }
     }
+    if registered_client.disconnect_requested() {
+        rate_control.unregister_client(sub.vid_sub_id);
+        let _ = state.input.release_control(client_id);
+        unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+        return;
+    }
 
     // Per-client audio enable flag (toggled by client via SetAudio control message)
     let audio_enabled = Arc::new(AtomicBool::new(true));
@@ -1167,6 +1188,9 @@ async fn handle_client(
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     loop {
+        if registered_client.disconnect_requested() {
+            break;
+        }
         let mut cursor_write_failed = false;
         for message in state.input.cursor_messages(client_id, &mut cursor_versions) {
             if stream.write_all(&message.serialize()).await.is_err() {
@@ -1400,35 +1424,100 @@ fn get_screen_resolution() -> Option<(u32, u32)> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
-    #[cfg(target_os = "linux")]
-    probe_backends();
-
-    let input = InputRuntime::new();
-    input.spawn_listener(UDP_PORT);
-    let state = Arc::new(ServerState {
-        pipeline: Mutex::new(None),
-        pending_pipeline_stop: Mutex::new(None),
-        input,
-    });
-
+async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
     let listener = TcpListener::bind("0.0.0.0:8080")
         .await
-        .expect("Failed to bind TCP listener on 0.0.0.0:8080");
+        .map_err(|err| format!("Failed to bind TCP listener on 0.0.0.0:8080: {err}"))?;
 
     println!("Server started. Waiting for clients on 0.0.0.0:8080...");
     println!(
         "  Overrides: ST_CODEC, ST_HDR, ST_BITRATE, ST_MIN_BITRATE, ST_MAX_BITRATE, ST_FPS, ST_GOP, ST_AUDIO, ST_CAPTURE"
     );
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
+    while !state.control.shutdown_requested() {
+        match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+            Err(_) => continue,
+            Ok(Ok((mut stream, addr))) => {
+                if !state.control.allow_new_connections() {
+                    println!("[server] Rejecting blocked client connection from {addr}");
+                    let _ = stream
+                        .write_all(
+                            &ControlMessage::Error("Server is currently blocking new connections.".into())
+                                .serialize(),
+                        )
+                        .await;
+                    continue;
+                }
                 let state = Arc::clone(&state);
                 tokio::spawn(handle_client(stream, addr, state));
             }
-            Err(e) => eprintln!("Accept error: {e}"),
+            Ok(Err(e)) => eprintln!("Accept error: {e}"),
         }
+    }
+
+    state.control.disconnect_all_clients();
+    Ok(())
+}
+
+fn build_server_state(control: Arc<ServerControl>) -> Arc<ServerState> {
+    let input = InputRuntime::new();
+    input.spawn_listener(UDP_PORT);
+    Arc::new(ServerState {
+        pipeline: Mutex::new(None),
+        pending_pipeline_stop: Mutex::new(None),
+        input,
+        control,
+    })
+}
+
+fn run_server_runtime(state: Arc<ServerState>) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("Failed to build Tokio runtime: {err}"))?;
+    runtime.block_on(run_server(state))
+}
+
+fn join_server_thread(handle: std::thread::JoinHandle<Result<(), String>>) -> ! {
+    match handle.join() {
+        Ok(Ok(())) => std::process::exit(0),
+        Ok(Err(err)) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!("Server runtime thread panicked.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn main() {
+    #[cfg(target_os = "linux")]
+    probe_backends();
+
+    let control = ServerControl::new();
+    let state = build_server_state(Arc::clone(&control));
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if tray::should_run_tray() {
+        let server_state = Arc::clone(&state);
+        let server_handle = std::thread::spawn(move || run_server_runtime(server_state));
+        match tray::run_tray(Arc::clone(&control)) {
+            Ok(()) => {
+                control.request_shutdown();
+                join_server_thread(server_handle);
+            }
+            Err(err) => {
+                eprintln!("[tray] {err}");
+                eprintln!("[tray] falling back to headless mode");
+                join_server_thread(server_handle);
+            }
+        }
+    }
+
+    if let Err(err) = run_server_runtime(state) {
+        eprintln!("{err}");
+        std::process::exit(1);
     }
 }

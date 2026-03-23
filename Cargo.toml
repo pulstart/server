@@ -10,12 +10,15 @@ crossbeam-channel = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = "1.5"
+tray-icon = { version = "0.21", default-features = false }
+winit = "0.30"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ffmpeg-next = "8.1"
 ffmpeg-sys-next = "8.1"
 nvfbc = "0.2.0"
 pipewire = "0.9"
+ksni = { version = "0.3", features = ["blocking"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zvariant = "5"
 futures-lite = "2"
