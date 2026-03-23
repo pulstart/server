@@ -1335,6 +1335,11 @@ fn probe_backends() {
 
     let x11_ok = std::env::var("DISPLAY").is_ok();
     let wlr_ok = capture::linux::wl_capture::verify_wayland();
+    let nvfbc_probe = if ds == "x11" {
+        Some(capture::linux::probe_nvfbc())
+    } else {
+        None
+    };
     let pipewire_ok = std::process::Command::new("dbus-send")
         .args([
             "--session",
@@ -1350,7 +1355,30 @@ fn probe_backends() {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    println!("[probe] Capture backends: X11={x11_ok}, wlr-screencopy={wlr_ok}, PipeWire(portal)={pipewire_ok}");
+    let nvfbc_ok = matches!(
+        &nvfbc_probe,
+        Some(Ok(capture::linux::NvfbcProbe {
+            is_capture_possible: true,
+            ..
+        }))
+    );
+    println!(
+        "[probe] Capture backends: NvFBC={nvfbc_ok}, X11={x11_ok}, wlr-screencopy={wlr_ok}, PipeWire(portal)={pipewire_ok}"
+    );
+    match &nvfbc_probe {
+        Some(Ok(status)) => {
+            println!(
+                "[probe] NvFBC: available (capture_possible={}, can_create_now={})",
+                status.is_capture_possible, status.can_create_now
+            );
+        }
+        Some(Err(err)) => {
+            println!("[probe] NvFBC: unavailable ({err})");
+        }
+        None => {
+            println!("[probe] NvFBC: unavailable (requires X11)");
+        }
+    }
 
     let capture_backend = match ds.as_str() {
         "wayland" => {
@@ -1363,7 +1391,15 @@ fn probe_backends() {
             }
         }
         "x11" => {
-            if x11_ok {
+            if matches!(
+                &nvfbc_probe,
+                Some(Ok(capture::linux::NvfbcProbe {
+                    is_capture_possible: true,
+                    can_create_now: true,
+                }))
+            ) {
+                "NvFBC (NVIDIA)"
+            } else if x11_ok {
                 "X11 (XShm)"
             } else {
                 "none available"

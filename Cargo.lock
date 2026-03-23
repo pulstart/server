@@ -1717,21 +1717,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nvfbc"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92781b6418f157251d615f9fefed9343f73b3767c515b2020a5998e7db10a038"
-dependencies = [
- "nvfbc-sys",
-]
-
-[[package]]
-name = "nvfbc-sys"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e5c977674e6a56da110fb4d6b82d7855ca84119a2df1718353a1b4913288526"
-
-[[package]]
 name = "objc-sys"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2686,8 +2671,8 @@ dependencies = [
  "futures-lite",
  "ksni",
  "libc",
+ "libloading 0.8.9",
  "nix 0.29.0",
- "nvfbc",
  "pipewire",
  "screencapturekit",
  "self-replace",

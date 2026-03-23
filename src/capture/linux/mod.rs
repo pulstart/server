@@ -24,6 +24,7 @@ pub mod x11_capture;
 pub(crate) use pipewire_capture::{
     active_remote_desktop_session, RemoteDesktopPortalSession,
 };
+pub(crate) use nvfbc_capture::{probe as probe_nvfbc, NvfbcProbe};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisplayServer {
