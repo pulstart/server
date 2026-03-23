@@ -1,4 +1,5 @@
-use crate::server_control::{ConnectedClientSnapshot, ServerControl};
+use crate::server_control::{ConnectedClientSnapshot, ServerControl, UpdateStateSnapshot};
+use crate::updater;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -13,7 +14,9 @@ use ksni::menu::{
 #[cfg(target_os = "macos")]
 use std::time::Instant;
 #[cfg(target_os = "macos")]
-use tray_icon::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder};
+use tray_icon::menu::{
+    CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder,
+};
 #[cfg(target_os = "macos")]
 use tray_icon::{Icon as MacTrayIcon, TrayIcon, TrayIconBuilder};
 #[cfg(target_os = "macos")]
@@ -23,6 +26,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 
 #[cfg(target_os = "macos")]
 const ALLOW_CONNECTIONS_ID: &str = "allow-connections";
+#[cfg(target_os = "macos")]
+const CHECK_UPDATES_ID: &str = "check-updates";
+#[cfg(target_os = "macos")]
+const INSTALL_UPDATE_ID: &str = "install-update";
 #[cfg(target_os = "macos")]
 const QUIT_ID: &str = "quit";
 #[cfg(target_os = "macos")]
@@ -95,7 +102,7 @@ impl ksni::Tray for LinuxTray {
     }
 
     fn title(&self) -> String {
-        "st-server".into()
+        tray_app_title()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -104,8 +111,8 @@ impl ksni::Tray for LinuxTray {
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
-            title: "st-server".into(),
-            description: tray_status_text(&self.control),
+            title: tray_app_title(),
+            description: tray_tooltip_text(&self.control),
             icon_pixmap: vec![self.icon.clone()],
             icon_name: String::new(),
         }
@@ -113,13 +120,31 @@ impl ksni::Tray for LinuxTray {
 
     fn menu(&self) -> Vec<LinuxMenuItem<Self>> {
         let clients = self.control.connected_clients();
-        let mut items = vec![
+        let update_state = self.control.update_state();
+        vec![
+            disabled_linux_item(tray_app_title()),
+            disabled_linux_item(tray_status_text(&self.control)),
+            LinuxMenuItem::Separator,
+            disabled_linux_item(tray_update_status_text(&update_state)),
             LinuxStandardItem {
-                label: tray_status_text(&self.control),
-                enabled: false,
+                label: "Check For Updates".into(),
+                enabled: update_check_enabled(&update_state),
+                activate: Box::new(|tray: &mut LinuxTray| {
+                    tray.control.begin_update_check();
+                }),
                 ..Default::default()
             }
             .into(),
+            LinuxStandardItem {
+                label: tray_install_update_label(&update_state),
+                enabled: update_install_enabled(&update_state),
+                activate: Box::new(|tray: &mut LinuxTray| {
+                    tray.control.begin_update_install();
+                }),
+                ..Default::default()
+            }
+            .into(),
+            LinuxMenuItem::Separator,
             LinuxCheckmarkItem {
                 label: "Allow New Connections".into(),
                 checked: self.control.allow_new_connections(),
@@ -146,18 +171,7 @@ impl ksni::Tray for LinuxTray {
                 ..Default::default()
             }
             .into(),
-        ];
-        if items.is_empty() {
-            items.push(
-                LinuxStandardItem {
-                    label: "st-server".into(),
-                    enabled: false,
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-        items
+        ]
     }
 
     fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
@@ -167,16 +181,19 @@ impl ksni::Tray for LinuxTray {
 }
 
 #[cfg(target_os = "linux")]
+fn disabled_linux_item(label: String) -> LinuxMenuItem<LinuxTray> {
+    LinuxStandardItem {
+        label,
+        enabled: false,
+        ..Default::default()
+    }
+    .into()
+}
+
+#[cfg(target_os = "linux")]
 fn linux_client_menu_items(clients: &[ConnectedClientSnapshot]) -> Vec<LinuxMenuItem<LinuxTray>> {
     if clients.is_empty() {
-        return vec![
-            LinuxStandardItem {
-                label: "No clients connected".into(),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-        ];
+        return vec![disabled_linux_item("No clients connected".into())];
     }
 
     clients
@@ -209,7 +226,11 @@ fn run_macos_tray(control: Arc<ServerControl>) -> Result<(), String> {
 struct TrayApp {
     control: Arc<ServerControl>,
     tray: Option<TrayIcon>,
+    version_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
+    update_status_item: Option<MenuItem>,
+    check_updates_item: Option<MenuItem>,
+    install_update_item: Option<MenuItem>,
     allow_item: Option<CheckMenuItem>,
     clients_submenu: Option<Submenu>,
     client_items: Vec<MenuItem>,
@@ -222,7 +243,11 @@ impl TrayApp {
         Self {
             control,
             tray: None,
+            version_item: None,
             status_item: None,
+            update_status_item: None,
+            check_updates_item: None,
+            install_update_item: None,
             allow_item: None,
             clients_submenu: None,
             client_items: Vec::new(),
@@ -235,7 +260,12 @@ impl TrayApp {
             return Ok(());
         }
 
-        let status_item = MenuItem::new("No clients connected", false, None);
+        let version_item = MenuItem::new(tray_app_title(), false, None);
+        let status_item = MenuItem::new("Ready: no connected clients", false, None);
+        let update_status_item = MenuItem::new("Checking GitHub releases...", false, None);
+        let check_updates_item = MenuItem::with_id(CHECK_UPDATES_ID, "Check For Updates", true, None);
+        let install_update_item =
+            MenuItem::with_id(INSTALL_UPDATE_ID, "Update To Latest", false, None);
         let allow_item = CheckMenuItem::with_id(
             ALLOW_CONNECTIONS_ID,
             "Allow New Connections",
@@ -256,8 +286,26 @@ impl TrayApp {
             .build()
             .map_err(|err| format!("Failed to build tray menu: {err}"))?;
         root_menu
+            .append(&version_item)
+            .map_err(|err| format!("Failed to append tray version item: {err}"))?;
+        root_menu
             .append(&status_item)
             .map_err(|err| format!("Failed to append tray status item: {err}"))?;
+        root_menu
+            .append(&PredefinedMenuItem::separator())
+            .map_err(|err| format!("Failed to append tray separator: {err}"))?;
+        root_menu
+            .append(&update_status_item)
+            .map_err(|err| format!("Failed to append tray update status item: {err}"))?;
+        root_menu
+            .append(&check_updates_item)
+            .map_err(|err| format!("Failed to append tray check-updates item: {err}"))?;
+        root_menu
+            .append(&install_update_item)
+            .map_err(|err| format!("Failed to append tray install-update item: {err}"))?;
+        root_menu
+            .append(&PredefinedMenuItem::separator())
+            .map_err(|err| format!("Failed to append tray separator: {err}"))?;
         root_menu
             .append(&allow_item)
             .map_err(|err| format!("Failed to append tray allow item: {err}"))?;
@@ -288,7 +336,11 @@ impl TrayApp {
             .map_err(|err| format!("Failed to create tray icon: {err}"))?;
 
         self.tray = Some(tray);
+        self.version_item = Some(version_item);
         self.status_item = Some(status_item);
+        self.update_status_item = Some(update_status_item);
+        self.check_updates_item = Some(check_updates_item);
+        self.install_update_item = Some(install_update_item);
         self.allow_item = Some(allow_item);
         self.clients_submenu = Some(clients_submenu);
         self.sync_from_state()?;
@@ -303,16 +355,30 @@ impl TrayApp {
         self.last_version = version;
 
         let clients = self.control.connected_clients();
+        let update_state = self.control.update_state();
         let status_text = tray_status_text(&self.control);
 
+        if let Some(version_item) = &self.version_item {
+            version_item.set_text(tray_app_title());
+        }
         if let Some(status_item) = &self.status_item {
-            status_item.set_text(&status_text);
+            status_item.set_text(status_text.clone());
+        }
+        if let Some(update_status_item) = &self.update_status_item {
+            update_status_item.set_text(tray_update_status_text(&update_state));
+        }
+        if let Some(check_updates_item) = &self.check_updates_item {
+            check_updates_item.set_enabled(update_check_enabled(&update_state));
+        }
+        if let Some(install_update_item) = &self.install_update_item {
+            install_update_item.set_text(tray_install_update_label(&update_state));
+            install_update_item.set_enabled(update_install_enabled(&update_state));
         }
         if let Some(allow_item) = &self.allow_item {
             allow_item.set_checked(self.control.allow_new_connections());
         }
         if let Some(tray) = &self.tray {
-            let _ = tray.set_tooltip(Some(status_text));
+            let _ = tray.set_tooltip(Some(tray_tooltip_text(&self.control)));
         }
 
         self.rebuild_clients_menu(&clients)
@@ -359,6 +425,10 @@ impl TrayApp {
             if id == ALLOW_CONNECTIONS_ID {
                 let next = !self.control.allow_new_connections();
                 self.control.set_allow_new_connections(next);
+            } else if id == CHECK_UPDATES_ID {
+                self.control.begin_update_check();
+            } else if id == INSTALL_UPDATE_ID {
+                self.control.begin_update_install();
             } else if id == QUIT_ID {
                 self.control.request_shutdown();
                 return true;
@@ -406,6 +476,18 @@ impl ApplicationHandler for TrayApp {
     }
 }
 
+fn tray_app_title() -> String {
+    format!("st-server v{}", updater::current_version())
+}
+
+fn tray_tooltip_text(control: &ServerControl) -> String {
+    format!(
+        "{}\n{}",
+        tray_status_text(control),
+        tray_update_status_text(&control.update_state())
+    )
+}
+
 fn tray_status_text(control: &ServerControl) -> String {
     let clients = control.connected_clients();
     let allow_connections = control.allow_new_connections();
@@ -427,6 +509,62 @@ fn tray_status_text(control: &ServerControl) -> String {
             }
         )
     }
+}
+
+fn tray_update_status_text(state: &UpdateStateSnapshot) -> String {
+    match state {
+        UpdateStateSnapshot::Unsupported(message) => format!("Updates unavailable: {}", trim_tray_label(message)),
+        UpdateStateSnapshot::Idle => "Updates: ready to check GitHub releases".into(),
+        UpdateStateSnapshot::Checking => "Updates: checking GitHub releases...".into(),
+        UpdateStateSnapshot::UpToDate { version } => {
+            format!("Updates: already on v{version}")
+        }
+        UpdateStateSnapshot::UpdateAvailable(release) => {
+            format!("Updates: v{} is available", release.version)
+        }
+        UpdateStateSnapshot::Installing { version } => {
+            format!("Updates: downloading and staging v{version}...")
+        }
+        UpdateStateSnapshot::ClosingForUpdate { version } => {
+            format!("Updates: applying v{version} and restarting...")
+        }
+        UpdateStateSnapshot::Error(message) => {
+            format!("Updates: {}", trim_tray_label(message))
+        }
+    }
+}
+
+fn tray_install_update_label(state: &UpdateStateSnapshot) -> String {
+    match state {
+        UpdateStateSnapshot::UpdateAvailable(release) => format!("Update To v{}", release.version),
+        UpdateStateSnapshot::Installing { version } => format!("Installing v{version}..."),
+        UpdateStateSnapshot::ClosingForUpdate { version } => format!("Applying v{version}..."),
+        _ => "Install Latest Update".into(),
+    }
+}
+
+fn update_check_enabled(state: &UpdateStateSnapshot) -> bool {
+    !matches!(
+        state,
+        UpdateStateSnapshot::Unsupported(_)
+            | UpdateStateSnapshot::Checking
+            | UpdateStateSnapshot::Installing { .. }
+            | UpdateStateSnapshot::ClosingForUpdate { .. }
+    )
+}
+
+fn update_install_enabled(state: &UpdateStateSnapshot) -> bool {
+    matches!(state, UpdateStateSnapshot::UpdateAvailable(_))
+}
+
+fn trim_tray_label(value: &str) -> String {
+    const MAX_LEN: usize = 72;
+    let mut trimmed = value.trim().replace('\n', " ");
+    if trimmed.len() > MAX_LEN {
+        trimmed.truncate(MAX_LEN.saturating_sub(3));
+        trimmed.push_str("...");
+    }
+    trimmed
 }
 
 fn connected_since_label(client: &ConnectedClientSnapshot) -> String {

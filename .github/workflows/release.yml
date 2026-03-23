@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-24.04
+            package_id: linux-x64
+          - name: macOS x64
+            os: macos-15-intel
+            package_id: macos-x64
+          - name: macOS arm64
+            os: macos-15
+            package_id: macos-arm64
+
+    steps:
+      - name: Checkout server with submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+          token: ${{ secrets.PROTOCOL_CHECKOUT_TOKEN || github.token }}
+
+      - name: Derive version from git tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="0.0.0-dev"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Stamp Cargo.toml version
+        shell: bash
+        run: |
+          sed -i.bak 's/^version = ".*"/version = "${{ steps.version.outputs.version }}"/' Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Cargo.toml version is now:"
+          grep '^version' Cargo.toml
+          cargo generate-lockfile
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libdrm-dev \
+            libpipewire-0.3-dev \
+            libpulse-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxtst-dev \
+            pkg-config
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package Unix artifact
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          MACOS_NOTARY_API_KEY_BASE64: ${{ secrets.MACOS_NOTARY_API_KEY_BASE64 }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_APP_PASSWORD: ${{ secrets.MACOS_NOTARY_APP_PASSWORD }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: bash ./scripts/package-unix.sh --platform ${{ matrix.package_id }}
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package_id }}
+          path: dist/*-${{ matrix.package_id }}.*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/**/*.tar.gz
+            release-artifacts/**/*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

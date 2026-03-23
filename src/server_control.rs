@@ -1,3 +1,4 @@
+use crate::updater::{self, ReleaseInfo};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::Command;
@@ -5,13 +6,28 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use std::thread;
 use std::time::{Duration, SystemTime};
+
+const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Clone, Debug)]
 pub struct ConnectedClientSnapshot {
     pub id: usize,
     pub addr: SocketAddr,
     pub connected_at: SystemTime,
+}
+
+#[derive(Clone, Debug)]
+pub enum UpdateStateSnapshot {
+    Unsupported(String),
+    Idle,
+    Checking,
+    UpToDate { version: String },
+    UpdateAvailable(ReleaseInfo),
+    Installing { version: String },
+    ClosingForUpdate { version: String },
+    Error(String),
 }
 
 pub struct RegisteredClient {
@@ -31,6 +47,9 @@ pub struct ServerControl {
     next_client_id: AtomicUsize,
     version: AtomicUsize,
     clients: Mutex<BTreeMap<usize, ConnectedClientEntry>>,
+    update_state: Mutex<UpdateStateSnapshot>,
+    update_task_running: AtomicBool,
+    auto_update_checks_started: AtomicBool,
 }
 
 impl ServerControl {
@@ -41,6 +60,9 @@ impl ServerControl {
             next_client_id: AtomicUsize::new(1),
             version: AtomicUsize::new(1),
             clients: Mutex::new(BTreeMap::new()),
+            update_state: Mutex::new(initial_update_state()),
+            update_task_running: AtomicBool::new(false),
+            auto_update_checks_started: AtomicBool::new(false),
         })
     }
 
@@ -70,6 +92,108 @@ impl ServerControl {
     pub fn connected_clients(&self) -> Vec<ConnectedClientSnapshot> {
         let clients = self.clients.lock().unwrap();
         clients.values().map(|entry| entry.snapshot.clone()).collect()
+    }
+
+    pub fn update_state(&self) -> UpdateStateSnapshot {
+        self.update_state.lock().unwrap().clone()
+    }
+
+    pub fn start_automatic_update_checks(self: &Arc<Self>) {
+        if self
+            .auto_update_checks_started
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        if matches!(self.update_state(), UpdateStateSnapshot::Unsupported(_)) {
+            return;
+        }
+
+        let control = Arc::clone(self);
+        thread::spawn(move || {
+            control.begin_update_check();
+            loop {
+                if control.shutdown_requested() {
+                    break;
+                }
+                thread::sleep(AUTO_UPDATE_CHECK_INTERVAL);
+                if control.shutdown_requested() {
+                    break;
+                }
+                match control.update_state() {
+                    UpdateStateSnapshot::Checking
+                    | UpdateStateSnapshot::Installing { .. }
+                    | UpdateStateSnapshot::ClosingForUpdate { .. } => {}
+                    _ => control.begin_update_check(),
+                }
+            }
+        });
+    }
+
+    pub fn begin_update_check(self: &Arc<Self>) {
+        if matches!(self.update_state(), UpdateStateSnapshot::Unsupported(_)) {
+            return;
+        }
+        if self
+            .update_task_running
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+
+        self.set_update_state(UpdateStateSnapshot::Checking);
+        let control = Arc::clone(self);
+        thread::spawn(move || {
+            let next_state = match updater::check_latest_release() {
+                Ok(updater::CheckOutcome::UpToDate { latest_version: version }) => {
+                    UpdateStateSnapshot::UpToDate { version }
+                }
+                Ok(updater::CheckOutcome::UpdateAvailable(release)) => {
+                    UpdateStateSnapshot::UpdateAvailable(release)
+                }
+                Err(err) => UpdateStateSnapshot::Error(err),
+            };
+            control.set_update_state(next_state);
+            control
+                .update_task_running
+                .store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub fn begin_update_install(self: &Arc<Self>) {
+        if self
+            .update_task_running
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+
+        let release = match self.update_state() {
+            UpdateStateSnapshot::UpdateAvailable(release) => release,
+            _ => {
+                self.update_task_running.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        let version = release.version.clone();
+        self.set_update_state(UpdateStateSnapshot::Installing {
+            version: version.clone(),
+        });
+
+        let control = Arc::clone(self);
+        thread::spawn(move || match updater::prepare_and_spawn_update(&release) {
+            Ok(()) => {
+                control.set_update_state(UpdateStateSnapshot::ClosingForUpdate { version });
+                control.request_shutdown();
+            }
+            Err(err) => {
+                control.set_update_state(UpdateStateSnapshot::Error(err));
+                control
+                    .update_task_running
+                    .store(false, Ordering::SeqCst);
+            }
+        });
     }
 
     pub fn register_client(self: &Arc<Self>, addr: SocketAddr) -> RegisteredClient {
@@ -117,6 +241,11 @@ impl ServerControl {
         }
     }
 
+    fn set_update_state(&self, next_state: UpdateStateSnapshot) {
+        *self.update_state.lock().unwrap() = next_state;
+        self.bump_version();
+    }
+
     fn bump_version(&self) {
         self.version.fetch_add(1, Ordering::Relaxed);
     }
@@ -131,6 +260,13 @@ impl RegisteredClient {
 impl Drop for RegisteredClient {
     fn drop(&mut self) {
         self.control.unregister_client(self.snapshot.id);
+    }
+}
+
+fn initial_update_state() -> UpdateStateSnapshot {
+    match updater::supported_target_label() {
+        Ok(_) => UpdateStateSnapshot::Idle,
+        Err(err) => UpdateStateSnapshot::Unsupported(err),
     }
 }
 

@@ -18,6 +18,7 @@ mod server_control;
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod tray;
+mod updater;
 
 use adaptive_bitrate::{AdaptiveBitrateState, ClientRateController};
 use broadcast::Broadcaster;
@@ -1493,6 +1494,15 @@ fn join_server_thread(handle: std::thread::JoinHandle<Result<(), String>>) -> ! 
 }
 
 fn main() {
+    match updater::maybe_run_apply_update_from_args() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("[updater] {err}");
+            std::process::exit(1);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     probe_backends();
 
@@ -1501,6 +1511,7 @@ fn main() {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if tray::should_run_tray() {
+        control.start_automatic_update_checks();
         let server_state = Arc::clone(&state);
         let server_handle = std::thread::spawn(move || run_server_runtime(server_state));
         match tray::run_tray(Arc::clone(&control)) {
