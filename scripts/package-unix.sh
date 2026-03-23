@@ -9,6 +9,68 @@ Packages an existing release build from target/release/st-server into server/dis
 EOF
 }
 
+read_ldd_paths() {
+    local target="$1"
+    ldd "$target" | sed -n \
+        -e 's/.*=> \(\/[^ ]*\).*/\1/p' \
+        -e 's/^\(\/[^ ]*\).*/\1/p'
+}
+
+should_bundle_linux_dep() {
+    local dep_path="$1"
+    local dep_name
+    dep_name="$(basename "$dep_path")"
+
+    case "$dep_name" in
+        linux-vdso.so.*|ld-linux*.so*|libc.so.*|libm.so.*|libpthread.so.*|librt.so.*|libdl.so.*|libutil.so.*|libresolv.so.*|libnsl.so.*|libcrypt.so.*|libanl.so.*|libBrokenLocale.so.*)
+            return 1
+            ;;
+        libGL.so.*|libGLX.so.*|libEGL.so.*|libdrm.so.*|libva*.so*|libvdpau.so.*|libOpenCL.so.*|libvulkan.so.*)
+            return 1
+            ;;
+        libX11.so.*|libXext.so.*|libXfixes.so.*|libXtst.so.*|libxcb*.so*|libwayland-*.so*|libpulse*.so*|libpipewire-*.so*|libjack.so.*|libasound.so.*|libdbus-1.so.*|libsystemd.so.*|libudev.so.*)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+bundle_linux_runtime_libs() {
+    local binary_path="$1"
+    local package_root="$2"
+    local lib_root="$package_root/lib"
+    local -a queue
+    local dep dep_name resolved_path
+
+    mkdir -p "$lib_root"
+    queue=("$binary_path")
+
+    declare -A seen=()
+
+    while ((${#queue[@]} > 0)); do
+        local current="${queue[0]}"
+        queue=("${queue[@]:1}")
+
+        while IFS= read -r dep; do
+            [[ -n "$dep" ]] || continue
+            [[ -f "$dep" ]] || continue
+            should_bundle_linux_dep "$dep" || continue
+
+            resolved_path="$(readlink -f "$dep")"
+            dep_name="$(basename "$dep")"
+            [[ -n "$resolved_path" ]] || resolved_path="$dep"
+
+            if [[ -z "${seen[$dep_name]:-}" ]]; then
+                cp -L "$dep" "$lib_root/$dep_name"
+                chmod 644 "$lib_root/$dep_name"
+                seen["$dep_name"]=1
+                queue+=("$resolved_path")
+            fi
+        done < <(read_ldd_paths "$current")
+    done
+}
+
 platform=""
 
 while [[ $# -gt 0 ]]; do
@@ -71,13 +133,33 @@ rm -rf "$package_root"
 mkdir -p "$package_root"
 
 cp "$binary_path" "$package_root/st-server"
+mv "$package_root/st-server" "$package_root/st-server-bin"
+chmod 755 "$package_root/st-server-bin"
+
+bundle_linux_runtime_libs "$binary_path" "$package_root"
+
+cat > "$package_root/st-server" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$app_dir/lib" ]]; then
+    export LD_LIBRARY_PATH="$app_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+exec "$app_dir/st-server-bin" "$@"
+EOF
 chmod 755 "$package_root/st-server"
+
 cat > "$package_root/README.txt" <<'EOF'
 This archive contains the Linux x64 build of st-server.
 
-The Linux package is built on GitHub Actions Ubuntu runners and ships as a plain tarball.
-Runtime libraries are not bundled. Install FFmpeg, PulseAudio, PipeWire, and the normal
-desktop capture/input stack on the target machine before launching the server.
+Run the server through the included launcher:
+
+  ./st-server
+
+The package bundles the user-space codec/runtime libraries that are practical to ship.
+The target machine still needs the normal Linux desktop stack for capture/input/audio:
+PulseAudio, PipeWire, X11/Wayland, and GPU/display drivers.
 
 Tray integration is optional. Set ST_SERVER_NO_TRAY=1 to force headless mode.
 EOF

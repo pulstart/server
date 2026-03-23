@@ -23,6 +23,12 @@ Release flow:
 - Linux artifacts are published as `tar.gz`
 - macOS artifacts are published as zipped `.app` bundles
 
+Linux release notes:
+
+- launch the packaged server with `./st-server`, not `./st-server-bin`
+- the Linux archive now bundles the user-space FFmpeg/runtime libraries that are practical to ship
+- the target machine still needs its normal Linux capture/input/audio stack: PulseAudio, PipeWire, X11/Wayland, and GPU/display drivers
+
 The macOS packaging script supports optional Apple signing/notarization when the same
 `MACOS_*` secrets used by the client workflow are configured. Without those secrets, the
 workflow still produces unsigned macOS `.app` archives.
