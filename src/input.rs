@@ -107,6 +107,8 @@ struct InputRuntimeInner {
     backend_label: String,
     capabilities: InputCapabilities,
     controller_id: Option<u32>,
+    last_input_seq_client_id: Option<u32>,
+    last_input_seq: Option<u16>,
     button_mask: u8,
     keyboard_state: [u8; KEYBOARD_STATE_BYTES],
     cursor_shape: Option<CursorShape>,
@@ -147,6 +149,8 @@ impl InputRuntime {
                 backend_label: "unavailable".to_string(),
                 capabilities: InputCapabilities::default(),
                 controller_id: None,
+                last_input_seq_client_id: None,
+                last_input_seq: None,
                 button_mask: 0,
                 keyboard_state: [0u8; KEYBOARD_STATE_BYTES],
                 cursor_shape: None,
@@ -489,8 +493,8 @@ impl InputRuntime {
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((n, _addr)) => {
-                    if let Some((_header, packet)) = InputPacket::deserialize(&buf[..n]) {
-                        self.handle_input_packet(packet);
+                    if let Some((header, packet)) = InputPacket::deserialize(&buf[..n]) {
+                        self.handle_input_packet(header.seq, packet);
                     }
                 }
                 Err(err) => {
@@ -501,7 +505,7 @@ impl InputRuntime {
         }
     }
 
-    fn handle_input_packet(&self, packet: InputPacket) {
+    fn handle_input_packet(&self, seq: u16, packet: InputPacket) {
         let mut inner = self.inner.lock().unwrap();
         let client_id = match packet {
             InputPacket::MouseAbsolute(packet) => packet.client_id,
@@ -511,6 +515,9 @@ impl InputRuntime {
             InputPacket::KeyboardState(packet) => packet.client_id,
         };
         if inner.controller_id != Some(client_id) {
+            return;
+        }
+        if !inner.accept_input_seq(client_id, seq) {
             return;
         }
 
@@ -538,6 +545,20 @@ impl InputRuntime {
 }
 
 impl InputRuntimeInner {
+    fn accept_input_seq(&mut self, client_id: u32, seq: u16) -> bool {
+        if self.last_input_seq_client_id == Some(client_id) {
+            if let Some(last_seq) = self.last_input_seq {
+                if !input_seq_is_newer(seq, last_seq) {
+                    return false;
+                }
+            }
+        }
+
+        self.last_input_seq_client_id = Some(client_id);
+        self.last_input_seq = Some(seq);
+        true
+    }
+
     fn release_all_inputs(&mut self) {
         self.release_buttons();
         self.release_keyboard();
@@ -657,6 +678,11 @@ impl InputRuntimeInner {
         }
         self.keyboard_state = next;
     }
+}
+
+fn input_seq_is_newer(seq: u16, last_seq: u16) -> bool {
+    let delta = seq.wrapping_sub(last_seq);
+    delta != 0 && delta < 0x8000
 }
 
 fn button_mappings() -> [(u8, u32); 5] {
@@ -1976,4 +2002,23 @@ fn x11_key_name(key: KeyboardKey) -> Option<&'static std::ffi::CStr> {
         KeyboardKey::RightAlt => c"Alt_R",
         KeyboardKey::RightMeta => c"Super_R",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::input_seq_is_newer;
+
+    #[test]
+    fn input_seq_rejects_duplicates_and_older_packets() {
+        assert!(!input_seq_is_newer(10, 10));
+        assert!(!input_seq_is_newer(9, 10));
+        assert!(!input_seq_is_newer(0, 0x8000));
+    }
+
+    #[test]
+    fn input_seq_accepts_forward_progress_and_wraparound() {
+        assert!(input_seq_is_newer(11, 10));
+        assert!(input_seq_is_newer(0, u16::MAX));
+        assert!(input_seq_is_newer(2, u16::MAX));
+    }
 }
