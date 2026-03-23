@@ -14,6 +14,7 @@ use zip::ZipArchive;
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/pulstart/server/releases/latest";
 const APPLY_UPDATE_FLAG: &str = "--apply-update";
+const ELEVATED_COPY_FLAG: &str = "--elevated-copy";
 const PACKAGE_PREFIX: &str = "st-server-v";
 
 #[derive(Clone, Debug)]
@@ -36,7 +37,6 @@ struct ApplyUpdateCommand {
     package_root: PathBuf,
     install_root: PathBuf,
     relaunch_executable: PathBuf,
-    original_user: Option<(u32, u32)>,
 }
 
 #[derive(Debug)]
@@ -81,6 +81,14 @@ pub fn maybe_run_apply_update_from_args() -> Result<bool, String> {
     let Some(flag) = args.next() else {
         return Ok(false);
     };
+    if flag == ELEVATED_COPY_FLAG {
+        let args: Vec<OsString> = args.collect();
+        if args.len() != 2 {
+            return Err("Elevated copy received an invalid argument set.".to_string());
+        }
+        sync_package_contents(&PathBuf::from(&args[0]), &PathBuf::from(&args[1]))?;
+        return Ok(true);
+    }
     if flag != APPLY_UPDATE_FLAG {
         return Ok(false);
     }
@@ -151,7 +159,7 @@ pub fn prepare_and_spawn_update(release: &ReleaseInfo) -> Result<(), String> {
 }
 
 fn parse_apply_update_command(args: Vec<OsString>) -> Result<ApplyUpdateCommand, String> {
-    if args.len() < 5 || args.len() > 6 {
+    if args.len() != 5 {
         return Err("Updater helper received an invalid argument set.".to_string());
     }
 
@@ -160,42 +168,28 @@ fn parse_apply_update_command(args: Vec<OsString>) -> Result<ApplyUpdateCommand,
         .parse::<u32>()
         .map_err(|err| format!("Invalid parent pid for updater helper: {err}"))?;
 
-    let original_user = if args.len() == 6 {
-        let s = args[5].to_string_lossy();
-        let (uid_str, gid_str) = s
-            .split_once(':')
-            .ok_or_else(|| format!("Invalid elevation argument: {s}"))?;
-        Some((
-            uid_str
-                .parse::<u32>()
-                .map_err(|e| format!("Invalid uid: {e}"))?,
-            gid_str
-                .parse::<u32>()
-                .map_err(|e| format!("Invalid gid: {e}"))?,
-        ))
-    } else {
-        None
-    };
-
     Ok(ApplyUpdateCommand {
         parent_pid,
         staging_root: PathBuf::from(&args[1]),
         package_root: PathBuf::from(&args[2]),
         install_root: PathBuf::from(&args[3]),
         relaunch_executable: PathBuf::from(&args[4]),
-        original_user,
     })
 }
 
 fn run_apply_update_command(command: &ApplyUpdateCommand) -> Result<(), String> {
     wait_for_process_exit(command.parent_pid)?;
-    sync_package_contents(&command.package_root, &command.install_root)?;
+    if let Err(direct_err) = sync_package_contents(&command.package_root, &command.install_root) {
+        eprintln!("[updater] {direct_err}");
+        eprintln!("[updater] Requesting elevated permissions...");
+        run_elevated_copy(&command.package_root, &command.install_root)?;
+    }
     if let Some(parent) = command.install_root.parent() {
         let _ = std::env::set_current_dir(parent);
     } else {
         let _ = std::env::set_current_dir(&command.install_root);
     }
-    relaunch_updated_app(&command.relaunch_executable, command.original_user)?;
+    relaunch_updated_app(&command.relaunch_executable)?;
     cleanup_staging_root(&command.staging_root);
     Ok(())
 }
@@ -300,101 +294,58 @@ fn spawn_apply_helper(
         .parent()
         .ok_or_else(|| "Updater helper executable does not have a parent directory.".to_string())?;
 
-    if install_dir_writable(install_root) {
-        Command::new(helper_executable)
-            .arg(APPLY_UPDATE_FLAG)
-            .arg(parent_pid.to_string())
-            .arg(staging_root)
-            .arg(package_root)
-            .arg(install_root)
-            .arg(relaunch_executable)
-            .current_dir(helper_dir)
-            .spawn()
-            .map_err(|err| format!("Failed to launch updater helper: {err}"))?;
-    } else {
-        spawn_elevated_helper(
-            helper_executable,
-            parent_pid,
-            staging_root,
-            package_root,
-            install_root,
-            relaunch_executable,
-            helper_dir,
-        )?;
-    }
-
-    Ok(())
-}
-
-fn install_dir_writable(path: &Path) -> bool {
-    let probe = path.join(".st-update-probe");
-    match fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn spawn_elevated_helper(
-    helper_executable: &Path,
-    parent_pid: u32,
-    staging_root: &Path,
-    package_root: &Path,
-    install_root: &Path,
-    relaunch_executable: &Path,
-    helper_dir: &Path,
-) -> Result<(), String> {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-    Command::new("pkexec")
-        .arg(helper_executable)
+    Command::new(helper_executable)
         .arg(APPLY_UPDATE_FLAG)
         .arg(parent_pid.to_string())
         .arg(staging_root)
         .arg(package_root)
         .arg(install_root)
         .arg(relaunch_executable)
-        .arg(format!("{uid}:{gid}"))
         .current_dir(helper_dir)
         .spawn()
-        .map_err(|err| format!("Failed to launch elevated updater helper: {err}"))?;
+        .map_err(|err| format!("Failed to launch updater helper: {err}"))?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to locate current executable: {e}"))?;
+    let status = Command::new("pkexec")
+        .arg(&current_exe)
+        .arg(ELEVATED_COPY_FLAG)
+        .arg(package_root)
+        .arg(install_root)
+        .status()
+        .map_err(|e| format!("Failed to request elevated permissions: {e}"))?;
+    if !status.success() {
+        return Err("Elevated update was cancelled or failed.".to_string());
+    }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn spawn_elevated_helper(
-    helper_executable: &Path,
-    parent_pid: u32,
-    staging_root: &Path,
-    package_root: &Path,
-    install_root: &Path,
-    relaunch_executable: &Path,
-    helper_dir: &Path,
-) -> Result<(), String> {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to locate current executable: {e}"))?;
     let shell_cmd = format!(
-        "cd {} && {} {} {} {} {} {} {} {}",
-        shell_escape(&helper_dir.to_string_lossy()),
-        shell_escape(&helper_executable.to_string_lossy()),
-        shell_escape(APPLY_UPDATE_FLAG),
-        parent_pid,
-        shell_escape(&staging_root.to_string_lossy()),
+        "{} {} {} {}",
+        shell_escape(&current_exe.to_string_lossy()),
+        shell_escape(ELEVATED_COPY_FLAG),
         shell_escape(&package_root.to_string_lossy()),
         shell_escape(&install_root.to_string_lossy()),
-        shell_escape(&relaunch_executable.to_string_lossy()),
-        format!("{uid}:{gid}"),
     );
     let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("do shell script \"{escaped}\" with administrator privileges");
-    Command::new("osascript")
+    let status = Command::new("osascript")
         .arg("-e")
         .arg(&script)
-        .spawn()
-        .map_err(|err| format!("Failed to launch elevated updater helper: {err}"))?;
+        .status()
+        .map_err(|e| format!("Failed to request elevated permissions: {e}"))?;
+    if !status.success() {
+        return Err("Elevated update was cancelled or failed.".to_string());
+    }
     Ok(())
 }
 
@@ -503,20 +454,10 @@ fn copy_permissions(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn relaunch_updated_app(path: &Path, original_user: Option<(u32, u32)>) -> Result<(), String> {
+fn relaunch_updated_app(path: &Path) -> Result<(), String> {
     let mut command = Command::new(path);
     if let Some(parent) = path.parent() {
         command.current_dir(parent);
-    }
-    if let Some((uid, gid)) = original_user {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            command.pre_exec(move || {
-                libc::setgid(gid);
-                libc::setuid(uid);
-                Ok(())
-            });
-        }
     }
     command
         .spawn()
