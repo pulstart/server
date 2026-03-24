@@ -16,6 +16,55 @@
 use st_protocol::{StreamConfig, VideoCodec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityPreset {
+    LowLatency,
+    Balanced,
+    HighQuality,
+}
+
+impl QualityPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LowLatency => "Low Latency",
+            Self::Balanced => "Balanced",
+            Self::HighQuality => "High Quality",
+        }
+    }
+
+    pub fn nvenc_preset(self) -> &'static str {
+        match self {
+            Self::LowLatency => "p1",
+            Self::Balanced => "p4",
+            Self::HighQuality => "p7",
+        }
+    }
+
+    pub fn nvenc_tune(self) -> &'static str {
+        match self {
+            Self::LowLatency => "ull",
+            Self::Balanced => "ll",
+            Self::HighQuality => "hq",
+        }
+    }
+
+    pub fn sw_x26x_preset(self) -> &'static str {
+        match self {
+            Self::LowLatency => "ultrafast",
+            Self::Balanced => "veryfast",
+            Self::HighQuality => "medium",
+        }
+    }
+
+    pub fn sw_svtav1_preset(self) -> &'static str {
+        match self {
+            Self::LowLatency => "12",
+            Self::Balanced => "8",
+            Self::HighQuality => "4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     H264,
     Hevc,
@@ -80,6 +129,7 @@ pub struct EncoderConfig {
     pub gop_size: u32,
     pub max_b_frames: u32,
     pub low_delay: bool,
+    pub quality: QualityPreset,
 }
 
 impl EncoderConfig {
@@ -166,6 +216,7 @@ impl EncoderConfig {
             gop_size,
             max_b_frames: 0,
             low_delay: true,
+            quality: QualityPreset::Balanced,
         }
     }
 

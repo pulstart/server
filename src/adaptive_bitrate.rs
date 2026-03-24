@@ -120,13 +120,13 @@ impl ClientRateController {
         self.apply_feedback_at(feedback, Instant::now())
     }
 
-    const DOWNGRADE_COOLDOWN: Duration = Duration::from_millis(750);
-    const UPGRADE_COOLDOWN: Duration = Duration::from_secs(12);
-    const CLEAN_INTERVALS_FOR_UPGRADE: u32 = 10;
-    const STABLE_INTERVALS_FOR_PROMOTION: u32 = 24;
+    const DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(2);
+    const UPGRADE_COOLDOWN: Duration = Duration::from_secs(8);
+    const CLEAN_INTERVALS_FOR_UPGRADE: u32 = 6;
+    const STABLE_INTERVALS_FOR_PROMOTION: u32 = 18;
     const PROBE_FAILURE_WINDOW: Duration = Duration::from_secs(8);
-    const BASE_PROBE_BACKOFF: Duration = Duration::from_secs(20);
-    const MAX_PROBE_BACKOFF: Duration = Duration::from_secs(120);
+    const BASE_PROBE_BACKOFF: Duration = Duration::from_secs(16);
+    const MAX_PROBE_BACKOFF: Duration = Duration::from_secs(90);
 
     fn apply_feedback_at(&mut self, feedback: TransportFeedback, now: Instant) -> u32 {
         if feedback.received_packets == 0
@@ -171,24 +171,26 @@ impl ClientRateController {
             feedback.dropped_frames > 0 || feedback.lost_packets > 0 || feedback.late_packets > 0;
         let probe_failed = has_any_impairment && self.probe_failed_recently(now);
 
-        if frame_loss_ratio >= 0.10 || packet_loss_ratio >= 0.08 {
+        if frame_loss_ratio >= 0.15 || packet_loss_ratio >= 0.10 {
+            // Heavy loss — significant reduction
             self.clean_intervals = 0;
             if probe_failed {
                 self.revert_failed_probe(now);
             } else if startup || self.can_decrease(now) {
-                let factor = if startup { 50 } else { 70 };
+                let factor = if startup { 50 } else { 80 };
                 self.recommended_kbps = ((self.recommended_kbps as u64 * factor) / 100) as u32;
                 self.recommended_kbps = self.recommended_kbps.max(self.min_kbps);
                 self.last_decrease = now;
                 self.stable_kbps = self.recommended_kbps;
                 self.clear_pending_probe();
             }
-        } else if frame_loss_ratio >= 0.03 || packet_loss_ratio >= 0.02 || late_ratio >= 0.10 {
+        } else if frame_loss_ratio >= 0.05 || packet_loss_ratio >= 0.04 || late_ratio >= 0.15 {
+            // Moderate loss — gentle reduction
             self.clean_intervals = 0;
             if probe_failed {
                 self.revert_failed_probe(now);
             } else if startup || self.can_decrease(now) {
-                let factor = if startup { 50 } else { 85 };
+                let factor = if startup { 50 } else { 92 };
                 self.recommended_kbps = ((self.recommended_kbps as u64 * factor) / 100) as u32;
                 self.recommended_kbps = self.recommended_kbps.max(self.min_kbps);
                 self.last_decrease = now;
@@ -288,9 +290,9 @@ impl ClientRateController {
     }
 
     fn increase_step_kbps(&self) -> u32 {
-        let base = (self.stable_kbps.max(self.recommended_kbps) / 24).clamp(1_000, 4_000);
+        let base = (self.stable_kbps.max(self.recommended_kbps) / 12).clamp(2_000, 8_000);
         let divisor = self.probe_failures.saturating_add(1);
-        (base / divisor).max(1_000)
+        (base / divisor).max(1_500)
     }
 }
 

@@ -103,15 +103,14 @@ impl NvencEncoder {
                 .map(|value| value.clamp(1, 15))
                 .unwrap_or(8);
 
-            // Preset: p1 = fastest (matching Sunshine default)
+            // Preset and tuning from quality preset
             let preset = std::ffi::CString::new("preset").unwrap();
-            let p1 = std::ffi::CString::new("p1").unwrap();
-            ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), p1.as_ptr(), 0);
+            let preset_val = std::ffi::CString::new(config.quality.nvenc_preset()).unwrap();
+            ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), preset_val.as_ptr(), 0);
 
-            // Tuning: ultra low latency
             let tune = std::ffi::CString::new("tune").unwrap();
-            let ull = std::ffi::CString::new("ull").unwrap();
-            ffi::av_opt_set((*ctx).priv_data, tune.as_ptr(), ull.as_ptr(), 0);
+            let tune_val = std::ffi::CString::new(config.quality.nvenc_tune()).unwrap();
+            ffi::av_opt_set((*ctx).priv_data, tune.as_ptr(), tune_val.as_ptr(), 0);
 
             // Rate control: CBR
             let rc = std::ffi::CString::new("rc").unwrap();

@@ -112,13 +112,13 @@ impl SoftwareEncoder {
             colorspace.apply_to_codec_ctx(ctx);
         }
 
-        // Codec-specific options
+        // Codec-specific options (preset driven by quality setting)
         match config.codec {
             Codec::H264 => {
                 let preset = std::ffi::CString::new("preset").unwrap();
-                let ultrafast = std::ffi::CString::new("ultrafast").unwrap();
+                let preset_val = std::ffi::CString::new(config.quality.sw_x26x_preset()).unwrap();
                 unsafe {
-                    ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), ultrafast.as_ptr(), 0);
+                    ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), preset_val.as_ptr(), 0);
                 }
                 let tune = std::ffi::CString::new("tune").unwrap();
                 let zerolatency = std::ffi::CString::new("zerolatency").unwrap();
@@ -136,9 +136,9 @@ impl SoftwareEncoder {
             }
             Codec::Hevc => {
                 let preset = std::ffi::CString::new("preset").unwrap();
-                let ultrafast = std::ffi::CString::new("ultrafast").unwrap();
+                let preset_val = std::ffi::CString::new(config.quality.sw_x26x_preset()).unwrap();
                 unsafe {
-                    ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), ultrafast.as_ptr(), 0);
+                    ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), preset_val.as_ptr(), 0);
                 }
                 let tune = std::ffi::CString::new("tune").unwrap();
                 let zerolatency = std::ffi::CString::new("zerolatency").unwrap();
@@ -155,11 +155,10 @@ impl SoftwareEncoder {
                 }
             }
             Codec::Av1 => {
-                // SVT-AV1 specific options
                 let preset = std::ffi::CString::new("preset").unwrap();
-                let fast = std::ffi::CString::new("12").unwrap(); // Fastest preset
+                let preset_val = std::ffi::CString::new(config.quality.sw_svtav1_preset()).unwrap();
                 unsafe {
-                    ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), fast.as_ptr(), 0);
+                    ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), preset_val.as_ptr(), 0);
                 }
             }
         }

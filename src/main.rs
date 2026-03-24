@@ -221,12 +221,20 @@ fn select_linux_encoder(
     framerate: u32,
     client_supported_codecs: VideoCodecSupport,
     client_hardware_codecs: VideoCodecSupport,
+    control: &ServerControl,
 ) -> Result<(EncoderConfig, EncoderKind), String> {
-    let prefer_first_success = EncoderConfig::preferred_codec_from_env().is_some();
+    let forced_codec = control.forced_codec();
+    let forced_quality = control.forced_quality();
+    let prefer_first_success = forced_codec.is_some() || EncoderConfig::preferred_codec_from_env().is_some();
     let mut failures = Vec::new();
     let mut selected: Option<(EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8))> = None;
 
-    for codec in EncoderConfig::preferred_codec_order_from_env() {
+    let codec_order = if let Some(codec) = forced_codec {
+        encode_config::Codec::preferred_order(Some(codec))
+    } else {
+        EncoderConfig::preferred_codec_order_from_env()
+    };
+    for codec in codec_order {
         if !client_supported_codecs.supports(codec.to_stream_codec()) {
             failures.push(format!(
                 "{} skipped: client does not support it",
@@ -235,7 +243,10 @@ fn select_linux_encoder(
             continue;
         }
 
-        let config = EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
+        let mut config = EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
+        if let Some(quality) = forced_quality {
+            config.quality = quality;
+        }
         match create_linux_encoder(&config) {
             Ok(encoder) => {
                 let backend = encoder_backend(&encoder);
@@ -355,6 +366,7 @@ impl SharedPipeline {
         client_supported_codecs: VideoCodecSupport,
         client_hardware_codecs: VideoCodecSupport,
         input: Arc<InputRuntime>,
+        control: Arc<ServerControl>,
     ) -> Result<(Self, ClientSubscription), String> {
         let video_bc = Arc::new(Broadcaster::new());
         #[cfg(target_os = "linux")]
@@ -378,6 +390,7 @@ impl SharedPipeline {
                 client_supported_codecs,
                 client_hardware_codecs,
                 input,
+                control,
                 vbc,
                 #[cfg(target_os = "linux")]
                 abc,
@@ -463,6 +476,7 @@ fn run_shared_pipeline(
     client_supported_codecs: VideoCodecSupport,
     client_hardware_codecs: VideoCodecSupport,
     input: Arc<InputRuntime>,
+    control: Arc<ServerControl>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     #[cfg(target_os = "linux")] audio_bc: Arc<Broadcaster<Vec<u8>>>,
 ) {
@@ -522,6 +536,7 @@ fn run_shared_pipeline(
         negotiated_fps,
         client_supported_codecs,
         client_hardware_codecs,
+        &control,
     ) {
         Ok(selected) => selected,
         Err(msg) => {
@@ -539,11 +554,20 @@ fn run_shared_pipeline(
         negotiated_fps,
     );
 
-    let rate_control = Arc::new(AdaptiveBitrateState::new(
-        config.bitrate_kbps,
-        config.min_bitrate_kbps,
-        config.max_bitrate_kbps,
-    ));
+    let forced_bitrate = control.forced_bitrate_kbps();
+    let rate_control = if forced_bitrate > 0 {
+        Arc::new(AdaptiveBitrateState::new(
+            forced_bitrate,
+            forced_bitrate,
+            forced_bitrate,
+        ))
+    } else {
+        Arc::new(AdaptiveBitrateState::new(
+            config.bitrate_kbps,
+            config.min_bitrate_kbps,
+            config.max_bitrate_kbps,
+        ))
+    };
 
     #[cfg(target_os = "macos")]
     let mut encoder = match encode_vt::VTEncoder::new(
@@ -600,6 +624,7 @@ fn run_shared_pipeline(
         capture_backend: capture_backend_name,
         input_backend: input.backend_label(),
         target_bitrate_kbps: config.bitrate_kbps,
+        quality_preset: config.quality.label().to_string(),
     };
 
     println!(
@@ -725,7 +750,12 @@ fn run_shared_pipeline(
                     }
                 }
 
-                let target_bitrate = rate_control.current_target_kbps();
+                let forced_br = control.forced_bitrate_kbps();
+                let target_bitrate = if forced_br > 0 {
+                    forced_br
+                } else {
+                    rate_control.current_target_kbps()
+                };
                 if pending_encoder_rebuild.is_none()
                     && should_schedule_bitrate_reconfigure(
                         current_config.bitrate_kbps,
@@ -733,7 +763,13 @@ fn run_shared_pipeline(
                         last_encoder_reconfigure,
                     )
                 {
-                    let next_config = current_config.with_bitrate_kbps(target_bitrate);
+                    let next_config = if forced_br > 0 {
+                        let mut c = current_config.clone();
+                        c.bitrate_kbps = forced_br;
+                        c
+                    } else {
+                        current_config.with_bitrate_kbps(target_bitrate)
+                    };
                     let backend = encoder_backend(&encoder);
                     match update_encoder_bitrate(&mut encoder, &next_config) {
                         Ok(()) => {
@@ -1210,6 +1246,7 @@ async fn handle_client(
                     supported_codecs_for_setup,
                     hardware_codecs_for_setup,
                     Arc::clone(&state2.input),
+                    Arc::clone(&state2.control),
                 )?;
                 let stream_config = started.stream_config;
                 let rate_control = Arc::clone(&started.rate_control);

@@ -1,3 +1,4 @@
+use crate::encode_config::{Codec, QualityPreset};
 use crate::server_control::{ConnectedClientSnapshot, ServerControl, UpdateStateSnapshot};
 use crate::updater;
 use std::sync::Arc;
@@ -35,6 +36,12 @@ const INSTALL_UPDATE_ID: &str = "install-update";
 const QUIT_ID: &str = "quit";
 #[cfg(target_os = "macos")]
 const DROP_CLIENT_ID_PREFIX: &str = "drop-client:";
+#[cfg(target_os = "macos")]
+const VIDEO_CODEC_PREFIX: &str = "video-codec:";
+#[cfg(target_os = "macos")]
+const VIDEO_BITRATE_PREFIX: &str = "video-bitrate:";
+#[cfg(target_os = "macos")]
+const VIDEO_QUALITY_PREFIX: &str = "video-quality:";
 
 pub fn should_run_tray() -> bool {
     if std::env::var_os("ST_SERVER_NO_TRAY").is_some() {
@@ -158,6 +165,32 @@ impl ksni::Tray for LinuxTray {
             .into(),
             LinuxMenuItem::Separator,
             LinuxSubMenu {
+                label: "Video".into(),
+                submenu: vec![
+                    LinuxSubMenu {
+                        label: format!("Codec: {}", codec_label(self.control.forced_codec())),
+                        submenu: linux_codec_menu_items(&self.control),
+                        ..Default::default()
+                    }
+                    .into(),
+                    LinuxSubMenu {
+                        label: format!("Bitrate: {}", bitrate_label(self.control.forced_bitrate_kbps())),
+                        submenu: linux_bitrate_menu_items(&self.control),
+                        ..Default::default()
+                    }
+                    .into(),
+                    LinuxSubMenu {
+                        label: format!("Quality: {}", quality_label(self.control.forced_quality())),
+                        submenu: linux_quality_menu_items(&self.control),
+                        ..Default::default()
+                    }
+                    .into(),
+                ],
+                ..Default::default()
+            }
+            .into(),
+            LinuxMenuItem::Separator,
+            LinuxSubMenu {
                 label: "Connected Clients".into(),
                 submenu: linux_client_menu_items(&clients),
                 ..Default::default()
@@ -213,6 +246,88 @@ fn linux_client_menu_items(clients: &[ConnectedClientSnapshot]) -> Vec<LinuxMenu
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn linux_codec_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<LinuxTray>> {
+    let current = control.forced_codec();
+    let options: [(Option<Codec>, &str); 4] = [
+        (None, "Best Available (Default)"),
+        (Some(Codec::H264), "H.264"),
+        (Some(Codec::Hevc), "HEVC"),
+        (Some(Codec::Av1), "AV1"),
+    ];
+    options
+        .into_iter()
+        .map(|(codec, label)| {
+            LinuxCheckmarkItem {
+                label: label.into(),
+                checked: current == codec,
+                activate: Box::new(move |tray: &mut LinuxTray| {
+                    tray.control.set_forced_codec(codec);
+                }),
+                ..Default::default()
+            }
+            .into()
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bitrate_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<LinuxTray>> {
+    let current = control.forced_bitrate_kbps();
+    let options: [(u32, &str); 11] = [
+        (0, "Adaptive (Default)"),
+        (1_000, "1 Mbps"),
+        (5_000, "5 Mbps"),
+        (10_000, "10 Mbps"),
+        (20_000, "20 Mbps"),
+        (30_000, "30 Mbps"),
+        (50_000, "50 Mbps"),
+        (80_000, "80 Mbps"),
+        (100_000, "100 Mbps"),
+        (150_000, "150 Mbps"),
+        (200_000, "200 Mbps"),
+    ];
+    options
+        .into_iter()
+        .map(|(kbps, label)| {
+            LinuxCheckmarkItem {
+                label: label.into(),
+                checked: current == kbps,
+                activate: Box::new(move |tray: &mut LinuxTray| {
+                    tray.control.set_forced_bitrate_kbps(kbps);
+                }),
+                ..Default::default()
+            }
+            .into()
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_quality_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<LinuxTray>> {
+    let current = control.forced_quality();
+    let options: [(Option<QualityPreset>, &str); 4] = [
+        (None, "Balanced (Default)"),
+        (Some(QualityPreset::LowLatency), "Low Latency"),
+        (Some(QualityPreset::Balanced), "Balanced"),
+        (Some(QualityPreset::HighQuality), "High Quality"),
+    ];
+    options
+        .into_iter()
+        .map(|(quality, label)| {
+            LinuxCheckmarkItem {
+                label: label.into(),
+                checked: current == quality,
+                activate: Box::new(move |tray: &mut LinuxTray| {
+                    tray.control.set_forced_quality(quality);
+                }),
+                ..Default::default()
+            }
+            .into()
+        })
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 fn run_macos_tray(control: Arc<ServerControl>) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|err| format!("Failed to create tray event loop: {err}"))?;
@@ -235,6 +350,9 @@ struct TrayApp {
     allow_item: Option<CheckMenuItem>,
     clients_submenu: Option<Submenu>,
     client_items: Vec<MenuItem>,
+    codec_items: Vec<CheckMenuItem>,
+    bitrate_items: Vec<CheckMenuItem>,
+    quality_items: Vec<CheckMenuItem>,
     last_version: usize,
 }
 
@@ -252,6 +370,9 @@ impl TrayApp {
             allow_item: None,
             clients_submenu: None,
             client_items: Vec::new(),
+            codec_items: Vec::new(),
+            bitrate_items: Vec::new(),
+            quality_items: Vec::new(),
             last_version: 0,
         }
     }
@@ -280,6 +401,91 @@ impl TrayApp {
             .build()
             .map_err(|err| format!("Failed to build clients submenu: {err}"))?;
         let quit_item = MenuItem::with_id(QUIT_ID, "Quit", true, None);
+
+        // --- Video submenu ---
+        let codec_options: [(Option<Codec>, &str); 4] = [
+            (None, "Best Available (Default)"),
+            (Some(Codec::H264), "H.264"),
+            (Some(Codec::Hevc), "HEVC"),
+            (Some(Codec::Av1), "AV1"),
+        ];
+        let current_codec = self.control.forced_codec();
+        let codec_submenu = SubmenuBuilder::new()
+            .text(format!("Codec: {}", codec_label(current_codec)))
+            .enabled(true)
+            .build()
+            .map_err(|err| format!("Failed to build codec submenu: {err}"))?;
+        let mut codec_items = Vec::new();
+        for (codec, label) in &codec_options {
+            let id = format!("{VIDEO_CODEC_PREFIX}{}", codec.map_or("auto", |c| match c {
+                Codec::H264 => "h264",
+                Codec::Hevc => "hevc",
+                Codec::Av1 => "av1",
+            }));
+            let item = CheckMenuItem::with_id(id, *label, true, current_codec == *codec, None);
+            codec_submenu.append(&item).map_err(|err| format!("Failed to append codec item: {err}"))?;
+            codec_items.push(item);
+        }
+
+        let bitrate_options: [(u32, &str); 11] = [
+            (0, "Adaptive (Default)"),
+            (1_000, "1 Mbps"),
+            (5_000, "5 Mbps"),
+            (10_000, "10 Mbps"),
+            (20_000, "20 Mbps"),
+            (30_000, "30 Mbps"),
+            (50_000, "50 Mbps"),
+            (80_000, "80 Mbps"),
+            (100_000, "100 Mbps"),
+            (150_000, "150 Mbps"),
+            (200_000, "200 Mbps"),
+        ];
+        let current_bitrate = self.control.forced_bitrate_kbps();
+        let bitrate_submenu = SubmenuBuilder::new()
+            .text(format!("Bitrate: {}", bitrate_label(current_bitrate)))
+            .enabled(true)
+            .build()
+            .map_err(|err| format!("Failed to build bitrate submenu: {err}"))?;
+        let mut bitrate_items = Vec::new();
+        for (kbps, label) in &bitrate_options {
+            let id = format!("{VIDEO_BITRATE_PREFIX}{kbps}");
+            let item = CheckMenuItem::with_id(id, *label, true, current_bitrate == *kbps, None);
+            bitrate_submenu.append(&item).map_err(|err| format!("Failed to append bitrate item: {err}"))?;
+            bitrate_items.push(item);
+        }
+
+        let quality_options: [(Option<QualityPreset>, &str); 4] = [
+            (None, "Balanced (Default)"),
+            (Some(QualityPreset::LowLatency), "Low Latency"),
+            (Some(QualityPreset::Balanced), "Balanced"),
+            (Some(QualityPreset::HighQuality), "High Quality"),
+        ];
+        let current_quality = self.control.forced_quality();
+        let quality_submenu = SubmenuBuilder::new()
+            .text(format!("Quality: {}", quality_label(current_quality)))
+            .enabled(true)
+            .build()
+            .map_err(|err| format!("Failed to build quality submenu: {err}"))?;
+        let mut quality_items = Vec::new();
+        for (quality, label) in &quality_options {
+            let id = format!("{VIDEO_QUALITY_PREFIX}{}", quality.map_or("auto", |q| match q {
+                QualityPreset::LowLatency => "low-latency",
+                QualityPreset::Balanced => "balanced",
+                QualityPreset::HighQuality => "high-quality",
+            }));
+            let item = CheckMenuItem::with_id(id, *label, true, current_quality == *quality, None);
+            quality_submenu.append(&item).map_err(|err| format!("Failed to append quality item: {err}"))?;
+            quality_items.push(item);
+        }
+
+        let video_submenu = SubmenuBuilder::new()
+            .text("Video")
+            .enabled(true)
+            .build()
+            .map_err(|err| format!("Failed to build video submenu: {err}"))?;
+        video_submenu.append(&codec_submenu).map_err(|err| format!("Failed to append codec submenu: {err}"))?;
+        video_submenu.append(&bitrate_submenu).map_err(|err| format!("Failed to append bitrate submenu: {err}"))?;
+        video_submenu.append(&quality_submenu).map_err(|err| format!("Failed to append quality submenu: {err}"))?;
 
         let root_menu = SubmenuBuilder::new()
             .text("st-server")
@@ -314,6 +520,12 @@ impl TrayApp {
             .append(&PredefinedMenuItem::separator())
             .map_err(|err| format!("Failed to append tray separator: {err}"))?;
         root_menu
+            .append(&video_submenu)
+            .map_err(|err| format!("Failed to append tray video submenu: {err}"))?;
+        root_menu
+            .append(&PredefinedMenuItem::separator())
+            .map_err(|err| format!("Failed to append tray separator: {err}"))?;
+        root_menu
             .append(&clients_submenu)
             .map_err(|err| format!("Failed to append tray clients submenu: {err}"))?;
         root_menu
@@ -344,6 +556,9 @@ impl TrayApp {
         self.install_update_item = Some(install_update_item);
         self.allow_item = Some(allow_item);
         self.clients_submenu = Some(clients_submenu);
+        self.codec_items = codec_items;
+        self.bitrate_items = bitrate_items;
+        self.quality_items = quality_items;
         self.sync_from_state()?;
         Ok(())
     }
@@ -380,6 +595,28 @@ impl TrayApp {
         }
         if let Some(tray) = &self.tray {
             let _ = tray.set_tooltip(Some(tray_tooltip_text(&self.control)));
+        }
+
+        // Sync video option checkmarks
+        let current_codec = self.control.forced_codec();
+        let codec_values: [Option<Codec>; 4] = [None, Some(Codec::H264), Some(Codec::Hevc), Some(Codec::Av1)];
+        for (item, value) in self.codec_items.iter().zip(codec_values.iter()) {
+            item.set_checked(current_codec == *value);
+        }
+        let current_bitrate = self.control.forced_bitrate_kbps();
+        let bitrate_values: [u32; 11] = [0, 1_000, 5_000, 10_000, 20_000, 30_000, 50_000, 80_000, 100_000, 150_000, 200_000];
+        for (item, value) in self.bitrate_items.iter().zip(bitrate_values.iter()) {
+            item.set_checked(current_bitrate == *value);
+        }
+        let current_quality = self.control.forced_quality();
+        let quality_values: [Option<QualityPreset>; 4] = [
+            None,
+            Some(QualityPreset::LowLatency),
+            Some(QualityPreset::Balanced),
+            Some(QualityPreset::HighQuality),
+        ];
+        for (item, value) in self.quality_items.iter().zip(quality_values.iter()) {
+            item.set_checked(current_quality == *value);
         }
 
         self.rebuild_clients_menu(&clients)
@@ -437,6 +674,26 @@ impl TrayApp {
                 if let Ok(client_id) = client_id.parse() {
                     let _ = self.control.request_disconnect(client_id);
                 }
+            } else if let Some(suffix) = id.strip_prefix(VIDEO_CODEC_PREFIX) {
+                let codec = match suffix {
+                    "h264" => Some(Codec::H264),
+                    "hevc" => Some(Codec::Hevc),
+                    "av1" => Some(Codec::Av1),
+                    _ => None,
+                };
+                self.control.set_forced_codec(codec);
+            } else if let Some(suffix) = id.strip_prefix(VIDEO_BITRATE_PREFIX) {
+                if let Ok(kbps) = suffix.parse::<u32>() {
+                    self.control.set_forced_bitrate_kbps(kbps);
+                }
+            } else if let Some(suffix) = id.strip_prefix(VIDEO_QUALITY_PREFIX) {
+                let quality = match suffix {
+                    "low-latency" => Some(QualityPreset::LowLatency),
+                    "balanced" => Some(QualityPreset::Balanced),
+                    "high-quality" => Some(QualityPreset::HighQuality),
+                    _ => None,
+                };
+                self.control.set_forced_quality(quality);
             }
         }
         false
@@ -474,6 +731,30 @@ impl ApplicationHandler for TrayApp {
         _window_id: winit::window::WindowId,
         _event: winit::event::WindowEvent,
     ) {
+    }
+}
+
+fn codec_label(codec: Option<Codec>) -> &'static str {
+    match codec {
+        None => "Best Available",
+        Some(Codec::H264) => "H.264",
+        Some(Codec::Hevc) => "HEVC",
+        Some(Codec::Av1) => "AV1",
+    }
+}
+
+fn bitrate_label(kbps: u32) -> String {
+    if kbps == 0 {
+        "Adaptive".into()
+    } else {
+        format!("{} Mbps", kbps / 1_000)
+    }
+}
+
+fn quality_label(quality: Option<QualityPreset>) -> &'static str {
+    match quality {
+        None => "Balanced",
+        Some(q) => q.label(),
     }
 }
 

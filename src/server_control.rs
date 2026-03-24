@@ -1,15 +1,69 @@
+use crate::encode_config::{Codec, QualityPreset};
 use crate::updater::{self, ReleaseInfo};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const CONFIG_FILENAME: &str = "st-server-config.json";
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codec: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    bitrate_kbps: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality: Option<String>,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+impl PersistedSettings {
+    fn codec_value(&self) -> u8 {
+        match self.codec.as_deref() {
+            Some("h264") => 1,
+            Some("hevc") => 2,
+            Some("av1") => 3,
+            _ => 0,
+        }
+    }
+
+    fn quality_value(&self) -> u8 {
+        match self.quality.as_deref() {
+            Some("low_latency") => 1,
+            Some("balanced") => 2,
+            Some("high_quality") => 3,
+            _ => 0,
+        }
+    }
+}
+
+fn config_path() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|exe| {
+        exe.parent().map(|dir| dir.join(CONFIG_FILENAME))
+    })
+}
+
+fn load_settings() -> PersistedSettings {
+    let Some(path) = config_path() else {
+        return PersistedSettings::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => PersistedSettings::default(),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ConnectedClientSnapshot {
@@ -50,10 +104,15 @@ pub struct ServerControl {
     update_state: Mutex<UpdateStateSnapshot>,
     update_task_running: AtomicBool,
     auto_update_checks_started: AtomicBool,
+    // Video overrides (0 = auto for all)
+    forced_codec: AtomicU8,
+    forced_bitrate_kbps: AtomicU32,
+    forced_quality: AtomicU8,
 }
 
 impl ServerControl {
     pub fn new() -> Arc<Self> {
+        let saved = load_settings();
         Arc::new(Self {
             allow_new_connections: AtomicBool::new(true),
             shutdown_requested: AtomicBool::new(false),
@@ -63,6 +122,9 @@ impl ServerControl {
             update_state: Mutex::new(initial_update_state()),
             update_task_running: AtomicBool::new(false),
             auto_update_checks_started: AtomicBool::new(false),
+            forced_codec: AtomicU8::new(saved.codec_value()),
+            forced_bitrate_kbps: AtomicU32::new(saved.bitrate_kbps),
+            forced_quality: AtomicU8::new(saved.quality_value()),
         })
     }
 
@@ -231,6 +293,90 @@ impl ServerControl {
         let clients = self.clients.lock().unwrap();
         for entry in clients.values() {
             entry.disconnect_requested.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // --- Video overrides ---
+
+    pub fn forced_codec(&self) -> Option<Codec> {
+        match self.forced_codec.load(Ordering::SeqCst) {
+            1 => Some(Codec::H264),
+            2 => Some(Codec::Hevc),
+            3 => Some(Codec::Av1),
+            _ => None,
+        }
+    }
+
+    pub fn set_forced_codec(&self, codec: Option<Codec>) {
+        let v = match codec {
+            None => 0,
+            Some(Codec::H264) => 1,
+            Some(Codec::Hevc) => 2,
+            Some(Codec::Av1) => 3,
+        };
+        self.forced_codec.store(v, Ordering::SeqCst);
+        self.bump_version();
+        self.save_video_settings();
+    }
+
+    /// Returns 0 for auto (adaptive bitrate).
+    pub fn forced_bitrate_kbps(&self) -> u32 {
+        self.forced_bitrate_kbps.load(Ordering::SeqCst)
+    }
+
+    /// Set to 0 for auto (adaptive bitrate).
+    pub fn set_forced_bitrate_kbps(&self, kbps: u32) {
+        self.forced_bitrate_kbps.store(kbps, Ordering::SeqCst);
+        self.bump_version();
+        self.save_video_settings();
+    }
+
+    pub fn forced_quality(&self) -> Option<QualityPreset> {
+        match self.forced_quality.load(Ordering::SeqCst) {
+            1 => Some(QualityPreset::LowLatency),
+            2 => Some(QualityPreset::Balanced),
+            3 => Some(QualityPreset::HighQuality),
+            _ => None,
+        }
+    }
+
+    pub fn set_forced_quality(&self, quality: Option<QualityPreset>) {
+        let v = match quality {
+            None => 0,
+            Some(QualityPreset::LowLatency) => 1,
+            Some(QualityPreset::Balanced) => 2,
+            Some(QualityPreset::HighQuality) => 3,
+        };
+        self.forced_quality.store(v, Ordering::SeqCst);
+        self.bump_version();
+        self.save_video_settings();
+    }
+
+    fn save_video_settings(&self) {
+        let settings = PersistedSettings {
+            codec: match self.forced_codec.load(Ordering::SeqCst) {
+                1 => Some("h264".into()),
+                2 => Some("hevc".into()),
+                3 => Some("av1".into()),
+                _ => None,
+            },
+            bitrate_kbps: self.forced_bitrate_kbps.load(Ordering::SeqCst),
+            quality: match self.forced_quality.load(Ordering::SeqCst) {
+                1 => Some("low_latency".into()),
+                2 => Some("balanced".into()),
+                3 => Some("high_quality".into()),
+                _ => None,
+            },
+        };
+        if let Some(path) = config_path() {
+            match serde_json::to_string_pretty(&settings) {
+                Ok(json) => {
+                    if let Err(err) = std::fs::write(&path, json) {
+                        eprintln!("[config] Failed to save {}: {err}", path.display());
+                    }
+                }
+                Err(err) => eprintln!("[config] Failed to serialize settings: {err}"),
+            }
         }
     }
 
