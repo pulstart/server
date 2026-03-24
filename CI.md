@@ -22,6 +22,8 @@ Release flow:
 - GitHub Actions stamps that version into `Cargo.toml`
 - Linux artifacts are published as `tar.gz`
 - macOS artifacts are published as zipped `.app` bundles
+- If a GitHub release already exists for that tag, the publish job deletes it and recreates it
+  before uploading the fresh artifacts
 
 Linux release notes:
 

@@ -127,6 +127,31 @@ jobs:
         with:
           path: release-artifacts
 
+      - name: Recreate existing release for this tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace("refs/tags/", "");
+            try {
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+              core.info(`Deleting existing release ${release.id} for tag ${tag}`);
+              await github.rest.repos.deleteRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: release.id,
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                core.info(`No existing release found for tag ${tag}`);
+                return;
+              }
+              throw error;
+            }
+
       - name: Publish assets
         uses: softprops/action-gh-release@v2
         with:
