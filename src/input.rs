@@ -1734,6 +1734,7 @@ fn macos_key_code(key: KeyboardKey) -> Option<u16> {
 
 #[cfg(target_os = "linux")]
 #[allow(non_snake_case, non_upper_case_globals, non_camel_case_types)]
+#[allow(dead_code)]
 mod x11_ffi {
     use std::ffi::c_void;
     use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_ulong};
@@ -1753,6 +1754,17 @@ mod x11_ffi {
         pub fn XKeysymToKeycode(display: *mut Display, keysym: KeySym) -> c_uchar;
         pub fn XStringToKeysym(string: *const c_char) -> KeySym;
         pub fn XSync(display: *mut Display, discard: Bool) -> c_int;
+        pub fn XQueryPointer(
+            display: *mut Display,
+            w: Window,
+            root_return: *mut Window,
+            child_return: *mut Window,
+            root_x_return: *mut c_int,
+            root_y_return: *mut c_int,
+            win_x_return: *mut c_int,
+            win_y_return: *mut c_int,
+            mask_return: *mut c_uint,
+        ) -> Bool;
     }
 
     extern "C" {
@@ -1794,10 +1806,12 @@ mod x11_ffi {
 #[cfg(target_os = "linux")]
 struct X11InputController {
     display: *mut x11_ffi::Display,
-    screen: i32,
+    _screen: i32,
     _root: x11_ffi::Window,
     width: i32,
     height: i32,
+    tracked_x: i32,
+    tracked_y: i32,
 }
 
 #[cfg(target_os = "linux")]
@@ -1833,27 +1847,54 @@ impl X11InputController {
         let root = unsafe { x11_ffi::XRootWindow(display, screen) };
         let width = unsafe { x11_ffi::XDisplayWidth(display, screen) };
         let height = unsafe { x11_ffi::XDisplayHeight(display, screen) };
+        let (tracked_x, tracked_y) = unsafe {
+            let mut root_ret: x11_ffi::Window = 0;
+            let mut child_ret: x11_ffi::Window = 0;
+            let mut root_x: std::os::raw::c_int = 0;
+            let mut root_y: std::os::raw::c_int = 0;
+            let mut win_x: std::os::raw::c_int = 0;
+            let mut win_y: std::os::raw::c_int = 0;
+            let mut mask: std::os::raw::c_uint = 0;
+            x11_ffi::XQueryPointer(
+                display, root,
+                &mut root_ret, &mut child_ret,
+                &mut root_x, &mut root_y,
+                &mut win_x, &mut win_y,
+                &mut mask,
+            );
+            (root_x, root_y)
+        };
         Ok(Self {
             display,
-            screen,
+            _screen: screen,
             _root: root,
             width,
             height,
+            tracked_x,
+            tracked_y,
         })
     }
 
     fn move_absolute(&mut self, x: u16, y: u16) {
         let width = self.width.max(1) as i64;
         let height = self.height.max(1) as i64;
-        let abs_x = (x as i64 * (width - 1).max(0) + 32767) / 65535;
-        let abs_y = (y as i64 * (height - 1).max(0) + 32767) / 65535;
-        unsafe {
-            x11_ffi::XTestFakeMotionEvent(self.display, self.screen, abs_x as i32, abs_y as i32, 0);
-            x11_ffi::XSync(self.display, 0);
+        let target_x = ((x as i64 * (width - 1).max(0) + 32767) / 65535) as i32;
+        let target_y = ((y as i64 * (height - 1).max(0) + 32767) / 65535) as i32;
+        let dx = target_x - self.tracked_x;
+        let dy = target_y - self.tracked_y;
+        self.tracked_x = target_x;
+        self.tracked_y = target_y;
+        if dx != 0 || dy != 0 {
+            unsafe {
+                x11_ffi::XTestFakeRelativeMotionEvent(self.display, dx, dy, 0);
+                x11_ffi::XSync(self.display, 0);
+            }
         }
     }
 
     fn move_relative(&mut self, dx: i16, dy: i16) {
+        self.tracked_x = (self.tracked_x + dx as i32).clamp(0, (self.width - 1).max(0));
+        self.tracked_y = (self.tracked_y + dy as i32).clamp(0, (self.height - 1).max(0));
         unsafe {
             x11_ffi::XTestFakeRelativeMotionEvent(self.display, dx as i32, dy as i32, 0);
             x11_ffi::XSync(self.display, 0);

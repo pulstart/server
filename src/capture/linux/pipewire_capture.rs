@@ -421,6 +421,7 @@ pub(crate) struct RemoteDesktopPortalSession {
     stream_node_id: u32,
     logical_width: Mutex<f64>,
     logical_height: Mutex<f64>,
+    tracked_pos: Mutex<Option<(f64, f64)>>,
 }
 
 impl RemoteDesktopPortalSession {
@@ -436,6 +437,7 @@ impl RemoteDesktopPortalSession {
             stream_node_id: stream_info.node_id,
             logical_width: Mutex::new(stream_info.logical_width),
             logical_height: Mutex::new(stream_info.logical_height),
+            tracked_pos: Mutex::new(None),
         }
     }
 
@@ -463,36 +465,83 @@ impl RemoteDesktopPortalSession {
     pub(crate) fn notify_pointer_motion_absolute(&self, x: u16, y: u16) -> Result<(), String> {
         let width = (*self.logical_width.lock().unwrap()).max(1.0);
         let height = (*self.logical_height.lock().unwrap()).max(1.0);
-        let abs_x = (x as f64 / 65535.0) * (width - 1.0).max(0.0);
-        let abs_y = (y as f64 / 65535.0) * (height - 1.0).max(0.0);
-        self.with_remote_desktop_proxy(|runtime, connection, session_path| {
-            runtime.block_on(async {
-                let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
-                    .destination("org.freedesktop.portal.Desktop")
-                    .map_err(|e| format!("portal dest: {e}"))?
-                    .path("/org/freedesktop/portal/desktop")
-                    .map_err(|e| format!("portal path: {e}"))?
-                    .interface("org.freedesktop.portal.RemoteDesktop")
-                    .map_err(|e| format!("portal iface: {e}"))?
-                    .build()
-                    .await
-                    .map_err(|e| format!("portal proxy: {e}"))?;
-                let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
-                let session = zvariant::ObjectPath::try_from(session_path)
-                    .map_err(|e| format!("session path: {e}"))?;
-                let _: () = proxy
-                    .call(
-                        "NotifyPointerMotionAbsolute",
-                        &(&session, opts, self.stream_node_id, abs_x, abs_y),
-                    )
-                    .await
-                    .map_err(|e| format!("NotifyPointerMotionAbsolute: {e}"))?;
-                Ok(())
+        let target_x = (x as f64 / 65535.0) * (width - 1.0).max(0.0);
+        let target_y = (y as f64 / 65535.0) * (height - 1.0).max(0.0);
+        let mut tracked = self.tracked_pos.lock().unwrap();
+        if let Some((prev_x, prev_y)) = *tracked {
+            let dx = target_x - prev_x;
+            let dy = target_y - prev_y;
+            *tracked = Some((target_x, target_y));
+            drop(tracked);
+            if dx.abs() < 0.001 && dy.abs() < 0.001 {
+                return Ok(());
+            }
+            self.with_remote_desktop_proxy(|runtime, connection, session_path| {
+                runtime.block_on(async {
+                    let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+                        .destination("org.freedesktop.portal.Desktop")
+                        .map_err(|e| format!("portal dest: {e}"))?
+                        .path("/org/freedesktop/portal/desktop")
+                        .map_err(|e| format!("portal path: {e}"))?
+                        .interface("org.freedesktop.portal.RemoteDesktop")
+                        .map_err(|e| format!("portal iface: {e}"))?
+                        .build()
+                        .await
+                        .map_err(|e| format!("portal proxy: {e}"))?;
+                    let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
+                    let session = zvariant::ObjectPath::try_from(session_path)
+                        .map_err(|e| format!("session path: {e}"))?;
+                    let _: () = proxy
+                        .call(
+                            "NotifyPointerMotion",
+                            &(&session, opts, dx, dy),
+                        )
+                        .await
+                        .map_err(|e| format!("NotifyPointerMotion: {e}"))?;
+                    Ok(())
+                })
             })
-        })
+        } else {
+            *tracked = Some((target_x, target_y));
+            drop(tracked);
+            self.with_remote_desktop_proxy(|runtime, connection, session_path| {
+                runtime.block_on(async {
+                    let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+                        .destination("org.freedesktop.portal.Desktop")
+                        .map_err(|e| format!("portal dest: {e}"))?
+                        .path("/org/freedesktop/portal/desktop")
+                        .map_err(|e| format!("portal path: {e}"))?
+                        .interface("org.freedesktop.portal.RemoteDesktop")
+                        .map_err(|e| format!("portal iface: {e}"))?
+                        .build()
+                        .await
+                        .map_err(|e| format!("portal proxy: {e}"))?;
+                    let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
+                    let session = zvariant::ObjectPath::try_from(session_path)
+                        .map_err(|e| format!("session path: {e}"))?;
+                    let _: () = proxy
+                        .call(
+                            "NotifyPointerMotionAbsolute",
+                            &(&session, opts, self.stream_node_id, target_x, target_y),
+                        )
+                        .await
+                        .map_err(|e| format!("NotifyPointerMotionAbsolute: {e}"))?;
+                    Ok(())
+                })
+            })
+        }
     }
 
     pub(crate) fn notify_pointer_motion_relative(&self, dx: i16, dy: i16) -> Result<(), String> {
+        {
+            let width = (*self.logical_width.lock().unwrap()).max(1.0);
+            let height = (*self.logical_height.lock().unwrap()).max(1.0);
+            let mut tracked = self.tracked_pos.lock().unwrap();
+            if let Some((ref mut tx, ref mut ty)) = *tracked {
+                *tx = (*tx + dx as f64).clamp(0.0, (width - 1.0).max(0.0));
+                *ty = (*ty + dy as f64).clamp(0.0, (height - 1.0).max(0.0));
+            }
+        }
         self.with_remote_desktop_proxy(|runtime, connection, session_path| {
             runtime.block_on(async {
                 let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
