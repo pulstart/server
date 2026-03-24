@@ -350,6 +350,9 @@ struct TrayApp {
     allow_item: Option<CheckMenuItem>,
     clients_submenu: Option<Submenu>,
     client_items: Vec<MenuItem>,
+    codec_submenu: Option<Submenu>,
+    bitrate_submenu: Option<Submenu>,
+    quality_submenu: Option<Submenu>,
     codec_items: Vec<CheckMenuItem>,
     bitrate_items: Vec<CheckMenuItem>,
     quality_items: Vec<CheckMenuItem>,
@@ -370,6 +373,9 @@ impl TrayApp {
             allow_item: None,
             clients_submenu: None,
             client_items: Vec::new(),
+            codec_submenu: None,
+            bitrate_submenu: None,
+            quality_submenu: None,
             codec_items: Vec::new(),
             bitrate_items: Vec::new(),
             quality_items: Vec::new(),
@@ -556,6 +562,9 @@ impl TrayApp {
         self.install_update_item = Some(install_update_item);
         self.allow_item = Some(allow_item);
         self.clients_submenu = Some(clients_submenu);
+        self.codec_submenu = Some(codec_submenu);
+        self.bitrate_submenu = Some(bitrate_submenu);
+        self.quality_submenu = Some(quality_submenu);
         self.codec_items = codec_items;
         self.bitrate_items = bitrate_items;
         self.quality_items = quality_items;
@@ -597,18 +606,27 @@ impl TrayApp {
             let _ = tray.set_tooltip(Some(tray_tooltip_text(&self.control)));
         }
 
-        // Sync video option checkmarks
+        // Sync video option checkmarks and submenu labels
         let current_codec = self.control.forced_codec();
+        if let Some(sub) = &self.codec_submenu {
+            sub.set_text(format!("Codec: {}", codec_label(current_codec)));
+        }
         let codec_values: [Option<Codec>; 4] = [None, Some(Codec::H264), Some(Codec::Hevc), Some(Codec::Av1)];
         for (item, value) in self.codec_items.iter().zip(codec_values.iter()) {
             item.set_checked(current_codec == *value);
         }
         let current_bitrate = self.control.forced_bitrate_kbps();
+        if let Some(sub) = &self.bitrate_submenu {
+            sub.set_text(format!("Bitrate: {}", bitrate_label(current_bitrate)));
+        }
         let bitrate_values: [u32; 11] = [0, 1_000, 5_000, 10_000, 20_000, 30_000, 50_000, 80_000, 100_000, 150_000, 200_000];
         for (item, value) in self.bitrate_items.iter().zip(bitrate_values.iter()) {
             item.set_checked(current_bitrate == *value);
         }
         let current_quality = self.control.forced_quality();
+        if let Some(sub) = &self.quality_submenu {
+            sub.set_text(format!("Quality: {}", quality_label(current_quality)));
+        }
         let quality_values: [Option<QualityPreset>; 4] = [
             None,
             Some(QualityPreset::LowLatency),
