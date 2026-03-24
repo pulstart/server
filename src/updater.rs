@@ -312,8 +312,9 @@ fn spawn_apply_helper(
 fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), String> {
     let current_exe = std::env::current_exe()
         .map_err(|e| format!("Failed to locate current executable: {e}"))?;
+    let elevated_helper = linux_elevated_helper_path(&current_exe);
     let status = Command::new("pkexec")
-        .arg(&current_exe)
+        .arg(&elevated_helper)
         .arg(ELEVATED_COPY_FLAG)
         .arg(package_root)
         .arg(install_root)
@@ -323,6 +324,16 @@ fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), Str
         return Err("Elevated update was cancelled or failed.".to_string());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_elevated_helper_path(current_exe: &Path) -> PathBuf {
+    let launcher = current_exe.with_file_name("st-server");
+    if launcher.is_file() {
+        launcher
+    } else {
+        current_exe.to_path_buf()
+    }
 }
 
 #[cfg(target_os = "macos")]
