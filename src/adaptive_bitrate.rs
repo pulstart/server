@@ -90,6 +90,7 @@ pub struct ClientRateController {
     pending_probe_started_at: Option<Instant>,
     probe_failures: u32,
     probe_backoff_until: Instant,
+    seen_completed_frame: bool,
 }
 
 impl ClientRateController {
@@ -111,6 +112,7 @@ impl ClientRateController {
             pending_probe_started_at: None,
             probe_failures: 0,
             probe_backoff_until: now - Duration::from_secs(1),
+            seen_completed_frame: false,
         }
     }
 
@@ -134,6 +136,12 @@ impl ClientRateController {
         {
             return self.recommended_kbps;
         }
+
+        if feedback.completed_frames > 0 {
+            self.seen_completed_frame = true;
+        }
+
+        let startup = !self.seen_completed_frame;
 
         let packet_total = feedback
             .received_packets
@@ -167,8 +175,9 @@ impl ClientRateController {
             self.clean_intervals = 0;
             if probe_failed {
                 self.revert_failed_probe(now);
-            } else if self.can_decrease(now) {
-                self.recommended_kbps = ((self.recommended_kbps as u64 * 70) / 100) as u32;
+            } else if startup || self.can_decrease(now) {
+                let factor = if startup { 50 } else { 70 };
+                self.recommended_kbps = ((self.recommended_kbps as u64 * factor) / 100) as u32;
                 self.recommended_kbps = self.recommended_kbps.max(self.min_kbps);
                 self.last_decrease = now;
                 self.stable_kbps = self.recommended_kbps;
@@ -178,8 +187,9 @@ impl ClientRateController {
             self.clean_intervals = 0;
             if probe_failed {
                 self.revert_failed_probe(now);
-            } else if self.can_decrease(now) {
-                self.recommended_kbps = ((self.recommended_kbps as u64 * 85) / 100) as u32;
+            } else if startup || self.can_decrease(now) {
+                let factor = if startup { 50 } else { 85 };
+                self.recommended_kbps = ((self.recommended_kbps as u64 * factor) / 100) as u32;
                 self.recommended_kbps = self.recommended_kbps.max(self.min_kbps);
                 self.last_decrease = now;
                 self.stable_kbps = self.recommended_kbps;
