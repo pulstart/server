@@ -4,7 +4,7 @@
 /// All encoder backends read from this struct instead of using hardcoded values.
 ///
 /// Environment variable overrides (matching Sunshine's config approach):
-///   ST_CODEC=h264|hevc|av1       — select video codec
+///   ST_CODEC=auto|h264|hevc|av1  — prefer a video codec (default: auto)
 ///   ST_HDR=1                     — enable HDR (10-bit BT.2020+PQ)
 ///   ST_CHROMA=yuv444             — use YUV 4:4:4 chroma sampling
 ///   ST_BITRATE=50000             — starting video bitrate in Kbps
@@ -20,6 +20,38 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+}
+
+impl Codec {
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "h264" => Some(Self::H264),
+            "hevc" | "h265" => Some(Self::Hevc),
+            "av1" => Some(Self::Av1),
+            "auto" | "" => None,
+            _ => None,
+        }
+    }
+
+    pub fn preferred_order(explicit: Option<Self>) -> [Self; 3] {
+        let default = [Self::Av1, Self::Hevc, Self::H264];
+        match explicit {
+            Some(codec) => match codec {
+                Self::Av1 => [Self::Av1, Self::Hevc, Self::H264],
+                Self::Hevc => [Self::Hevc, Self::Av1, Self::H264],
+                Self::H264 => [Self::H264, Self::Hevc, Self::Av1],
+            },
+            None => default,
+        }
+    }
+
+    pub fn to_stream_codec(self) -> VideoCodec {
+        match self {
+            Self::H264 => VideoCodec::H264,
+            Self::Hevc => VideoCodec::Hevc,
+            Self::Av1 => VideoCodec::Av1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,19 +95,30 @@ impl EncoderConfig {
 
     /// Build config for the given resolution, reading overrides from env vars.
     pub fn from_env(width: u32, height: u32) -> Self {
-        Self::from_env_with_framerate(width, height, Self::resolve_target_fps(None))
+        Self::from_env_with_framerate_and_codec(
+            width,
+            height,
+            Self::resolve_target_fps(None),
+            Self::preferred_codec_from_env().unwrap_or(Codec::H264),
+        )
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn from_env_with_framerate(width: u32, height: u32, framerate: u32) -> Self {
-        let codec = match std::env::var("ST_CODEC")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
-            "hevc" | "h265" => Codec::Hevc,
-            "av1" => Codec::Av1,
-            _ => Codec::H264,
-        };
+        Self::from_env_with_framerate_and_codec(
+            width,
+            height,
+            framerate,
+            Self::preferred_codec_from_env().unwrap_or(Codec::H264),
+        )
+    }
+
+    pub fn from_env_with_framerate_and_codec(
+        width: u32,
+        height: u32,
+        framerate: u32,
+        codec: Codec,
+    ) -> Self {
 
         let dynamic_range = if std::env::var("ST_HDR").unwrap_or_default() == "1" {
             DynamicRange::Hdr
@@ -124,6 +167,16 @@ impl EncoderConfig {
             max_b_frames: 0,
             low_delay: true,
         }
+    }
+
+    pub fn preferred_codec_from_env() -> Option<Codec> {
+        std::env::var("ST_CODEC")
+            .ok()
+            .and_then(|value| Codec::from_env_value(&value))
+    }
+
+    pub fn preferred_codec_order_from_env() -> [Codec; 3] {
+        Codec::preferred_order(Self::preferred_codec_from_env())
     }
 
     pub fn fps_cap_from_env() -> Option<u32> {
@@ -201,11 +254,7 @@ impl EncoderConfig {
     }
 
     pub fn stream_codec(&self) -> VideoCodec {
-        match self.codec {
-            Codec::H264 => VideoCodec::H264,
-            Codec::Hevc => VideoCodec::Hevc,
-            Codec::Av1 => VideoCodec::Av1,
-        }
+        self.codec.to_stream_codec()
     }
 
     pub fn to_stream_config(&self, audio: &AudioConfig) -> StreamConfig {

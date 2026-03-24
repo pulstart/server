@@ -94,6 +94,15 @@ impl NvencEncoder {
 
         // NVENC-specific options (matching Sunshine's video.cpp:540-610)
         unsafe {
+            let spatial_aq_enabled = std::env::var("ST_NVENC_SPATIAL_AQ")
+                .map(|value| value != "0")
+                .unwrap_or(true);
+            let aq_strength = std::env::var("ST_NVENC_AQ_STRENGTH")
+                .ok()
+                .and_then(|value| value.parse::<u8>().ok())
+                .map(|value| value.clamp(1, 15))
+                .unwrap_or(8);
+
             // Preset: p1 = fastest (matching Sunshine default)
             let preset = std::ffi::CString::new("preset").unwrap();
             let p1 = std::ffi::CString::new("p1").unwrap();
@@ -145,6 +154,20 @@ impl NvencEncoder {
             // Disable lookahead — adds frames of latency (matches Sunshine)
             let rc_lookahead = std::ffi::CString::new("rc-lookahead").unwrap();
             ffi::av_opt_set((*ctx).priv_data, rc_lookahead.as_ptr(), zero.as_ptr(), 0);
+
+            if spatial_aq_enabled {
+                let spatial_aq = std::ffi::CString::new("spatial-aq").unwrap();
+                ffi::av_opt_set((*ctx).priv_data, spatial_aq.as_ptr(), one.as_ptr(), 0);
+
+                let aq_strength_key = std::ffi::CString::new("aq-strength").unwrap();
+                let aq_strength_value = CString::new(aq_strength.to_string()).unwrap();
+                ffi::av_opt_set(
+                    (*ctx).priv_data,
+                    aq_strength_key.as_ptr(),
+                    aq_strength_value.as_ptr(),
+                    0,
+                );
+            }
         }
 
         let ret = unsafe { ffi::avcodec_open2(ctx, codec, ptr::null_mut()) };

@@ -31,6 +31,7 @@ use transport::{EncodedVideoFrame, UdpSender};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPong, ControlMessage, InputSession, SessionDebugInfo, StreamConfig,
+    VideoCodec, VideoCodecSupport,
 };
 use std::net::SocketAddr;
 use std::sync::{
@@ -133,6 +134,40 @@ fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
 }
 
+fn codec_name(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::Hevc => "hevc",
+        VideoCodec::Av1 => "av1",
+    }
+}
+
+fn codec_support_summary(support: VideoCodecSupport) -> String {
+    let mut entries = Vec::new();
+    for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+        if support.supports(codec) {
+            entries.push(codec_name(codec));
+        }
+    }
+    if entries.is_empty() {
+        "-".to_string()
+    } else {
+        entries.join(" / ")
+    }
+}
+
+fn client_supported_video_codecs(display: Option<ClientDisplayInfo>) -> VideoCodecSupport {
+    display
+        .map(|info| info.supported_video_codecs)
+        .unwrap_or_else(VideoCodecSupport::h264_only)
+}
+
+fn client_hardware_video_codecs(display: Option<ClientDisplayInfo>) -> VideoCodecSupport {
+    display
+        .map(|info| info.hardware_video_codecs)
+        .unwrap_or_else(VideoCodecSupport::empty)
+}
+
 #[cfg(target_os = "linux")]
 fn encoder_name(encoder: &EncoderKind) -> &'static str {
     match encoder {
@@ -157,6 +192,97 @@ fn encoder_backend_name(backend: EncoderBackend) -> &'static str {
         EncoderBackend::Vaapi => "vaapi",
         EncoderBackend::Nvenc => "nvenc",
         EncoderBackend::Software => "software",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn codec_selection_score(
+    codec: encode_config::Codec,
+    backend: EncoderBackend,
+    client_hardware_codecs: VideoCodecSupport,
+) -> (u8, u8, u8) {
+    let backend_rank = match backend {
+        EncoderBackend::Vaapi | EncoderBackend::Nvenc => 1,
+        EncoderBackend::Software => 0,
+    };
+    let client_hw_rank = u8::from(client_hardware_codecs.supports(codec.to_stream_codec()));
+    let codec_rank = match codec {
+        encode_config::Codec::H264 => 0,
+        encode_config::Codec::Hevc => 1,
+        encode_config::Codec::Av1 => 2,
+    };
+    (backend_rank, client_hw_rank, codec_rank)
+}
+
+#[cfg(target_os = "linux")]
+fn select_linux_encoder(
+    width: u32,
+    height: u32,
+    framerate: u32,
+    client_supported_codecs: VideoCodecSupport,
+    client_hardware_codecs: VideoCodecSupport,
+) -> Result<(EncoderConfig, EncoderKind), String> {
+    let prefer_first_success = EncoderConfig::preferred_codec_from_env().is_some();
+    let mut failures = Vec::new();
+    let mut selected: Option<(EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8))> = None;
+
+    for codec in EncoderConfig::preferred_codec_order_from_env() {
+        if !client_supported_codecs.supports(codec.to_stream_codec()) {
+            failures.push(format!(
+                "{} skipped: client does not support it",
+                codec_name(codec.to_stream_codec())
+            ));
+            continue;
+        }
+
+        let config = EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
+        match create_linux_encoder(&config) {
+            Ok(encoder) => {
+                let backend = encoder_backend(&encoder);
+                if prefer_first_success {
+                    println!(
+                        "[encoder] Selected {} with {} backend (client hw decode: {})",
+                        codec_name(config.stream_codec()),
+                        encoder_backend_name(backend),
+                        if client_hardware_codecs.supports(config.stream_codec()) {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    );
+                    return Ok((config, encoder));
+                }
+
+                let score = codec_selection_score(codec, backend, client_hardware_codecs);
+                let replace = selected
+                    .as_ref()
+                    .map(|(_, _, _, best_score)| score > *best_score)
+                    .unwrap_or(true);
+                if replace {
+                    selected = Some((config, encoder, backend, score));
+                }
+            }
+            Err(err) => failures.push(format!("{} failed: {err}", codec_name(codec.to_stream_codec()))),
+        }
+    }
+
+    if let Some((config, encoder, backend, _)) = selected {
+        println!(
+            "[encoder] Selected {} with {} backend (client hw decode: {})",
+            codec_name(config.stream_codec()),
+            encoder_backend_name(backend),
+            if client_hardware_codecs.supports(config.stream_codec()) {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        Ok((config, encoder))
+    } else {
+        Err(format!(
+            "No mutually supported video codec could start.\n  {}",
+            failures.join("\n  ")
+        ))
     }
 }
 
@@ -226,6 +352,8 @@ struct SharedPipeline {
 impl SharedPipeline {
     fn start(
         client_requested_fps: Option<u32>,
+        client_supported_codecs: VideoCodecSupport,
+        client_hardware_codecs: VideoCodecSupport,
         input: Arc<InputRuntime>,
     ) -> Result<(Self, ClientSubscription), String> {
         let video_bc = Arc::new(Broadcaster::new());
@@ -247,6 +375,8 @@ impl SharedPipeline {
                 shutdown_rx,
                 status_tx,
                 client_requested_fps,
+                client_supported_codecs,
+                client_hardware_codecs,
                 input,
                 vbc,
                 #[cfg(target_os = "linux")]
@@ -330,6 +460,8 @@ fn run_shared_pipeline(
     shutdown_rx: Receiver<()>,
     status_tx: Sender<PipelineResult>,
     client_requested_fps: Option<u32>,
+    client_supported_codecs: VideoCodecSupport,
+    client_hardware_codecs: VideoCodecSupport,
     input: Arc<InputRuntime>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     #[cfg(target_os = "linux")] audio_bc: Arc<Broadcaster<Vec<u8>>>,
@@ -380,18 +512,38 @@ fn run_shared_pipeline(
     }
     let mut trace_capture_frames = 1usize;
 
+    #[cfg(target_os = "linux")]
+    let audio_config = encode_config::AudioConfig::from_env();
+
+    #[cfg(target_os = "linux")]
+    let (config, mut encoder) = match select_linux_encoder(
+        first_frame.width,
+        first_frame.height,
+        negotiated_fps,
+        client_supported_codecs,
+        client_hardware_codecs,
+    ) {
+        Ok(selected) => selected,
+        Err(msg) => {
+            eprintln!("{msg}");
+            capture_backend.stop();
+            let _ = status_tx.send(PipelineResult::Error(msg));
+            return;
+        }
+    };
+
+    #[cfg(target_os = "macos")]
     let config = EncoderConfig::from_env_with_framerate(
         first_frame.width,
         first_frame.height,
         negotiated_fps,
     );
+
     let rate_control = Arc::new(AdaptiveBitrateState::new(
         config.bitrate_kbps,
         config.min_bitrate_kbps,
         config.max_bitrate_kbps,
     ));
-    #[cfg(target_os = "linux")]
-    let audio_config = encode_config::AudioConfig::from_env();
 
     #[cfg(target_os = "macos")]
     let mut encoder = match encode_vt::VTEncoder::new(
@@ -407,17 +559,6 @@ fn run_shared_pipeline(
             unsafe {
                 CVPixelBufferRelease(first_frame.pixel_buffer_ptr);
             }
-            capture_backend.stop();
-            let _ = status_tx.send(PipelineResult::Error(msg));
-            return;
-        }
-    };
-
-    #[cfg(target_os = "linux")]
-    let mut encoder = match create_linux_encoder(&config) {
-        Ok(encoder) => encoder,
-        Err(msg) => {
-            eprintln!("{msg}");
             capture_backend.stop();
             let _ = status_tx.send(PipelineResult::Error(msg));
             return;
@@ -1014,17 +1155,26 @@ async fn handle_client(
         return;
     }
     let client_requested_fps = client_display_fps_hint(startup_prefs.display);
+    let client_supported_codecs = client_supported_video_codecs(startup_prefs.display);
+    let client_hardware_codecs = client_hardware_video_codecs(startup_prefs.display);
     if let Some(display) = startup_prefs.display {
         println!(
             "[client {addr}] display refresh hint: {:.3} Hz, media udp port: {}",
             display.max_refresh_millihz as f32 / 1000.0,
             client_media_port(Some(display))
         );
+        println!(
+            "[client {addr}] video decode support: supported={} hardware={}",
+            codec_support_summary(display.supported_video_codecs),
+            codec_support_summary(display.hardware_video_codecs)
+        );
     }
 
     // Ensure shared pipeline is running and subscribe (blocking work)
     let state2 = Arc::clone(&state);
     let requested_fps_for_setup = client_requested_fps;
+    let supported_codecs_for_setup = client_supported_codecs;
+    let hardware_codecs_for_setup = client_hardware_codecs;
     let setup = tokio::task::spawn_blocking(
         move || -> Result<
             (
@@ -1057,6 +1207,8 @@ async fn handle_client(
                 println!("[pipeline] Starting shared pipeline...");
                 let (started, sub) = SharedPipeline::start(
                     requested_fps_for_setup,
+                    supported_codecs_for_setup,
+                    hardware_codecs_for_setup,
                     Arc::clone(&state2.input),
                 )?;
                 let stream_config = started.stream_config;
@@ -1066,6 +1218,12 @@ async fn handle_client(
                 return Ok((sub, stream_config, rate_control, session_debug));
             }
             let p = pipeline.as_ref().unwrap();
+            if !supported_codecs_for_setup.supports(p.stream_config.codec) {
+                return Err(format!(
+                    "Active stream codec '{}' is not supported by this client",
+                    codec_name(p.stream_config.codec)
+                ));
+            }
             let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY);
             #[cfg(target_os = "linux")]
             let (aud_id, aud_rx) = p.audio_bc.subscribe(30);
