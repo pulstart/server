@@ -76,7 +76,6 @@ fn run_linux_tray(control: Arc<ServerControl>) -> Result<(), String> {
     let mut last_version = control.ui_version();
     let handle = LinuxTray {
         control: Arc::clone(&control),
-        icon: server_icon(),
     }
     .assume_sni_available(true)
     .spawn()
@@ -98,7 +97,6 @@ fn run_linux_tray(control: Arc<ServerControl>) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 struct LinuxTray {
     control: Arc<ServerControl>,
-    icon: ksni::Icon,
 }
 
 #[cfg(target_os = "linux")]
@@ -114,14 +112,16 @@ impl ksni::Tray for LinuxTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![self.icon.clone()]
+        let connected = !self.control.connected_clients().is_empty();
+        vec![linux_icon(connected)]
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
+        let connected = !self.control.connected_clients().is_empty();
         ksni::ToolTip {
             title: tray_app_title(),
             description: tray_tooltip_text(&self.control),
-            icon_pixmap: vec![self.icon.clone()],
+            icon_pixmap: vec![linux_icon(connected)],
             icon_name: String::new(),
         }
     }
@@ -357,6 +357,7 @@ struct TrayApp {
     bitrate_items: Vec<CheckMenuItem>,
     quality_items: Vec<CheckMenuItem>,
     last_version: usize,
+    last_connected: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -380,6 +381,7 @@ impl TrayApp {
             bitrate_items: Vec::new(),
             quality_items: Vec::new(),
             last_version: 0,
+            last_connected: false,
         }
     }
 
@@ -546,7 +548,7 @@ impl TrayApp {
             .with_title("st-server")
             .with_menu_on_left_click(false)
             .with_menu(Box::new(root_menu))
-            .with_icon(server_icon()?);
+            .with_icon(macos_icon(false)?);
 
         let builder = builder.with_icon_as_template(false);
 
@@ -602,8 +604,15 @@ impl TrayApp {
         if let Some(allow_item) = &self.allow_item {
             allow_item.set_checked(self.control.allow_new_connections());
         }
+        let connected = !clients.is_empty();
         if let Some(tray) = &self.tray {
             let _ = tray.set_tooltip(Some(tray_tooltip_text(&self.control)));
+            if connected != self.last_connected {
+                self.last_connected = connected;
+                if let Ok(icon) = macos_icon(connected) {
+                    let _ = tray.set_icon(Some(icon));
+                }
+            }
         }
 
         // Sync video option checkmarks and submenu labels
@@ -882,37 +891,76 @@ fn connected_since_label(client: &ConnectedClientSnapshot) -> String {
     }
 }
 
-fn server_icon_rgba() -> (Vec<u8>, u32, u32) {
+/// Flat 2D monitor icon with status dot.
+/// `connected`: green dot when true, dim gray dot when false.
+fn server_icon_rgba(connected: bool) -> (Vec<u8>, u32, u32) {
     let width = 32u32;
     let height = 32u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];
+
+    let white: [u8; 4] = [240, 240, 240, 255];
+    let light_gray: [u8; 4] = [180, 180, 180, 255];
+    let dark: [u8; 4] = [60, 60, 60, 255];
+    let screen: [u8; 4] = if connected {
+        [220, 220, 220, 255]
+    } else {
+        [120, 120, 120, 255]
+    };
+    let status_dot: [u8; 4] = if connected {
+        [80, 200, 100, 255]
+    } else {
+        [100, 100, 100, 255]
+    };
 
     for y in 0..height {
         for x in 0..width {
             let idx = ((y * width + x) * 4) as usize;
             let mut pixel = [0u8, 0u8, 0u8, 0u8];
 
-            let dx = x as i32 - 16;
-            let dy = y as i32 - 16;
-            let dist2 = dx * dx + dy * dy;
-            if dist2 <= 15 * 15 {
-                pixel = [24, 28, 44, 255];
-            }
-            if (7..=24).contains(&x) && (8..=20).contains(&y) {
-                pixel = [72, 163, 255, 255];
-            }
-            if (10..=21).contains(&x) && (11..=17).contains(&y) {
-                pixel = [235, 244, 255, 255];
-            }
-            if (13..=18).contains(&x) && (21..=22).contains(&y) {
-                pixel = [72, 163, 255, 255];
-            }
-            if (20..=25).contains(&x) && (21..=26).contains(&y) {
-                let dot_dx = x as i32 - 22;
-                let dot_dy = y as i32 - 23;
-                if dot_dx * dot_dx + dot_dy * dot_dy <= 9 {
-                    pixel = [56, 214, 118, 255];
+            // Monitor frame (rounded rect): x 4..27, y 4..21
+            if (4..=27).contains(&x) && (4..=21).contains(&y) {
+                // Outer border
+                pixel = white;
+                // Inner screen area
+                if (6..=25).contains(&x) && (6..=19).contains(&y) {
+                    pixel = screen;
                 }
+            }
+
+            // Stand neck: x 14..17, y 22..24
+            if (14..=17).contains(&x) && (22..=24).contains(&y) {
+                pixel = light_gray;
+            }
+
+            // Stand base: x 10..21, y 25..26
+            if (10..=21).contains(&x) && (25..=26).contains(&y) {
+                pixel = light_gray;
+            }
+
+            // Status dot: bottom-right of monitor, radius 3
+            let dot_cx = 25i32;
+            let dot_cy = 19i32;
+            let ddx = x as i32 - dot_cx;
+            let ddy = y as i32 - dot_cy;
+            if ddx * ddx + ddy * ddy <= 9 {
+                pixel = status_dot;
+            }
+
+            // Round the monitor corners
+            if pixel == white {
+                let corners = [
+                    (4i32, 4i32), (4, 21), (27, 4), (27, 21),
+                ];
+                for (cx, cy) in corners {
+                    if x as i32 == cx && y as i32 == cy {
+                        pixel = [0, 0, 0, 0];
+                    }
+                }
+            }
+
+            // Dark outline on bottom of screen for depth
+            if (6..=25).contains(&x) && y == 20 {
+                pixel = dark;
             }
 
             rgba[idx..idx + 4].copy_from_slice(&pixel);
@@ -923,8 +971,9 @@ fn server_icon_rgba() -> (Vec<u8>, u32, u32) {
 }
 
 #[cfg(target_os = "linux")]
-fn server_icon() -> ksni::Icon {
-    let (mut rgba, width, height) = server_icon_rgba();
+fn linux_icon(connected: bool) -> ksni::Icon {
+    let (mut rgba, width, height) = server_icon_rgba(connected);
+    // ksni expects ARGB byte order
     for pixel in rgba.chunks_exact_mut(4) {
         pixel.rotate_right(1);
     }
@@ -936,8 +985,8 @@ fn server_icon() -> ksni::Icon {
 }
 
 #[cfg(target_os = "macos")]
-fn server_icon() -> Result<MacTrayIcon, String> {
-    let (rgba, width, height) = server_icon_rgba();
+fn macos_icon(connected: bool) -> Result<MacTrayIcon, String> {
+    let (rgba, width, height) = server_icon_rgba(connected);
     MacTrayIcon::from_rgba(rgba, width, height)
         .map_err(|err| format!("Failed to build tray icon: {err}"))
 }

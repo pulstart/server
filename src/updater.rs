@@ -14,6 +14,7 @@ use zip::ZipArchive;
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/pulstart/server/releases/latest";
 const APPLY_UPDATE_FLAG: &str = "--apply-update";
+const RELAUNCH_FLAG: &str = "--relaunch-after-exit";
 const ELEVATED_COPY_FLAG: &str = "--elevated-copy";
 const PACKAGE_PREFIX: &str = "st-server-v";
 
@@ -89,6 +90,22 @@ pub fn maybe_run_apply_update_from_args() -> Result<bool, String> {
         sync_package_contents(&PathBuf::from(&args[0]), &PathBuf::from(&args[1]))?;
         return Ok(true);
     }
+    if flag == RELAUNCH_FLAG {
+        let args: Vec<OsString> = args.collect();
+        if args.len() != 3 {
+            return Err("Relaunch helper received an invalid argument set.".to_string());
+        }
+        let parent_pid = args[0]
+            .to_string_lossy()
+            .parse::<u32>()
+            .map_err(|e| format!("Invalid parent pid: {e}"))?;
+        let staging_root = PathBuf::from(&args[1]);
+        let relaunch_executable = PathBuf::from(&args[2]);
+        wait_for_process_exit(parent_pid)?;
+        relaunch_updated_app(&relaunch_executable)?;
+        cleanup_staging_root(&staging_root);
+        return Ok(true);
+    }
     if flag != APPLY_UPDATE_FLAG {
         return Ok(false);
     }
@@ -144,15 +161,22 @@ pub fn prepare_and_spawn_update(release: &ReleaseInfo) -> Result<(), String> {
         .to_path_buf();
     let staging_root = temp_dir.keep();
     let package_root = staging_root.join(package_root_relative);
-
-    let helper_executable = packaged_executable_path(&package_root)?;
     let install_target = current_install_target()?;
-    spawn_apply_helper(
-        &helper_executable,
+
+    // Copy files BEFORE shutting down so the user can see the pkexec dialog
+    // through the active stream if elevated permissions are needed.
+    if let Err(direct_err) = sync_package_contents(&package_root, &install_target.install_root) {
+        eprintln!("[updater] {direct_err}");
+        eprintln!("[updater] Requesting elevated permissions...");
+        run_elevated_copy(&package_root, &install_target.install_root)?;
+    }
+
+    // Spawn a lightweight helper that just waits for this process to exit
+    // and then relaunches the updated binary. No copy needed at this point.
+    spawn_relaunch_helper(
+        &install_target.relaunch_executable,
         std::process::id(),
         &staging_root,
-        &package_root,
-        &install_target.install_root,
         &install_target.relaunch_executable,
     )?;
     Ok(())
@@ -219,31 +243,6 @@ fn archive_kind() -> Result<ArchiveKind, String> {
     }
 }
 
-fn packaged_executable_path(package_root: &Path) -> Result<PathBuf, String> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Ok(package_root.join("st-server")),
-        ("macos", "x86_64") | ("macos", "aarch64") => packaged_macos_executable_path(package_root),
-        _ => Err(supported_target_label().unwrap_err()),
-    }
-}
-
-fn packaged_macos_executable_path(package_root: &Path) -> Result<PathBuf, String> {
-    let direct_bundle_path = package_root.join("Contents/MacOS/st-server");
-    if direct_bundle_path.is_file() {
-        return Ok(direct_bundle_path);
-    }
-
-    let nested_bundle_path = package_root.join("st-server.app/Contents/MacOS/st-server");
-    if nested_bundle_path.is_file() {
-        return Ok(nested_bundle_path);
-    }
-
-    Err(format!(
-        "Could not find the macOS app executable inside '{}'.",
-        package_root.display()
-    ))
-}
-
 fn current_install_target() -> Result<InstallTarget, String> {
     let current_executable =
         std::env::current_exe().map_err(|err| format!("Failed to locate current executable: {err}"))?;
@@ -282,28 +281,24 @@ fn macos_app_bundle_root(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn spawn_apply_helper(
-    helper_executable: &Path,
+fn spawn_relaunch_helper(
+    executable: &Path,
     parent_pid: u32,
     staging_root: &Path,
-    package_root: &Path,
-    install_root: &Path,
     relaunch_executable: &Path,
 ) -> Result<(), String> {
-    let helper_dir = helper_executable
+    let exec_dir = executable
         .parent()
-        .ok_or_else(|| "Updater helper executable does not have a parent directory.".to_string())?;
+        .ok_or_else(|| "Relaunch executable does not have a parent directory.".to_string())?;
 
-    Command::new(helper_executable)
-        .arg(APPLY_UPDATE_FLAG)
+    Command::new(executable)
+        .arg(RELAUNCH_FLAG)
         .arg(parent_pid.to_string())
         .arg(staging_root)
-        .arg(package_root)
-        .arg(install_root)
         .arg(relaunch_executable)
-        .current_dir(helper_dir)
+        .current_dir(exec_dir)
         .spawn()
-        .map_err(|err| format!("Failed to launch updater helper: {err}"))?;
+        .map_err(|err| format!("Failed to launch relaunch helper: {err}"))?;
 
     Ok(())
 }
