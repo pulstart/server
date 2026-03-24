@@ -200,6 +200,14 @@ impl CursorCache {
             visible: self.visible,
         })
     }
+
+    fn mark_hidden(&mut self) -> Option<CapturedCursor> {
+        if !self.has_state {
+            return None;
+        }
+        self.visible = false;
+        self.current_cursor()
+    }
 }
 
 fn convert_cursor_bitmap_to_bgra(
@@ -263,10 +271,10 @@ fn extract_cursor(
         ) as *mut pw::spa::sys::spa_meta_cursor
     };
     if cursor_ptr.is_null() {
-        return cache.current_cursor();
+        return cache.mark_hidden();
     }
     if !spa_meta_cursor_is_valid_local(cursor_ptr.cast_const()) {
-        return cache.current_cursor();
+        return cache.mark_hidden();
     }
 
     let cursor = unsafe { &*cursor_ptr };
