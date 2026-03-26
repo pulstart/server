@@ -1,6 +1,6 @@
 use crate::server_control::ServerControl;
 use st_protocol::tunnel::{CryptoContext, TunnelKeys};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,6 +12,10 @@ pub struct ApiTunnelState {
     pub shared_key: Mutex<Option<[u8; 32]>>,
     /// Partner (client) NAT candidates from the API server.
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
+    /// Pre-bound UDP socket for hole punching (taken once by the punch attempt).
+    pub punch_socket: Mutex<Option<UdpSocket>>,
+    /// Set when both shared_key and partner_candidates are populated.
+    pub hole_punch_ready: AtomicBool,
     /// Whether the last API request succeeded.
     pub connected: AtomicBool,
 }
@@ -21,6 +25,8 @@ impl ApiTunnelState {
         Self {
             shared_key: Mutex::new(None),
             partner_candidates: Mutex::new(Vec::new()),
+            punch_socket: Mutex::new(None),
+            hole_punch_ready: AtomicBool::new(false),
             connected: AtomicBool::new(false),
         }
     }
@@ -33,8 +39,25 @@ impl ApiTunnelState {
             .map(|key| Arc::new(CryptoContext::new(key, true)))
     }
 
+    /// Take the pre-bound punch socket for use in hole punching (one-shot).
+    pub fn take_punch_socket(&self) -> Option<UdpSocket> {
+        self.punch_socket.lock().unwrap().take()
+    }
+
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    pub fn is_hole_punch_ready(&self) -> bool {
+        self.hole_punch_ready.load(Ordering::Relaxed)
+    }
+
+    /// Check and update hole_punch_ready based on current state.
+    pub fn update_hole_punch_ready(&self) {
+        let has_key = self.shared_key.lock().unwrap().is_some();
+        let has_candidates = !self.partner_candidates.lock().unwrap().is_empty();
+        let has_socket = self.punch_socket.lock().unwrap().is_some();
+        self.hole_punch_ready.store(has_key && has_candidates && has_socket, Ordering::Relaxed);
     }
 }
 
@@ -58,39 +81,6 @@ fn interruptible_sleep(control: &ServerControl, secs: u64) -> bool {
     false
 }
 
-fn gather_local_candidates(listen_port: u16) -> Vec<String> {
-    let mut candidates = Vec::new();
-
-    // Default-route local IP via unconnected UDP trick.
-    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect("8.8.8.8:80").is_ok() {
-            if let Ok(local) = sock.local_addr() {
-                let c = format!("{}:{listen_port}", local.ip());
-                candidates.push(c);
-            }
-        }
-    }
-
-    // Enumerate all non-loopback IPs via `hostname -I` (Linux).
-    #[cfg(target_os = "linux")]
-    if let Ok(output) = std::process::Command::new("hostname")
-        .arg("-I")
-        .output()
-    {
-        for tok in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-            if let Ok(ip) = tok.parse::<IpAddr>() {
-                if !ip.is_loopback() {
-                    let c = format!("{ip}:{listen_port}");
-                    if !candidates.contains(&c) {
-                        candidates.push(c);
-                    }
-                }
-            }
-        }
-    }
-
-    candidates
-}
 
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -155,10 +145,29 @@ pub fn start_api_registration(
     tunnel_state: Arc<ApiTunnelState>,
 ) {
     std::thread::spawn(move || {
-        let candidates = gather_local_candidates(listen_port);
+        // Bind a dedicated punch socket and advertise its port in candidates.
+        let punch_port = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(sock) => {
+                let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+                *tunnel_state.punch_socket.lock().unwrap() = Some(sock);
+                port
+            }
+            Err(e) => {
+                eprintln!("[api] Failed to bind punch socket: {e}");
+                listen_port
+            }
+        };
+        // Gather local candidates + discover public IP via STUN on the punch socket.
+        let candidates = {
+            let sock_guard = tunnel_state.punch_socket.lock().unwrap();
+            st_protocol::tunnel::gather_candidates_with_stun(
+                punch_port,
+                sock_guard.as_ref(),
+            )
+        };
         let peer_id = control.peer_id().to_string();
         let hostname = get_hostname();
-        println!("[api] Registering with {api_url} (peer_id={peer_id}, hostname={hostname}, candidates: {candidates:?})");
+        println!("[api] Registering with {api_url} (peer_id={peer_id}, hostname={hostname}, punch_port={punch_port}, candidates: {candidates:?})");
 
         let keys = TunnelKeys::generate();
         let pub_key_b64 = base64_encode(&keys.public_key_bytes());
@@ -210,6 +219,7 @@ pub fn start_api_registration(
                                             *tunnel_state.shared_key.lock().unwrap() =
                                                 Some(shared);
                                             println!("[api] Shared key derived");
+                                            tunnel_state.update_hole_punch_ready();
                                         }
                                     }
                                 }
@@ -235,6 +245,7 @@ pub fn start_api_registration(
                                     .collect();
                                 if !addrs.is_empty() {
                                     *tunnel_state.partner_candidates.lock().unwrap() = addrs;
+                                    tunnel_state.update_hole_punch_ready();
                                 }
                             }
                         }

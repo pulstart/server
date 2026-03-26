@@ -1781,6 +1781,389 @@ async fn run_discovery_beacon(control: Arc<ServerControl>, listen_port: u16) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hole-punch background task: monitors ApiTunnelState and attempts UDP hole
+// punching when the signaling exchange is complete.
+// ---------------------------------------------------------------------------
+
+fn spawn_hole_punch_task(state: Arc<ServerState>) {
+    let tunnel = match state.tunnel_state.clone() {
+        Some(t) => t,
+        None => return,
+    };
+    let state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        loop {
+            if state.control.shutdown_requested() {
+                break;
+            }
+            if !tunnel.is_hole_punch_ready() {
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+
+            let socket = match tunnel.take_punch_socket() {
+                Some(s) => s,
+                None => {
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            };
+
+            let candidates: Vec<SocketAddr> = tunnel.partner_candidates.lock().unwrap().clone();
+            if candidates.is_empty() {
+                // Put socket back and retry.
+                *tunnel.punch_socket.lock().unwrap() = Some(socket);
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+
+            let crypto = match tunnel.crypto_context() {
+                Some(c) => c,
+                None => {
+                    *tunnel.punch_socket.lock().unwrap() = Some(socket);
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            println!("[hole-punch] Attempting to punch through to {} candidate(s)...", candidates.len());
+            match st_protocol::tunnel::hole_punch(&socket, &candidates, &crypto, Duration::from_secs(10)) {
+                Ok(peer) => {
+                    println!("[hole-punch] Success! Peer confirmed at {peer}");
+                    let punched = Arc::new(st_protocol::reliable_udp::PunchedSocket::new(
+                        socket, peer, crypto,
+                    ));
+                    let state2 = Arc::clone(&state);
+                    // Run the punched-client handler in a blocking thread.
+                    std::thread::spawn(move || {
+                        handle_punched_client(punched, state2);
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[hole-punch] Failed: {e}");
+                    // Re-register by rebinding a new socket.
+                    if let Ok(new_sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                        *tunnel.punch_socket.lock().unwrap() = Some(new_sock);
+                        tunnel.update_hole_punch_ready();
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    });
+}
+
+/// Handle a client connection over a hole-punched UDP socket.
+/// All control and media traffic flows through the single PunchedSocket.
+fn handle_punched_client(
+    punched: Arc<st_protocol::reliable_udp::PunchedSocket>,
+    state: Arc<ServerState>,
+) {
+    use st_protocol::reliable_udp::PunchedMessage;
+    let peer = punched.peer();
+    println!("[punched] Client connected via hole-punch: {peer}");
+
+    // Set short read timeout for the handshake phase.
+    let _ = punched.set_read_timeout(Some(Duration::from_millis(100)));
+
+    // --- Authentication ---
+    let token = state.control.token();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut authenticated = false;
+    while Instant::now() < deadline {
+        punched.tick();
+        if let Some(msg) = punched.try_recv() {
+            if let PunchedMessage::Control(data) = msg {
+                if let Some((ControlMessage::Authenticate(client_token), _)) =
+                    ControlMessage::deserialize(&data)
+                {
+                    if client_token == token {
+                        authenticated = true;
+                        let resp = ControlMessage::AuthResult(true).serialize();
+                        let _ = punched.send_control(&resp);
+                        break;
+                    } else {
+                        let resp = ControlMessage::AuthResult(false).serialize();
+                        let _ = punched.send_control(&resp);
+                        eprintln!("[punched] Auth failed from {peer}");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if !authenticated {
+        eprintln!("[punched] Auth timeout from {peer}");
+        return;
+    }
+    println!("[punched] Client {peer} authenticated");
+
+    // --- Read ClientDisplayInfo ---
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut client_display: Option<ClientDisplayInfo> = None;
+    while Instant::now() < deadline {
+        punched.tick();
+        if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
+            if let Some((ControlMessage::ClientDisplayInfo(info), _)) =
+                ControlMessage::deserialize(&data)
+            {
+                client_display = Some(info);
+                break;
+            }
+        }
+    }
+    let _client_display = match client_display {
+        Some(d) => d,
+        None => {
+            eprintln!("[punched] Timeout waiting for ClientDisplayInfo from {peer}");
+            return;
+        }
+    };
+
+    let registered_client = state.control.register_client(peer);
+    let client_id = state.input.allocate_client_id();
+
+    let client_supported_codecs = _client_display.supported_video_codecs;
+    let client_hardware_codecs = _client_display.hardware_video_codecs;
+    let client_requested_fps = if _client_display.max_refresh_millihz > 0 {
+        Some(_client_display.max_refresh_millihz / 1000)
+    } else {
+        None
+    };
+
+    // --- Start/subscribe to pipeline ---
+    let state2 = Arc::clone(&state);
+    let setup: Result<(ClientSubscription, StreamConfig, Arc<AdaptiveBitrateState>, SessionDebugInfo), String> = {
+        if let Some(handle) = state2.pending_pipeline_stop.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        let mut pipeline = state2.pipeline.lock().unwrap();
+        if let Some(p) = pipeline.as_ref() {
+            if p.pipeline_handle.is_finished() {
+                let p = pipeline.take().unwrap();
+                p.stop();
+            }
+        }
+        if pipeline.is_none() {
+            match SharedPipeline::start(
+                client_requested_fps,
+                client_supported_codecs,
+                client_hardware_codecs,
+                Arc::clone(&state2.input),
+                Arc::clone(&state2.control),
+            ) {
+                Ok((started, sub)) => {
+                    let sc = started.stream_config;
+                    let rc = Arc::clone(&started.rate_control);
+                    let sd = started.session_debug.clone();
+                    *pipeline = Some(started);
+                    Ok((sub, sc, rc, sd))
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            let p = pipeline.as_ref().unwrap();
+            if !client_supported_codecs.supports(p.stream_config.codec) {
+                Err(format!(
+                    "Active stream codec '{}' not supported by punched client",
+                    codec_name(p.stream_config.codec)
+                ))
+            } else {
+                let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY);
+                #[cfg(target_os = "linux")]
+                let (aud_id, aud_rx) = p.audio_bc.subscribe(30);
+                Ok((
+                    ClientSubscription {
+                        vid_sub_id: vid_id,
+                        vid_rx,
+                        video_bc: Arc::clone(&p.video_bc),
+                        #[cfg(target_os = "linux")]
+                        aud_sub_id: aud_id,
+                        #[cfg(target_os = "linux")]
+                        aud_rx,
+                    },
+                    p.stream_config,
+                    Arc::clone(&p.rate_control),
+                    p.session_debug.clone(),
+                ))
+            }
+        }
+    };
+
+    let (sub, stream_config, rate_control, session_debug) = match setup {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[punched] Pipeline error for {peer}: {e}");
+            let _ = punched.send_control(&ControlMessage::Error(e).serialize());
+            return;
+        }
+    };
+
+    rate_control.register_client(sub.vid_sub_id);
+    let controller_state = state.input.controller_state_for(client_id);
+
+    // --- Send startup control bundle ---
+    let mut control_buf = ControlMessage::StreamConfig(stream_config).serialize();
+    control_buf.extend_from_slice(&ControlMessage::SessionDebugInfo(session_debug).serialize());
+    control_buf.extend_from_slice(&ControlMessage::InputSession(InputSession { client_id }).serialize());
+    control_buf.extend_from_slice(&ControlMessage::InputCapabilities(state.input.capabilities()).serialize());
+    control_buf.extend_from_slice(&ControlMessage::ControllerState(controller_state).serialize());
+    let _ = punched.send_control(&control_buf);
+
+    // Wait for ClientReadyForMedia.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        punched.tick();
+        if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
+            let mut offset = 0;
+            while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
+                offset += used;
+                if matches!(msg, ControlMessage::ClientReadyForMedia) {
+                    ready = true;
+                    break;
+                }
+            }
+            if ready { break; }
+        }
+    }
+    if !ready {
+        eprintln!("[punched] Timeout waiting for ClientReadyForMedia from {peer}");
+        rate_control.unregister_client(sub.vid_sub_id);
+        let _ = state.input.release_control(client_id);
+        unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+        return;
+    }
+
+    // --- Start transport (video + audio) over punched socket ---
+    let audio_enabled = Arc::new(AtomicBool::new(true));
+    let transport_running = Arc::new(AtomicBool::new(true));
+    sub.video_bc.request_keyframe();
+    let vid_rx = sub.vid_rx;
+    #[cfg(target_os = "linux")]
+    let aud_rx = Some(sub.aud_rx);
+    #[cfg(not(target_os = "linux"))]
+    let aud_rx: Option<Receiver<Arc<Vec<u8>>>> = None;
+    let transport_running_clone = Arc::clone(&transport_running);
+    let audio_enabled_transport = Arc::clone(&audio_enabled);
+    let punched_transport = Arc::clone(&punched);
+    let transport_handle = std::thread::spawn(move || {
+        run_punched_transport(
+            punched_transport,
+            vid_rx,
+            aud_rx,
+            audio_enabled_transport,
+            transport_running_clone,
+        );
+    });
+
+    let _ = punched.send_control(&ControlMessage::StreamStarted.serialize());
+    println!("[punched] Client {peer} subscribed (transport started)");
+
+    // --- Control loop: read from punched socket ---
+    let mut bitrate_controller = ClientRateController::from_state(rate_control.as_ref());
+    let mut cursor_versions = CursorVersionCursor::default();
+    let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
+    let _ = punched.set_nonblocking(false);
+    let _ = punched.set_read_timeout(Some(Duration::from_millis(50)));
+
+    loop {
+        if registered_client.disconnect_requested() || state.control.shutdown_requested() {
+            break;
+        }
+        punched.tick();
+
+        // Read from punched socket.
+        match punched.try_recv() {
+            Some(PunchedMessage::Control(data)) => {
+                let mut offset = 0;
+                while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
+                    offset += used;
+                    match msg {
+                        ControlMessage::SetAudio(enabled) => {
+                            audio_enabled.store(enabled, Ordering::Relaxed);
+                        }
+                        ControlMessage::TransportFeedback(fb) => {
+                            let next_kbps = bitrate_controller.apply_feedback(fb);
+                            rate_control.update_client_target(sub.vid_sub_id, next_kbps);
+                            if (fb.lost_packets > 0 || fb.dropped_frames > 0)
+                                && last_transport_recovery_keyframe.elapsed() >= Duration::from_secs(1)
+                            {
+                                sub.video_bc.request_keyframe();
+                                last_transport_recovery_keyframe = Instant::now();
+                            }
+                        }
+                        ControlMessage::AcquireControl => {
+                            let _ = state.input.acquire_control(client_id);
+                        }
+                        ControlMessage::ReleaseControl => {
+                            let _ = state.input.release_control(client_id);
+                        }
+                        ControlMessage::RequestKeyframe => {
+                            sub.video_bc.request_keyframe();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(PunchedMessage::Media(data)) => {
+                // Demux input packets from the media channel.
+                if let Some((header, packet)) = st_protocol::InputPacket::deserialize(&data) {
+                    state.input.handle_input_packet(header.seq, packet);
+                }
+            }
+            None => {}
+        }
+
+        // Send cursor updates.
+        for message in state.input.cursor_messages(client_id, &mut cursor_versions) {
+            let serialized: Vec<u8> = message.serialize();
+            let _ = punched.send_control(&serialized);
+        }
+    }
+
+    // Cleanup.
+    transport_running.store(false, Ordering::SeqCst);
+    let _ = transport_handle.join();
+    rate_control.unregister_client(sub.vid_sub_id);
+    let _ = state.input.release_control(client_id);
+    unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+    println!("[punched] Client {peer} disconnected");
+}
+
+/// Per-client transport loop for punched connections.
+fn run_punched_transport(
+    punched: Arc<st_protocol::reliable_udp::PunchedSocket>,
+    vid_rx: Receiver<Arc<EncodedVideoFrame>>,
+    aud_rx: Option<Receiver<Arc<Vec<u8>>>>,
+    audio_enabled: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+) {
+    let mut sender = UdpSender::from_punched(punched);
+    while running.load(Ordering::SeqCst) {
+        match vid_rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(frame) => {
+                if let Err(e) = sender.send_frame(&frame, unix_time_micros()) {
+                    eprintln!("[punched-transport] video send error: {e}");
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+        if let Some(ref aud) = aud_rx {
+            let send_audio = audio_enabled.load(Ordering::Relaxed);
+            while let Ok(opus) = aud.try_recv() {
+                if send_audio {
+                    if let Err(e) = sender.send_audio(&opus) {
+                        eprintln!("[punched-transport] audio send error: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
     let listen_addr = format!("0.0.0.0:{}", state.listen_port);
     let listener = TcpListener::bind(&listen_addr)
@@ -1810,6 +2193,9 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
             tunnel,
         );
     }
+
+    // Spawn hole-punch background task.
+    spawn_hole_punch_task(Arc::clone(&state));
 
     // Handle Ctrl+C so the API thread can unregister cleanly.
     {

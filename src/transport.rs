@@ -1,4 +1,5 @@
 use st_protocol::packet::HEADER_SIZE;
+use st_protocol::reliable_udp::PunchedSocket;
 use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
 use st_protocol::{FrameSlicer, FrameTimingMeta, PacketHeader, PayloadType};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -12,13 +13,23 @@ pub struct EncodedVideoFrame {
     pub capture_micros: u64,
 }
 
+/// Backend for sending UDP data: either a direct socket or a punched socket.
+enum SendBackend {
+    /// Direct connection: raw UDP socket + optional encryption.
+    Direct {
+        socket: UdpSocket,
+        crypto: Option<Arc<CryptoContext>>,
+    },
+    /// Punched connection: all media goes through PunchedSocket::send_media().
+    Punched(Arc<PunchedSocket>),
+}
+
 pub struct UdpSender {
-    socket: UdpSocket,
+    backend: SendBackend,
     slicer: FrameSlicer,
     frame_id: u32,
     audio_seq: u16,
     audio_buf: Vec<u8>,
-    crypto: Option<Arc<CryptoContext>>,
     encrypt_buf: Vec<u8>,
 }
 
@@ -37,29 +48,57 @@ impl UdpSender {
             );
         }
         Ok(Self {
-            socket,
+            backend: SendBackend::Direct { socket, crypto },
             slicer: FrameSlicer::with_max_udp(max_udp),
             frame_id: 0,
             audio_seq: 0,
             audio_buf: Vec::with_capacity(1500),
-            crypto,
             encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
         })
     }
 
+    /// Create a sender that uses a punched socket for media delivery.
+    pub fn from_punched(punched: Arc<PunchedSocket>) -> Self {
+        // Punched connections always use the safe (public internet) MTU
+        // minus crypto overhead (handled inside PunchedSocket) minus channel prefix.
+        let max_udp = SAFE_PATH_MAX_UDP
+            .saturating_sub(CRYPTO_OVERHEAD)
+            .saturating_sub(st_protocol::reliable_udp::PUNCHED_MEDIA_OVERHEAD);
+        eprintln!(
+            "[transport] Punched UDP max payload {} bytes for {}",
+            max_udp,
+            punched.peer()
+        );
+        Self {
+            backend: SendBackend::Punched(punched),
+            slicer: FrameSlicer::with_max_udp(max_udp),
+            frame_id: 0,
+            audio_seq: 0,
+            audio_buf: Vec::with_capacity(1500),
+            encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
+        }
+    }
+
     /// Send raw bytes through the socket, encrypting first if a CryptoContext is present.
     fn send_bytes(&mut self, plaintext: &[u8]) -> Result<(), String> {
-        if let Some(ref crypto) = self.crypto {
-            self.encrypt_buf.clear();
-            self.encrypt_buf.resize(plaintext.len() + CRYPTO_OVERHEAD, 0);
-            let n = crypto.encrypt_into(plaintext, &mut self.encrypt_buf);
-            self.socket
-                .send(&self.encrypt_buf[..n])
-                .map_err(|e| format!("send: {e}"))?;
-        } else {
-            self.socket
-                .send(plaintext)
-                .map_err(|e| format!("send: {e}"))?;
+        match &self.backend {
+            SendBackend::Direct { socket, crypto } => {
+                if let Some(ref crypto) = crypto {
+                    self.encrypt_buf.clear();
+                    self.encrypt_buf.resize(plaintext.len() + CRYPTO_OVERHEAD, 0);
+                    let n = crypto.encrypt_into(plaintext, &mut self.encrypt_buf);
+                    socket
+                        .send(&self.encrypt_buf[..n])
+                        .map_err(|e| format!("send: {e}"))?;
+                } else {
+                    socket
+                        .send(plaintext)
+                        .map_err(|e| format!("send: {e}"))?;
+                }
+            }
+            SendBackend::Punched(punched) => {
+                punched.send_media(plaintext)?;
+            }
         }
         Ok(())
     }

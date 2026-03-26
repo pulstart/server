@@ -505,7 +505,7 @@ impl InputRuntime {
         }
     }
 
-    fn handle_input_packet(&self, seq: u16, packet: InputPacket) {
+    pub fn handle_input_packet(&self, seq: u16, packet: InputPacket) {
         let mut inner = self.inner.lock().unwrap();
         let client_id = match packet {
             InputPacket::MouseAbsolute(packet) => packet.client_id,
