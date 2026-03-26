@@ -1,6 +1,8 @@
 use st_protocol::packet::HEADER_SIZE;
+use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
 use st_protocol::{FrameSlicer, FrameTimingMeta, PacketHeader, PayloadType};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::Arc;
 
 const LAN_MAX_UDP: usize = 1400;
 const SAFE_PATH_MAX_UDP: usize = 1200;
@@ -16,19 +18,22 @@ pub struct UdpSender {
     frame_id: u32,
     audio_seq: u16,
     audio_buf: Vec<u8>,
+    crypto: Option<Arc<CryptoContext>>,
+    encrypt_buf: Vec<u8>,
 }
 
 impl UdpSender {
-    pub fn new(client_addr: SocketAddr) -> Result<Self, String> {
+    pub fn new(client_addr: SocketAddr, crypto: Option<Arc<CryptoContext>>) -> Result<Self, String> {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind UDP: {e}"))?;
         socket
             .connect(client_addr)
             .map_err(|e| format!("connect UDP: {e}"))?;
-        let max_udp = select_max_udp_packet_size(client_addr);
-        if std::env::var_os("ST_TRACE").is_some() || max_udp != LAN_MAX_UDP {
+        let overhead = if crypto.is_some() { CRYPTO_OVERHEAD } else { 0 };
+        let max_udp = select_max_udp_packet_size(client_addr).saturating_sub(overhead);
+        if std::env::var_os("ST_TRACE").is_some() || max_udp != LAN_MAX_UDP || crypto.is_some() {
             eprintln!(
-                "[transport] UDP max packet size {} bytes for {}",
-                max_udp, client_addr
+                "[transport] UDP max payload {} bytes for {} (encrypted={})",
+                max_udp, client_addr, crypto.is_some()
             );
         }
         Ok(Self {
@@ -36,8 +41,27 @@ impl UdpSender {
             slicer: FrameSlicer::with_max_udp(max_udp),
             frame_id: 0,
             audio_seq: 0,
-            audio_buf: Vec::with_capacity(1400),
+            audio_buf: Vec::with_capacity(1500),
+            crypto,
+            encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
         })
+    }
+
+    /// Send raw bytes through the socket, encrypting first if a CryptoContext is present.
+    fn send_bytes(&mut self, plaintext: &[u8]) -> Result<(), String> {
+        if let Some(ref crypto) = self.crypto {
+            self.encrypt_buf.clear();
+            self.encrypt_buf.resize(plaintext.len() + CRYPTO_OVERHEAD, 0);
+            let n = crypto.encrypt_into(plaintext, &mut self.encrypt_buf);
+            self.socket
+                .send(&self.encrypt_buf[..n])
+                .map_err(|e| format!("send: {e}"))?;
+        } else {
+            self.socket
+                .send(plaintext)
+                .map_err(|e| format!("send: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Send a single NAL unit as sliced UDP packets (video).
@@ -54,20 +78,23 @@ impl UdpSender {
                 send_ts_micros: send_micros,
             },
         );
+        // Collect owned copies first so we release the borrow on self.slicer.
+        let owned: Vec<Vec<u8>> = packets.into_iter().map(|p| p.to_vec()).collect();
+        let parity = self.slicer.parity_packet().map(|p| p.to_vec());
         self.frame_id = self.frame_id.wrapping_add(1);
 
-        let mut delayed_duplicate = None;
-        for (idx, pkt) in packets.iter().enumerate() {
-            if idx == 0 && packets.len() > 1 {
+        let mut delayed_duplicate: Option<Vec<u8>> = None;
+        for (idx, pkt) in owned.iter().enumerate() {
+            if idx == 0 && owned.len() > 1 {
                 delayed_duplicate = Some(pkt.clone());
             }
-            self.socket.send(pkt).map_err(|e| format!("send: {e}"))?;
+            self.send_bytes(pkt)?;
         }
-        if let Some(parity) = self.slicer.parity_packet() {
-            self.socket.send(parity).map_err(|e| format!("send: {e}"))?;
+        if let Some(ref p) = parity {
+            self.send_bytes(p)?;
         }
-        if let Some(pkt) = delayed_duplicate.as_deref() {
-            self.socket.send(pkt).map_err(|e| format!("send: {e}"))?;
+        if let Some(ref pkt) = delayed_duplicate {
+            self.send_bytes(pkt)?;
         }
         Ok(())
     }
@@ -86,10 +113,8 @@ impl UdpSender {
         header.serialize(&mut self.audio_buf[..HEADER_SIZE]);
         self.audio_buf[HEADER_SIZE..].copy_from_slice(opus_data);
 
-        self.socket
-            .send(&self.audio_buf)
-            .map_err(|e| format!("send: {e}"))?;
-        Ok(())
+        let buf = self.audio_buf.clone();
+        self.send_bytes(&buf)
     }
 }
 

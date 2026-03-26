@@ -1,4 +1,5 @@
 mod adaptive_bitrate;
+mod api_client;
 #[cfg(target_os = "linux")]
 mod audio;
 mod broadcast;
@@ -458,6 +459,8 @@ struct ServerState {
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
     listen_port: u16,
+    /// Tunnel state from the API registration thread (key exchange + partner candidates).
+    tunnel_state: Option<Arc<api_client::ApiTunnelState>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -961,8 +964,9 @@ fn run_transport(
     aud_rx: Option<Receiver<Arc<Vec<u8>>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
 ) {
-    let mut sender = match UdpSender::new(addr) {
+    let mut sender = match UdpSender::new(addr, crypto) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[transport] Failed to create UDP sender for {addr}: {e}");
@@ -1443,6 +1447,7 @@ async fn handle_client(
     let aud_rx: Option<Receiver<Arc<Vec<u8>>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
+    let tunnel_crypto = state.tunnel_state.as_ref().and_then(|ts| ts.crypto_context());
     let transport_handle = std::thread::spawn(move || {
         run_transport(
             transport_addr,
@@ -1450,6 +1455,7 @@ async fn handle_client(
             aud_rx,
             audio_enabled_transport,
             transport_running_clone,
+            tunnel_crypto,
         );
     });
     if let Err(err) = stream
@@ -1787,9 +1793,27 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
         state.listen_port,
     ));
 
+    // Spawn API server registration
+    const API_SERVER_URL: &str = "https://st-api.kubemaxx.io";
+    {
+        let api_url = std::env::var("ST_API_URL")
+            .unwrap_or_else(|_| API_SERVER_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let tunnel = state.tunnel_state.clone().unwrap_or_else(|| {
+            Arc::new(api_client::ApiTunnelState::new())
+        });
+        api_client::start_api_registration(
+            api_url,
+            Arc::clone(&state.control),
+            state.listen_port,
+            tunnel,
+        );
+    }
+
     println!("Server started. Waiting for clients on {listen_addr}...");
     println!(
-        "  Overrides: ST_PORT, ST_CODEC, ST_HDR, ST_BITRATE, ST_MIN_BITRATE, ST_MAX_BITRATE, ST_FPS, ST_GOP, ST_AUDIO, ST_CAPTURE, ST_TOKEN"
+        "  Overrides: ST_PORT, ST_CODEC, ST_HDR, ST_BITRATE, ST_MIN_BITRATE, ST_MAX_BITRATE, ST_FPS, ST_GOP, ST_AUDIO, ST_CAPTURE, ST_TOKEN, ST_API_URL"
     );
 
     while !state.control.shutdown_requested() {
@@ -1817,7 +1841,11 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
     Ok(())
 }
 
-fn build_server_state(control: Arc<ServerControl>, listen_port: u16) -> Arc<ServerState> {
+fn build_server_state(
+    control: Arc<ServerControl>,
+    listen_port: u16,
+    tunnel_state: Option<Arc<api_client::ApiTunnelState>>,
+) -> Arc<ServerState> {
     let input = InputRuntime::new();
     input.spawn_listener(listen_port);
     Arc::new(ServerState {
@@ -1826,6 +1854,7 @@ fn build_server_state(control: Arc<ServerControl>, listen_port: u16) -> Arc<Serv
         input,
         control,
         listen_port,
+        tunnel_state,
     })
 }
 
@@ -1866,14 +1895,15 @@ fn main() {
 
     let listen_port = configured_listen_port();
     let control = ServerControl::new();
-    let state = build_server_state(Arc::clone(&control), listen_port);
+    let tunnel_state = Some(Arc::new(api_client::ApiTunnelState::new()));
+    let state = build_server_state(Arc::clone(&control), listen_port, tunnel_state.clone());
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if tray::should_run_tray() {
         control.start_automatic_update_checks();
         let server_state = Arc::clone(&state);
         let server_handle = std::thread::spawn(move || run_server_runtime(server_state));
-        match tray::run_tray(Arc::clone(&control)) {
+        match tray::run_tray(Arc::clone(&control), tunnel_state.clone()) {
             Ok(()) => {
                 control.request_shutdown();
                 join_server_thread(server_handle);

@@ -1,3 +1,4 @@
+use crate::api_client::ApiTunnelState;
 use crate::encode_config::{Codec, QualityPreset};
 use crate::server_control::{ConnectedClientSnapshot, ServerControl, UpdateStateSnapshot};
 use crate::updater;
@@ -63,23 +64,25 @@ pub fn should_run_tray() -> bool {
     }
 }
 
-pub fn run_tray(control: Arc<ServerControl>) -> Result<(), String> {
+pub fn run_tray(control: Arc<ServerControl>, tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        run_linux_tray(control)
+        run_linux_tray(control, tunnel_state)
     }
 
     #[cfg(target_os = "macos")]
     {
-        run_macos_tray(control)
+        run_macos_tray(control, tunnel_state)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn run_linux_tray(control: Arc<ServerControl>) -> Result<(), String> {
+fn run_linux_tray(control: Arc<ServerControl>, tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
     let mut last_version = control.ui_version();
+    let mut last_api_connected = tunnel_state.as_ref().map(|ts| ts.is_connected());
     let handle = LinuxTray {
         control: Arc::clone(&control),
+        tunnel_state: tunnel_state.clone(),
     }
     .assume_sni_available(true)
     .spawn()
@@ -87,8 +90,10 @@ fn run_linux_tray(control: Arc<ServerControl>) -> Result<(), String> {
 
     while !control.shutdown_requested() && !handle.is_closed() {
         let version = control.ui_version();
-        if version != last_version {
+        let api_connected = tunnel_state.as_ref().map(|ts| ts.is_connected());
+        if version != last_version || api_connected != last_api_connected {
             last_version = version;
+            last_api_connected = api_connected;
             let _ = handle.update(|_| {});
         }
         thread::sleep(Duration::from_millis(100));
@@ -101,6 +106,7 @@ fn run_linux_tray(control: Arc<ServerControl>) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 struct LinuxTray {
     control: Arc<ServerControl>,
+    tunnel_state: Option<Arc<ApiTunnelState>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -133,9 +139,15 @@ impl ksni::Tray for LinuxTray {
     fn menu(&self) -> Vec<LinuxMenuItem<Self>> {
         let clients = self.control.connected_clients();
         let update_state = self.control.update_state();
+        let api_status = match &self.tunnel_state {
+            Some(ts) if ts.is_connected() => "API: Connected",
+            Some(_) => "API: Disconnected",
+            None => "API: Not configured",
+        };
         vec![
             disabled_linux_item(tray_app_title()),
             disabled_linux_item(tray_status_text(&self.control)),
+            disabled_linux_item(api_status.to_string()),
             LinuxStandardItem {
                 label: format!("Token: {} (click to copy)", self.control.token()),
                 activate: Box::new(|tray: &mut LinuxTray| {
@@ -356,7 +368,7 @@ fn linux_quality_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<L
 }
 
 #[cfg(target_os = "macos")]
-fn run_macos_tray(control: Arc<ServerControl>) -> Result<(), String> {
+fn run_macos_tray(control: Arc<ServerControl>, _tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|err| format!("Failed to create tray event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(200)));
     let mut app = TrayApp::new(control);

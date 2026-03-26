@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-st-protocol = { path = "protocol" }
+st-protocol = { path = "protocol", features = ["tunnel"] }
 crossbeam-channel = "0.5"
 flate2 = "1"
 libc = "0.2"
