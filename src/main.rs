@@ -1811,6 +1811,16 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
         );
     }
 
+    // Handle Ctrl+C so the API thread can unregister cleanly.
+    {
+        let ctrl = Arc::clone(&state.control);
+        let _ = tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("\n[server] Shutting down...");
+            ctrl.request_shutdown();
+        });
+    }
+
     println!("Server started. Waiting for clients on {listen_addr}...");
     println!(
         "  Overrides: ST_PORT, ST_CODEC, ST_HDR, ST_BITRATE, ST_MIN_BITRATE, ST_MAX_BITRATE, ST_FPS, ST_GOP, ST_AUDIO, ST_CAPTURE, ST_TOKEN, ST_API_URL"
@@ -1838,6 +1848,8 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
     }
 
     state.control.disconnect_all_clients();
+    // Give the API registration thread time to unregister (it polls every 500ms).
+    std::thread::sleep(Duration::from_secs(2));
     Ok(())
 }
 

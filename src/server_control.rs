@@ -25,6 +25,8 @@ struct PersistedSettings {
     quality: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -83,6 +85,22 @@ fn load_settings() -> PersistedSettings {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
         Err(_) => PersistedSettings::default(),
     }
+}
+
+fn resolve_peer_id(saved: &mut PersistedSettings) -> String {
+    if let Some(ref id) = saved.peer_id {
+        if !id.is_empty() {
+            return id.clone();
+        }
+    }
+    let id = generate_token(); // reuse the same hex generator
+    saved.peer_id = Some(id.clone());
+    if let Some(path) = config_path() {
+        if let Ok(json) = serde_json::to_string_pretty(saved) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+    id
 }
 
 fn resolve_token(saved: &mut PersistedSettings) -> String {
@@ -155,13 +173,17 @@ pub struct ServerControl {
     forced_quality: AtomicU8,
     /// Authentication token for client connections.
     token: Mutex<String>,
+    /// Stable peer identifier, persisted across restarts.
+    peer_id: String,
 }
 
 impl ServerControl {
     pub fn new() -> Arc<Self> {
         let mut saved = load_settings();
         let token = resolve_token(&mut saved);
+        let peer_id = resolve_peer_id(&mut saved);
         println!("[auth] Server token: {token}");
+        println!("[auth] Peer ID: {peer_id}");
         Arc::new(Self {
             allow_new_connections: AtomicBool::new(true),
             shutdown_requested: AtomicBool::new(false),
@@ -175,12 +197,18 @@ impl ServerControl {
             forced_bitrate_kbps: AtomicU32::new(saved.bitrate_kbps),
             forced_quality: AtomicU8::new(saved.quality_value()),
             token: Mutex::new(token),
+            peer_id,
         })
     }
 
     /// Returns the server authentication token.
     pub fn token(&self) -> String {
         self.token.lock().unwrap().clone()
+    }
+
+    /// Returns the stable peer identifier.
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
     }
 
     /// Replace the token, persist to config, and disconnect all current clients.
@@ -435,6 +463,7 @@ impl ServerControl {
                 _ => None,
             },
             token: Some(self.token.lock().unwrap().clone()),
+            peer_id: Some(self.peer_id.clone()),
         };
         if let Some(path) = config_path() {
             match serde_json::to_string_pretty(&settings) {

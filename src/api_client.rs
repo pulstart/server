@@ -38,12 +38,24 @@ impl ApiTunnelState {
     }
 }
 
-fn retry_interval(consecutive_failures: u32) -> Duration {
+fn retry_secs(consecutive_failures: u32) -> u64 {
     match consecutive_failures {
-        0 => Duration::from_secs(10),
-        1 => Duration::from_secs(30),
-        _ => Duration::from_secs(60),
+        0 => 10,
+        1 => 30,
+        _ => 60,
     }
+}
+
+/// Sleep for `secs` seconds, but wake early if shutdown is requested.
+fn interruptible_sleep(control: &ServerControl, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if control.shutdown_requested() {
+            return true; // interrupted
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
 }
 
 fn gather_local_candidates(listen_port: u16) -> Vec<String> {
@@ -144,7 +156,9 @@ pub fn start_api_registration(
 ) {
     std::thread::spawn(move || {
         let candidates = gather_local_candidates(listen_port);
-        println!("[api] Registering with {api_url} (candidates: {candidates:?})");
+        let peer_id = control.peer_id().to_string();
+        let hostname = get_hostname();
+        println!("[api] Registering with {api_url} (peer_id={peer_id}, hostname={hostname}, candidates: {candidates:?})");
 
         let keys = TunnelKeys::generate();
         let pub_key_b64 = base64_encode(&keys.public_key_bytes());
@@ -162,7 +176,7 @@ pub fn start_api_registration(
 
             // 1. Register
             let body = format!(
-                r#"{{"token":"{token}","role":"host","candidates":{cands_json}}}"#,
+                r#"{{"token":"{token}","role":"host","peer_id":"{peer_id}","hostname":"{hostname}","candidates":{cands_json}}}"#,
             );
             let ok = ureq::post(&format!("{api_url}/api/register"))
                 .set("Content-Type", "application/json")
@@ -170,6 +184,9 @@ pub fn start_api_registration(
                 .is_ok();
 
             if ok {
+                if failures > 0 || !tunnel_state.is_connected() {
+                    println!("[api] Connected to API server");
+                }
                 failures = 0;
                 tunnel_state.connected.store(true, Ordering::Relaxed);
 
@@ -226,25 +243,39 @@ pub fn start_api_registration(
 
                 // Normal interval when connected.
                 let has_key = tunnel_state.shared_key.lock().unwrap().is_some();
-                let interval = if has_key {
-                    Duration::from_secs(30)
-                } else {
-                    Duration::from_secs(3)
-                };
-                std::thread::sleep(interval);
+                let secs = if has_key { 30 } else { 3 };
+                if interruptible_sleep(&control, secs) {
+                    break;
+                }
             } else {
                 // Failed — backoff retry.
                 tunnel_state.connected.store(false, Ordering::Relaxed);
-                let wait = retry_interval(failures);
+                let secs = retry_secs(failures);
                 failures = failures.saturating_add(1);
-                eprintln!(
-                    "[api] Registration failed, retrying in {}s",
-                    wait.as_secs()
-                );
-                std::thread::sleep(wait);
+                eprintln!("[api] Registration failed, retrying in {secs}s");
+                if interruptible_sleep(&control, secs) {
+                    break;
+                }
             }
         }
 
-        println!("[api] Registration loop stopped");
+        // Unregister on shutdown.
+        let token = control.token();
+        let body = format!(r#"{{"token":"{token}","role":"host","peer_id":"{peer_id}"}}"#);
+        let _ = ureq::post(&format!("{api_url}/api/unregister"))
+            .set("Content-Type", "application/json")
+            .send_string(&body);
+        tunnel_state.connected.store(false, Ordering::Relaxed);
+        println!("[api] Unregistered from API server");
     });
+}
+
+fn get_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| {
+            std::fs::read_to_string("/etc/hostname")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        })
 }
