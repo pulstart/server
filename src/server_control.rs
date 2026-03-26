@@ -23,6 +23,8 @@ struct PersistedSettings {
     bitrate_kbps: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -55,6 +57,24 @@ fn config_path() -> Option<PathBuf> {
     })
 }
 
+fn generate_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let s = RandomState::new();
+    let mut h = s.build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    let a = h.finish();
+    let mut h2 = s.build_hasher();
+    h2.write_u64(a ^ 0xdeadbeef);
+    let b = h2.finish();
+    format!("{a:016x}{b:016x}")
+}
+
 fn load_settings() -> PersistedSettings {
     let Some(path) = config_path() else {
         return PersistedSettings::default();
@@ -63,6 +83,31 @@ fn load_settings() -> PersistedSettings {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
         Err(_) => PersistedSettings::default(),
     }
+}
+
+fn resolve_token(saved: &mut PersistedSettings) -> String {
+    // ST_TOKEN env var overrides everything
+    if let Ok(env_token) = std::env::var("ST_TOKEN") {
+        let t = env_token.trim().to_string();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    // Use persisted token or generate a new one
+    if let Some(ref t) = saved.token {
+        if !t.is_empty() {
+            return t.clone();
+        }
+    }
+    let t = generate_token();
+    saved.token = Some(t.clone());
+    // Persist immediately so the token is stable across restarts
+    if let Some(path) = config_path() {
+        if let Ok(json) = serde_json::to_string_pretty(saved) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+    t
 }
 
 #[derive(Clone, Debug)]
@@ -108,11 +153,15 @@ pub struct ServerControl {
     forced_codec: AtomicU8,
     forced_bitrate_kbps: AtomicU32,
     forced_quality: AtomicU8,
+    /// Authentication token for client connections.
+    token: Mutex<String>,
 }
 
 impl ServerControl {
     pub fn new() -> Arc<Self> {
-        let saved = load_settings();
+        let mut saved = load_settings();
+        let token = resolve_token(&mut saved);
+        println!("[auth] Server token: {token}");
         Arc::new(Self {
             allow_new_connections: AtomicBool::new(true),
             shutdown_requested: AtomicBool::new(false),
@@ -125,7 +174,25 @@ impl ServerControl {
             forced_codec: AtomicU8::new(saved.codec_value()),
             forced_bitrate_kbps: AtomicU32::new(saved.bitrate_kbps),
             forced_quality: AtomicU8::new(saved.quality_value()),
+            token: Mutex::new(token),
         })
+    }
+
+    /// Returns the server authentication token.
+    pub fn token(&self) -> String {
+        self.token.lock().unwrap().clone()
+    }
+
+    /// Replace the token, persist to config, and disconnect all current clients.
+    pub fn set_token(&self, new_token: String) {
+        {
+            let mut t = self.token.lock().unwrap();
+            *t = new_token;
+        }
+        println!("[auth] Token updated: {}", self.token());
+        self.save_video_settings();
+        self.disconnect_all_clients();
+        self.bump_version();
     }
 
     pub fn allow_new_connections(&self) -> bool {
@@ -367,6 +434,7 @@ impl ServerControl {
                 3 => Some("high_quality".into()),
                 _ => None,
             },
+            token: Some(self.token.lock().unwrap().clone()),
         };
         if let Some(path) = config_path() {
             match serde_json::to_string_pretty(&settings) {

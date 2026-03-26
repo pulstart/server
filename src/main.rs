@@ -43,6 +43,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const DEFAULT_APP_PORT: u16 = 28_480;
+const DISCOVERY_PORT: u16 = 28_481;
+const DISCOVERY_BEACON_INTERVAL: Duration = Duration::from_secs(2);
 const VIDEO_SUBSCRIBER_CAPACITY: usize = 120;
 static TRACE_ENCODE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -1097,6 +1099,52 @@ fn configured_listen_port() -> u16 {
     }
 }
 
+/// Read the Authenticate message from the client and verify the token.
+/// Returns `true` if authentication succeeds; sends AuthResult either way.
+async fn authenticate_client(
+    stream: &mut tokio::net::TcpStream,
+    expected_token: &str,
+) -> Result<bool, std::io::Error> {
+    let mut buf = [0u8; 512];
+    let mut pending = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        // Try to parse what we have
+        let mut consumed = 0usize;
+        while let Some((msg, used)) = ControlMessage::deserialize(&pending[consumed..]) {
+            consumed += used;
+            if let ControlMessage::Authenticate(token) = msg {
+                if consumed > 0 {
+                    pending.drain(..consumed);
+                }
+                let ok = token == expected_token;
+                let _ = stream
+                    .write_all(&ControlMessage::AuthResult(ok).serialize())
+                    .await;
+                return Ok(ok);
+            }
+        }
+        if consumed > 0 {
+            pending.drain(..consumed);
+        }
+
+        let read_result = tokio::time::timeout_at(deadline, stream.read(&mut buf)).await;
+        match read_result {
+            Ok(Ok(0)) => {
+                // Connection closed before auth
+                return Ok(false);
+            }
+            Ok(Ok(n)) => pending.extend_from_slice(&buf[..n]),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                // Timeout — no auth message received
+                return Ok(false);
+            }
+        }
+    }
+}
+
 async fn read_client_startup_prefs(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<ClientStartupPrefs, std::io::Error> {
@@ -1177,6 +1225,25 @@ async fn handle_client(
 ) {
     println!("Client connected: {addr}");
     let _ = stream.set_nodelay(true);
+
+    // Authenticate before anything else
+    match authenticate_client(&mut stream, &state.control.token()).await {
+        Ok(true) => println!("[auth] Client {addr} authenticated"),
+        Ok(false) => {
+            eprintln!("[auth] Client {addr} failed authentication");
+            let _ = stream
+                .write_all(
+                    &ControlMessage::Error("Authentication failed.".into()).serialize(),
+                )
+                .await;
+            return;
+        }
+        Err(err) => {
+            eprintln!("[auth] Error reading auth from {addr}: {err}");
+            return;
+        }
+    }
+
     let registered_client = state.control.register_client(addr);
     let client_id = state.input.allocate_client_id();
 
@@ -1673,15 +1740,56 @@ fn get_screen_resolution() -> Option<(u32, u32)> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+async fn run_discovery_beacon(control: Arc<ServerControl>, listen_port: u16) {
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| {
+            std::fs::read_to_string("/etc/hostname")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "st-server".to_string())
+        });
+
+    let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("[discovery] Failed to bind UDP socket: {err}");
+            return;
+        }
+    };
+    if let Err(err) = sock.set_broadcast(true) {
+        eprintln!("[discovery] Failed to enable broadcast: {err}");
+        return;
+    }
+
+    let dest: std::net::SocketAddr = ([255, 255, 255, 255], DISCOVERY_PORT).into();
+    println!("[discovery] Broadcasting beacon on port {DISCOVERY_PORT} (hostname={hostname})");
+
+    loop {
+        if control.shutdown_requested() {
+            break;
+        }
+        let token = control.token();
+        let packet = format!("ST_DISCOVER\n{hostname}\n{listen_port}\n{token}");
+        let _ = sock.send_to(packet.as_bytes(), dest).await;
+        tokio::time::sleep(DISCOVERY_BEACON_INTERVAL).await;
+    }
+}
+
 async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
     let listen_addr = format!("0.0.0.0:{}", state.listen_port);
     let listener = TcpListener::bind(&listen_addr)
         .await
         .map_err(|err| format!("Failed to bind TCP listener on {listen_addr}: {err}"))?;
 
+    // Spawn discovery beacon
+    tokio::spawn(run_discovery_beacon(
+        Arc::clone(&state.control),
+        state.listen_port,
+    ));
+
     println!("Server started. Waiting for clients on {listen_addr}...");
     println!(
-        "  Overrides: ST_PORT, ST_CODEC, ST_HDR, ST_BITRATE, ST_MIN_BITRATE, ST_MAX_BITRATE, ST_FPS, ST_GOP, ST_AUDIO, ST_CAPTURE"
+        "  Overrides: ST_PORT, ST_CODEC, ST_HDR, ST_BITRATE, ST_MIN_BITRATE, ST_MAX_BITRATE, ST_FPS, ST_GOP, ST_AUDIO, ST_CAPTURE, ST_TOKEN"
     );
 
     while !state.control.shutdown_requested() {

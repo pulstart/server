@@ -35,6 +35,10 @@ const INSTALL_UPDATE_ID: &str = "install-update";
 #[cfg(target_os = "macos")]
 const QUIT_ID: &str = "quit";
 #[cfg(target_os = "macos")]
+const COPY_TOKEN_ID: &str = "copy-token";
+#[cfg(target_os = "macos")]
+const SET_TOKEN_ID: &str = "set-token";
+#[cfg(target_os = "macos")]
 const DROP_CLIENT_ID_PREFIX: &str = "drop-client:";
 #[cfg(target_os = "macos")]
 const VIDEO_CODEC_PREFIX: &str = "video-codec:";
@@ -132,6 +136,29 @@ impl ksni::Tray for LinuxTray {
         vec![
             disabled_linux_item(tray_app_title()),
             disabled_linux_item(tray_status_text(&self.control)),
+            LinuxStandardItem {
+                label: format!("Token: {} (click to copy)", self.control.token()),
+                activate: Box::new(|tray: &mut LinuxTray| {
+                    copy_to_clipboard(&tray.control.token());
+                }),
+                ..Default::default()
+            }
+            .into(),
+            LinuxStandardItem {
+                label: "Set Token...".into(),
+                activate: Box::new(|tray: &mut LinuxTray| {
+                    let control = Arc::clone(&tray.control);
+                    thread::spawn(move || {
+                        if let Some(new_token) = show_token_input_dialog(&control.token()) {
+                            if !new_token.is_empty() {
+                                control.set_token(new_token);
+                            }
+                        }
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
             LinuxMenuItem::Separator,
             disabled_linux_item(tray_update_status_text(&update_state)),
             LinuxStandardItem {
@@ -344,6 +371,8 @@ struct TrayApp {
     tray: Option<TrayIcon>,
     version_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
+    token_item: Option<MenuItem>,
+    set_token_item: Option<MenuItem>,
     update_status_item: Option<MenuItem>,
     check_updates_item: Option<MenuItem>,
     install_update_item: Option<MenuItem>,
@@ -368,6 +397,8 @@ impl TrayApp {
             tray: None,
             version_item: None,
             status_item: None,
+            token_item: None,
+            set_token_item: None,
             update_status_item: None,
             check_updates_item: None,
             install_update_item: None,
@@ -392,6 +423,13 @@ impl TrayApp {
 
         let version_item = MenuItem::new(tray_app_title(), false, None);
         let status_item = MenuItem::new("Ready: no connected clients", false, None);
+        let token_item = MenuItem::with_id(
+            COPY_TOKEN_ID,
+            format!("Token: {} (click to copy)", self.control.token()),
+            true,
+            None,
+        );
+        let set_token_item = MenuItem::with_id(SET_TOKEN_ID, "Set Token...", true, None);
         let update_status_item = MenuItem::new("Checking GitHub releases...", false, None);
         let check_updates_item = MenuItem::with_id(CHECK_UPDATES_ID, "Check For Updates", true, None);
         let install_update_item =
@@ -507,6 +545,12 @@ impl TrayApp {
             .append(&status_item)
             .map_err(|err| format!("Failed to append tray status item: {err}"))?;
         root_menu
+            .append(&token_item)
+            .map_err(|err| format!("Failed to append tray token item: {err}"))?;
+        root_menu
+            .append(&set_token_item)
+            .map_err(|err| format!("Failed to append tray set-token item: {err}"))?;
+        root_menu
             .append(&PredefinedMenuItem::separator())
             .map_err(|err| format!("Failed to append tray separator: {err}"))?;
         root_menu
@@ -559,6 +603,8 @@ impl TrayApp {
         self.tray = Some(tray);
         self.version_item = Some(version_item);
         self.status_item = Some(status_item);
+        self.token_item = Some(token_item);
+        self.set_token_item = Some(set_token_item);
         self.update_status_item = Some(update_status_item);
         self.check_updates_item = Some(check_updates_item);
         self.install_update_item = Some(install_update_item);
@@ -590,6 +636,9 @@ impl TrayApp {
         }
         if let Some(status_item) = &self.status_item {
             status_item.set_text(status_text.clone());
+        }
+        if let Some(token_item) = &self.token_item {
+            token_item.set_text(format!("Token: {} (click to copy)", self.control.token()));
         }
         if let Some(update_status_item) = &self.update_status_item {
             update_status_item.set_text(tray_update_status_text(&update_state));
@@ -694,6 +743,17 @@ impl TrayApp {
                 self.control.begin_update_check();
             } else if id == INSTALL_UPDATE_ID {
                 self.control.begin_update_install();
+            } else if id == COPY_TOKEN_ID {
+                copy_to_clipboard(&self.control.token());
+            } else if id == SET_TOKEN_ID {
+                let control = Arc::clone(&self.control);
+                std::thread::spawn(move || {
+                    if let Some(new_token) = show_macos_token_input_dialog(&control.token()) {
+                        if !new_token.is_empty() {
+                            control.set_token(new_token);
+                        }
+                    }
+                });
             } else if id == QUIT_ID {
                 self.control.request_shutdown();
                 return true;
@@ -888,6 +948,75 @@ fn connected_since_label(client: &ConnectedClientSnapshot) -> String {
         format!("{}m {}s", elapsed / 60, elapsed % 60)
     } else {
         format!("{elapsed}s")
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => {
+            if let Err(err) = clipboard.set_text(text) {
+                eprintln!("[tray] Failed to copy to clipboard: {err}");
+            }
+        }
+        Err(err) => eprintln!("[tray] Failed to open clipboard: {err}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn show_token_input_dialog(current: &str) -> Option<String> {
+    // Try zenity first, then kdialog
+    if let Ok(output) = std::process::Command::new("zenity")
+        .args([
+            "--entry",
+            "--title=Set Server Token",
+            "--text=Enter new authentication token:",
+            &format!("--entry-text={current}"),
+        ])
+        .output()
+    {
+        if output.status.success() {
+            return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+        return None;
+    }
+    if let Ok(output) = std::process::Command::new("kdialog")
+        .args([
+            "--inputbox",
+            "Enter new authentication token:",
+            current,
+            "--title",
+            "Set Server Token",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+        return None;
+    }
+    eprintln!("[tray] No dialog tool found (tried zenity, kdialog)");
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn show_macos_token_input_dialog(current: &str) -> Option<String> {
+    let escaped = current.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "set result to display dialog \"Enter new authentication token:\" \
+         default answer \"{}\" with title \"Set Server Token\" \
+         buttons {{\"Cancel\", \"OK\"}} default button \"OK\"\n\
+         return text returned of result",
+        escaped
+    );
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
     }
 }
 
