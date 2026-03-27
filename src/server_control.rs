@@ -54,6 +54,18 @@ impl PersistedSettings {
 }
 
 fn config_path() -> Option<PathBuf> {
+    // Prefer XDG state directory for stable persistence across rebuilds.
+    if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME") {
+        let dir = PathBuf::from(state_dir).join("st");
+        let _ = std::fs::create_dir_all(&dir);
+        return Some(dir.join(CONFIG_FILENAME));
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let dir = PathBuf::from(home).join(".local").join("state").join("st");
+        let _ = std::fs::create_dir_all(&dir);
+        return Some(dir.join(CONFIG_FILENAME));
+    }
+    // Fall back to exe directory.
     std::env::current_exe().ok().and_then(|exe| {
         exe.parent().map(|dir| dir.join(CONFIG_FILENAME))
     })
@@ -120,10 +132,18 @@ fn resolve_token(saved: &mut PersistedSettings) -> String {
     let t = generate_token();
     saved.token = Some(t.clone());
     // Persist immediately so the token is stable across restarts
-    if let Some(path) = config_path() {
-        if let Ok(json) = serde_json::to_string_pretty(saved) {
-            let _ = std::fs::write(&path, json);
-        }
+    match config_path() {
+        Some(path) => match serde_json::to_string_pretty(saved) {
+            Ok(json) => {
+                if let Err(err) = std::fs::write(&path, &json) {
+                    eprintln!("[config] Failed to persist token to {}: {err}", path.display());
+                } else {
+                    eprintln!("[config] Token persisted to {}", path.display());
+                }
+            }
+            Err(err) => eprintln!("[config] Failed to serialize settings: {err}"),
+        },
+        None => eprintln!("[config] Warning: cannot determine config path, token will not persist across restarts"),
     }
     t
 }

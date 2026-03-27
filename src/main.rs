@@ -2095,10 +2095,17 @@ fn handle_punched_client(
                             }
                         }
                         ControlMessage::AcquireControl => {
-                            let _ = state.input.acquire_control(client_id);
+                            let state_msg = ControlMessage::ControllerState(
+                                state.input.acquire_control(client_id),
+                            );
+                            cursor_versions = CursorVersionCursor::default();
+                            let _ = punched.send_control(&state_msg.serialize());
                         }
                         ControlMessage::ReleaseControl => {
-                            let _ = state.input.release_control(client_id);
+                            let state_msg = ControlMessage::ControllerState(
+                                state.input.release_control(client_id),
+                            );
+                            let _ = punched.send_control(&state_msg.serialize());
                         }
                         ControlMessage::RequestKeyframe => {
                             sub.video_bc.request_keyframe();
