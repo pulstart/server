@@ -152,6 +152,8 @@ impl UdpSender {
         header.serialize(&mut self.audio_buf[..HEADER_SIZE]);
         self.audio_buf[HEADER_SIZE..].copy_from_slice(opus_data);
 
+        // Clone needed: send_bytes borrows &mut self (for encrypt_buf) while
+        // audio_buf is also part of self.
         let buf = self.audio_buf.clone();
         self.send_bytes(&buf)
     }

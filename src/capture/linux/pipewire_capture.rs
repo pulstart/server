@@ -442,11 +442,26 @@ impl RemoteDesktopPortalSession {
     }
 
     pub(crate) fn set_logical_size(&self, width: u32, height: u32) {
+        let mut changed = false;
         if width > 0 {
-            *self.logical_width.lock().unwrap() = width as f64;
+            let mut w = self.logical_width.lock().unwrap();
+            if *w != width as f64 {
+                *w = width as f64;
+                changed = true;
+            }
         }
         if height > 0 {
-            *self.logical_height.lock().unwrap() = height as f64;
+            let mut h = self.logical_height.lock().unwrap();
+            if *h != height as f64 {
+                *h = height as f64;
+                changed = true;
+            }
+        }
+        // Reset tracked cursor position so the next absolute move re-establishes
+        // the initial position via NotifyPointerMotionAbsolute, avoiding stale
+        // deltas computed from the old resolution.
+        if changed {
+            *self.tracked_pos.lock().unwrap() = None;
         }
     }
 

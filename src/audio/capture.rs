@@ -94,8 +94,11 @@ impl PaSimple {
             channels,
         };
 
+        // Use server-defaults for most fields (u32::MAX means "let PA decide"),
+        // but cap maxlength to ~500ms of audio to prevent excessive allocation.
+        let max_buffer = fragment_size.saturating_mul(25).max(fragment_size);
         let attr = pulse_ffi::pa_buffer_attr {
-            maxlength: u32::MAX,
+            maxlength: max_buffer,
             tlength: u32::MAX,
             prebuf: u32::MAX,
             minreq: u32::MAX,
@@ -208,9 +211,11 @@ impl AudioCapture {
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
 
+        let device_clone = device.map(|d| d.to_string());
         let handle = thread::spawn(move || {
             println!("[audio] Capture thread started ({channels}ch, {sample_rate}Hz, frame={samples_per_frame} samples)");
 
+            let mut pa = pa;
             let mut buf = vec![0.0f32; samples_per_frame];
 
             while running.load(Ordering::SeqCst) {
@@ -228,12 +233,23 @@ impl AudioCapture {
                     }
                     Err(e) => {
                         eprintln!("[audio] Capture error: {e}");
-                        // Sunshine waits 5s then reinits on error
                         if !running.load(Ordering::SeqCst) {
                             break;
                         }
+                        // Recreate PulseAudio connection instead of retrying broken handle
                         thread::sleep(std::time::Duration::from_secs(5));
-                        // Try to continue — PulseAudio may recover
+                        if !running.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        match PaSimple::new(device_clone.as_deref(), channels, sample_rate, fragment_size) {
+                            Ok(new_pa) => {
+                                eprintln!("[audio] PulseAudio reconnected");
+                                pa = new_pa;
+                            }
+                            Err(e2) => {
+                                eprintln!("[audio] PulseAudio reconnect failed: {e2}");
+                            }
+                        }
                     }
                 }
             }

@@ -43,6 +43,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// Constant-time byte comparison to prevent timing side-channels on token auth.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 const DEFAULT_APP_PORT: u16 = 28_480;
 const DISCOVERY_PORT: u16 = 28_481;
 const DISCOVERY_BEACON_INTERVAL: Duration = Duration::from_secs(2);
@@ -374,9 +386,9 @@ impl SharedPipeline {
         let video_bc = Arc::new(Broadcaster::new());
         #[cfg(target_os = "linux")]
         let audio_bc = Arc::new(Broadcaster::new());
-        let (vid_sub_id, vid_rx) = video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY);
+        let (vid_sub_id, vid_rx) = video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
         #[cfg(target_os = "linux")]
-        let (aud_sub_id, aud_rx) = audio_bc.subscribe(30);
+        let (aud_sub_id, aud_rx) = audio_bc.subscribe(30)?;
 
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (status_tx, status_rx) = bounded::<PipelineResult>(1);
@@ -400,7 +412,7 @@ impl SharedPipeline {
             );
         });
 
-        match status_rx.recv() {
+        match status_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(PipelineResult::Started(stream_config, rate_control, session_debug)) => Ok((
                 Self {
                     video_bc: Arc::clone(&video_bc),
@@ -1122,7 +1134,7 @@ async fn authenticate_client(
                 if consumed > 0 {
                     pending.drain(..consumed);
                 }
-                let ok = token == expected_token;
+                let ok = constant_time_eq(token.as_bytes(), expected_token.as_bytes());
                 let _ = stream
                     .write_all(&ControlMessage::AuthResult(ok).serialize())
                     .await;
@@ -1332,9 +1344,9 @@ async fn handle_client(
                     codec_name(p.stream_config.codec)
                 ));
             }
-            let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY);
+            let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
             #[cfg(target_os = "linux")]
-            let (aud_id, aud_rx) = p.audio_bc.subscribe(30);
+            let (aud_id, aud_rx) = p.audio_bc.subscribe(30)?;
             Ok((
                 ClientSubscription {
                     vid_sub_id: vid_id,
@@ -1878,7 +1890,7 @@ fn handle_punched_client(
                 if let Some((ControlMessage::Authenticate(client_token), _)) =
                     ControlMessage::deserialize(&data)
                 {
-                    if client_token == token {
+                    if constant_time_eq(client_token.as_bytes(), token.as_bytes()) {
                         authenticated = true;
                         let resp = ControlMessage::AuthResult(true).serialize();
                         let _ = punched.send_control(&resp);
@@ -1934,7 +1946,7 @@ fn handle_punched_client(
 
     // --- Start/subscribe to pipeline ---
     let state2 = Arc::clone(&state);
-    let setup: Result<(ClientSubscription, StreamConfig, Arc<AdaptiveBitrateState>, SessionDebugInfo), String> = {
+    let setup: Result<(ClientSubscription, StreamConfig, Arc<AdaptiveBitrateState>, SessionDebugInfo), String> = (|| {
         if let Some(handle) = state2.pending_pipeline_stop.lock().unwrap().take() {
             let _ = handle.join();
         }
@@ -1970,9 +1982,9 @@ fn handle_punched_client(
                     codec_name(p.stream_config.codec)
                 ))
             } else {
-                let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY);
+                let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
                 #[cfg(target_os = "linux")]
-                let (aud_id, aud_rx) = p.audio_bc.subscribe(30);
+                let (aud_id, aud_rx) = p.audio_bc.subscribe(30)?;
                 Ok((
                     ClientSubscription {
                         vid_sub_id: vid_id,
@@ -1989,7 +2001,7 @@ fn handle_punched_client(
                 ))
             }
         }
-    };
+    })();
 
     let (sub, stream_config, rate_control, session_debug) = match setup {
         Ok(s) => s,

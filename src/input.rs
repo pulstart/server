@@ -18,6 +18,17 @@ use std::sync::{
 const MAX_CURSOR_SHAPE_RGBA_BYTES: usize = u16::MAX as usize - 16;
 static TRACE_CURSOR_UPDATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TRACE_CURSOR_SEND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+static PORTAL_ERROR_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Log Portal D-Bus errors sparingly (first 3, then every 100th).
+#[cfg(target_os = "linux")]
+fn log_portal_error(method: &str, err: impl std::fmt::Display) {
+    let n = PORTAL_ERROR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 3 || n % 100 == 0 {
+        eprintln!("[input] Portal {method} failed (count={n}): {err}");
+    }
+}
 
 #[cfg(target_os = "linux")]
 use crate::capture::CapturedCursor;
@@ -589,7 +600,9 @@ impl InputRuntimeInner {
                     #[cfg(target_os = "linux")]
                     InputBackend::PortalRemoteDesktop(controller) => {
                         if let Some(code) = linux_button_code(button) {
-                            let _ = controller.notify_pointer_button(code, pressed);
+                            if let Err(e) = controller.notify_pointer_button(code, pressed) {
+                                log_portal_error("notify_pointer_button", e);
+                            }
                         }
                     }
                     #[cfg(target_os = "macos")]
@@ -609,7 +622,9 @@ impl InputRuntimeInner {
             InputBackend::Uinput(controller) => controller.move_absolute(x, y),
             #[cfg(target_os = "linux")]
             InputBackend::PortalRemoteDesktop(controller) => {
-                let _ = controller.notify_pointer_motion_absolute(x, y);
+                if let Err(e) = controller.notify_pointer_motion_absolute(x, y) {
+                    log_portal_error("notify_pointer_motion_absolute", e);
+                }
             }
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.move_absolute(x, y),
@@ -625,7 +640,9 @@ impl InputRuntimeInner {
             InputBackend::Uinput(controller) => controller.move_relative(dx, dy),
             #[cfg(target_os = "linux")]
             InputBackend::PortalRemoteDesktop(controller) => {
-                let _ = controller.notify_pointer_motion_relative(dx, dy);
+                if let Err(e) = controller.notify_pointer_motion_relative(dx, dy) {
+                    log_portal_error("notify_pointer_motion_relative", e);
+                }
             }
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.move_relative(dx, dy),
@@ -641,7 +658,9 @@ impl InputRuntimeInner {
             InputBackend::Uinput(controller) => controller.scroll(delta_x, delta_y),
             #[cfg(target_os = "linux")]
             InputBackend::PortalRemoteDesktop(controller) => {
-                let _ = controller.notify_pointer_axis_discrete(delta_x, delta_y);
+                if let Err(e) = controller.notify_pointer_axis_discrete(delta_x, delta_y) {
+                    log_portal_error("notify_pointer_axis_discrete", e);
+                }
             }
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.scroll(delta_x, delta_y),
@@ -669,7 +688,9 @@ impl InputRuntimeInner {
                 #[cfg(target_os = "linux")]
                 InputBackend::PortalRemoteDesktop(controller) => {
                     if let Some(code) = linux_key_code(key) {
-                        let _ = controller.notify_keyboard_keycode(code, now_pressed);
+                        if let Err(e) = controller.notify_keyboard_keycode(code, now_pressed) {
+                            log_portal_error("notify_keyboard_keycode", e);
+                        }
                     }
                 }
                 #[cfg(target_os = "macos")]

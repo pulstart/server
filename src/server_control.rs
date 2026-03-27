@@ -72,21 +72,9 @@ fn config_path() -> Option<PathBuf> {
 }
 
 fn generate_token() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let s = RandomState::new();
-    let mut h = s.build_hasher();
-    h.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-    );
-    let a = h.finish();
-    let mut h2 = s.build_hasher();
-    h2.write_u64(a ^ 0xdeadbeef);
-    let b = h2.finish();
-    format!("{a:016x}{b:016x}")
+    use rand::Rng;
+    let bytes: [u8; 16] = rand::thread_rng().gen();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn load_settings() -> PersistedSettings {
@@ -138,6 +126,12 @@ fn resolve_token(saved: &mut PersistedSettings) -> String {
                 if let Err(err) = std::fs::write(&path, &json) {
                     eprintln!("[config] Failed to persist token to {}: {err}", path.display());
                 } else {
+                    // Restrict file permissions so other users cannot read the token.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                    }
                     eprintln!("[config] Token persisted to {}", path.display());
                 }
             }

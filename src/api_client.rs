@@ -10,6 +10,9 @@ use std::time::Duration;
 pub struct ApiTunnelState {
     /// Derived ChaCha20 key, ready for CryptoContext creation.
     pub shared_key: Mutex<Option<[u8; 32]>>,
+    /// Cached CryptoContext (single instance shared across all callers to avoid
+    /// nonce reuse — the AtomicU64 send counter is thread-safe).
+    crypto: Mutex<Option<Arc<CryptoContext>>>,
     /// Partner (client) NAT candidates from the API server.
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
     /// Pre-bound UDP socket for hole punching (taken once by the punch attempt).
@@ -24,6 +27,7 @@ impl ApiTunnelState {
     pub fn new() -> Self {
         Self {
             shared_key: Mutex::new(None),
+            crypto: Mutex::new(None),
             partner_candidates: Mutex::new(Vec::new()),
             punch_socket: Mutex::new(None),
             hole_punch_ready: AtomicBool::new(false),
@@ -31,12 +35,19 @@ impl ApiTunnelState {
         }
     }
 
-    /// Build a CryptoContext for the host side if a shared key has been negotiated.
+    /// Return the shared CryptoContext (same instance for all callers so the
+    /// atomic nonce counter is never reset).
     pub fn crypto_context(&self) -> Option<Arc<CryptoContext>> {
-        self.shared_key
-            .lock()
-            .unwrap()
-            .map(|key| Arc::new(CryptoContext::new(key, true)))
+        let cached = self.crypto.lock().unwrap();
+        if cached.is_some() {
+            return cached.clone();
+        }
+        drop(cached);
+        // Build from shared_key if available, cache it.
+        let key = (*self.shared_key.lock().unwrap())?;
+        let ctx = Arc::new(CryptoContext::new(key, true));
+        *self.crypto.lock().unwrap() = Some(Arc::clone(&ctx));
+        Some(ctx)
     }
 
     /// Take the pre-bound punch socket for use in hole punching (one-shot).
@@ -53,11 +64,16 @@ impl ApiTunnelState {
     }
 
     /// Check and update hole_punch_ready based on current state.
+    /// Acquires all three locks in a consistent order to avoid TOCTOU races.
     pub fn update_hole_punch_ready(&self) {
-        let has_key = self.shared_key.lock().unwrap().is_some();
-        let has_candidates = !self.partner_candidates.lock().unwrap().is_empty();
-        let has_socket = self.punch_socket.lock().unwrap().is_some();
-        self.hole_punch_ready.store(has_key && has_candidates && has_socket, Ordering::Relaxed);
+        let key = self.shared_key.lock().unwrap();
+        let cands = self.partner_candidates.lock().unwrap();
+        let sock = self.punch_socket.lock().unwrap();
+        let ready = key.is_some() && !cands.is_empty() && sock.is_some();
+        drop(sock);
+        drop(cands);
+        drop(key);
+        self.hole_punch_ready.store(ready, Ordering::Relaxed);
     }
 }
 
@@ -180,13 +196,15 @@ pub fn start_api_registration(
             }
 
             let token = control.token();
-            let cands_json =
-                serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".into());
 
             // 1. Register
-            let body = format!(
-                r#"{{"token":"{token}","role":"host","peer_id":"{peer_id}","hostname":"{hostname}","candidates":{cands_json}}}"#,
-            );
+            let body = serde_json::json!({
+                "token": token,
+                "role": "host",
+                "peer_id": peer_id,
+                "hostname": hostname,
+                "candidates": candidates,
+            }).to_string();
             let ok = ureq::post(&format!("{api_url}/api/register"))
                 .set("Content-Type", "application/json")
                 .send_string(&body)
@@ -200,9 +218,11 @@ pub fn start_api_registration(
                 tunnel_state.connected.store(true, Ordering::Relaxed);
 
                 // 2. Upload our public key and try to get partner's key back
-                let key_body = format!(
-                    r#"{{"token":"{token}","role":"host","public_key":"{pub_key_b64}"}}"#,
-                );
+                let key_body = serde_json::json!({
+                    "token": token,
+                    "role": "host",
+                    "public_key": pub_key_b64,
+                }).to_string();
                 if let Ok(resp) = ureq::post(&format!("{api_url}/api/key"))
                     .set("Content-Type", "application/json")
                     .send_string(&key_body)
@@ -229,9 +249,11 @@ pub fn start_api_registration(
                 }
 
                 // 3. Share candidates and fetch partner's candidates
-                let cand_body = format!(
-                    r#"{{"token":"{token}","role":"host","candidates":{cands_json}}}"#,
-                );
+                let cand_body = serde_json::json!({
+                    "token": token,
+                    "role": "host",
+                    "candidates": candidates,
+                }).to_string();
                 if let Ok(resp) = ureq::post(&format!("{api_url}/api/candidates"))
                     .set("Content-Type", "application/json")
                     .send_string(&cand_body)
@@ -272,7 +294,11 @@ pub fn start_api_registration(
 
         // Unregister on shutdown.
         let token = control.token();
-        let body = format!(r#"{{"token":"{token}","role":"host","peer_id":"{peer_id}"}}"#);
+        let body = serde_json::json!({
+            "token": token,
+            "role": "host",
+            "peer_id": peer_id,
+        }).to_string();
         let _ = ureq::post(&format!("{api_url}/api/unregister"))
             .set("Content-Type", "application/json")
             .send_string(&body);

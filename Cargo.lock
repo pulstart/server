@@ -3003,6 +3003,7 @@ dependencies = [
  "libloading 0.8.9",
  "nix 0.29.0",
  "pipewire",
+ "rand",
  "screencapturekit",
  "self-replace",
  "semver",

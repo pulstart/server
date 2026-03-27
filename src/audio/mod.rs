@@ -24,6 +24,7 @@ const PACKET_QUEUE_CAPACITY: usize = 60;
 pub struct AudioPipeline {
     capture: capture::AudioCapture,
     running: Arc<AtomicBool>,
+    encode_handle: Option<thread::JoinHandle<()>>,
     relay_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -32,6 +33,7 @@ impl AudioPipeline {
         Self {
             capture: capture::AudioCapture::new(),
             running: Arc::new(AtomicBool::new(false)),
+            encode_handle: None,
             relay_handle: None,
         }
     }
@@ -67,7 +69,7 @@ impl AudioPipeline {
 
         // 2. Start encode thread (outputs to packet_tx)
         let encode_running = Arc::clone(&self.running);
-        encode::run_encode_thread(config, sample_rx, packet_tx, encode_running);
+        self.encode_handle = Some(encode::run_encode_thread(config, sample_rx, packet_tx, encode_running));
 
         // 3. Relay: forward encoded packets to broadcaster
         let relay_running = Arc::clone(&self.running);
@@ -89,6 +91,9 @@ impl AudioPipeline {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         self.capture.stop();
+        if let Some(handle) = self.encode_handle.take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.relay_handle.take() {
             let _ = handle.join();
         }

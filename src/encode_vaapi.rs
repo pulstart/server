@@ -420,7 +420,12 @@ impl VaapiEncoder {
             (*drm_frame).width = width as i32;
             (*drm_frame).height = height as i32;
             (*drm_frame).data[0] = &mut desc as *mut _ as *mut u8;
-            (*drm_frame).buf[0] = ffi::av_buffer_alloc(1);
+            let buf_ref = ffi::av_buffer_alloc(1);
+            if buf_ref.is_null() {
+                ffi::av_frame_free(&mut { drm_frame });
+                return Err("av_buffer_alloc failed".into());
+            }
+            (*drm_frame).buf[0] = buf_ref;
 
             let vaapi_frame = ffi::av_frame_alloc();
             if vaapi_frame.is_null() {

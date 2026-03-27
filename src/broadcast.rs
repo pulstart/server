@@ -9,6 +9,9 @@ use std::sync::{
     Arc, Mutex,
 };
 
+/// Maximum number of concurrent subscribers per broadcaster.
+const MAX_SUBSCRIBERS: usize = 16;
+
 pub struct Broadcaster<T: Send + Sync + 'static> {
     subscribers: Mutex<Vec<(u64, Sender<Arc<T>>)>>,
     next_id: AtomicU64,
@@ -25,14 +28,18 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
         }
     }
 
-    /// Add a subscriber. Returns (id, receiver).
+    /// Add a subscriber. Returns (id, receiver), or an error if at capacity.
     /// Also sets the keyframe-requested flag so the encoder produces a fresh IDR.
-    pub fn subscribe(&self, capacity: usize) -> (u64, Receiver<Arc<T>>) {
+    pub fn subscribe(&self, capacity: usize) -> Result<(u64, Receiver<Arc<T>>), String> {
+        let mut subs = self.subscribers.lock().unwrap();
+        if subs.len() >= MAX_SUBSCRIBERS {
+            return Err(format!("subscriber limit reached ({MAX_SUBSCRIBERS})"));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = bounded(capacity);
-        self.subscribers.lock().unwrap().push((id, tx));
+        subs.push((id, tx));
         self.keyframe_requested.store(true, Ordering::Release);
-        (id, rx)
+        Ok((id, rx))
     }
 
     /// Check and clear the keyframe-requested flag.

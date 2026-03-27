@@ -258,8 +258,8 @@ pub fn run_encode_thread(
     sample_rx: Receiver<AudioSamples>,
     packet_tx: Sender<EncodedAudioPacket>,
     running: Arc<AtomicBool>,
-) {
-    let handle = thread::spawn(move || {
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         let mut encoder = match OpusEncoder::new(&config) {
             Ok(e) => e,
             Err(e) => {
@@ -303,10 +303,7 @@ pub fn run_encode_thread(
         }
 
         println!("[audio] Encode thread exited");
-    });
-
-    // Detach — lifetime managed by `running` flag
-    drop(handle);
+    })
 }
 
 fn ffmpeg_err(code: i32) -> String {
