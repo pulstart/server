@@ -1459,7 +1459,6 @@ async fn handle_client(
     let aud_rx: Option<Receiver<Arc<Vec<u8>>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
-    let tunnel_crypto = state.tunnel_state.as_ref().and_then(|ts| ts.crypto_context());
     let transport_handle = std::thread::spawn(move || {
         run_transport(
             transport_addr,
@@ -1467,7 +1466,7 @@ async fn handle_client(
             aud_rx,
             audio_enabled_transport,
             transport_running_clone,
-            tunnel_crypto,
+            None,
         );
     });
     if let Err(err) = stream
