@@ -2,11 +2,11 @@ use st_protocol::packet::HEADER_SIZE;
 use st_protocol::reliable_udp::PunchedSocket;
 use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
 use st_protocol::{FrameSlicer, FrameTimingMeta, PacketHeader, PayloadType};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 
-const LAN_MAX_UDP: usize = 1400;
-const SAFE_PATH_MAX_UDP: usize = 1200;
+const LOOPBACK_MAX_UDP: usize = 1400;
+const SAFE_NETWORK_MAX_UDP: usize = 1200;
 
 pub struct EncodedVideoFrame {
     pub data: Vec<u8>,
@@ -41,7 +41,10 @@ impl UdpSender {
             .map_err(|e| format!("connect UDP: {e}"))?;
         let overhead = if crypto.is_some() { CRYPTO_OVERHEAD } else { 0 };
         let max_udp = select_max_udp_packet_size(client_addr).saturating_sub(overhead);
-        if std::env::var_os("ST_TRACE").is_some() || max_udp != LAN_MAX_UDP || crypto.is_some() {
+        if std::env::var_os("ST_TRACE").is_some()
+            || max_udp != LOOPBACK_MAX_UDP
+            || crypto.is_some()
+        {
             eprintln!(
                 "[transport] UDP max payload {} bytes for {} (encrypted={})",
                 max_udp, client_addr, crypto.is_some()
@@ -61,7 +64,7 @@ impl UdpSender {
     pub fn from_punched(punched: Arc<PunchedSocket>) -> Self {
         // Punched connections always use the safe (public internet) MTU
         // minus crypto overhead (handled inside PunchedSocket) minus channel prefix.
-        let max_udp = SAFE_PATH_MAX_UDP
+        let max_udp = SAFE_NETWORK_MAX_UDP
             .saturating_sub(CRYPTO_OVERHEAD)
             .saturating_sub(st_protocol::reliable_udp::PUNCHED_MEDIA_OVERHEAD);
         eprintln!(
@@ -169,22 +172,15 @@ fn select_max_udp_packet_size(client_addr: SocketAddr) -> usize {
     }
 
     if prefers_safe_udp_path(client_addr.ip()) {
-        SAFE_PATH_MAX_UDP
+        SAFE_NETWORK_MAX_UDP
     } else {
-        LAN_MAX_UDP
+        LOOPBACK_MAX_UDP
     }
 }
 
 fn prefers_safe_udp_path(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.octets()[0] == Ipv4Addr::BROADCAST.octets()[0])
-        }
-        IpAddr::V6(v6) => !(v6.is_loopback()
-            || v6.is_unique_local()
-            || v6.is_unicast_link_local()),
+        IpAddr::V4(v4) => !v4.is_loopback(),
+        IpAddr::V6(v6) => !v6.is_loopback(),
     }
 }

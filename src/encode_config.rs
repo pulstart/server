@@ -133,7 +133,8 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
-    const DEFAULT_BITRATE_KBPS: u32 = 50_000;
+    // Start conservatively so weak Wi-Fi can lock in and let ABR probe upward.
+    const DEFAULT_BITRATE_KBPS: u32 = 20_000;
     const DEFAULT_MIN_BITRATE_KBPS: u32 = 5_000;
     const DEFAULT_MAX_BITRATE_KBPS: u32 = 100_000;
     const DEFAULT_FRAMERATE: u32 = 60;
