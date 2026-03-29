@@ -17,6 +17,8 @@ extern crate ffmpeg_sys_next as ffi;
 
 use std::ptr;
 
+const DEFAULT_MAX_CAPTURE_BACKLOG: usize = 2;
+
 /// RAII wrapper for FFmpeg codec context used for Opus encoding.
 struct OpusEncoder {
     ctx: *mut ffi::AVCodecContext,
@@ -269,12 +271,39 @@ pub fn run_encode_thread(
         };
 
         let mut pts: i64 = 0;
+        let trace = std::env::var_os("ST_TRACE").is_some();
+        let max_capture_backlog = std::env::var("ST_AUDIO_MAX_CAPTURE_BACKLOG")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 8))
+            .unwrap_or(DEFAULT_MAX_CAPTURE_BACKLOG);
+        let mut backlog_logs = 0usize;
 
         while running.load(Ordering::SeqCst) {
-            let samples = match sample_rx.recv() {
+            let mut samples = match sample_rx.recv() {
                 Ok(s) => s,
                 Err(_) => break, // Channel closed
             };
+            let mut dropped_frames = 0usize;
+            while sample_rx.len() > max_capture_backlog {
+                match sample_rx.try_recv() {
+                    Ok(newer) => {
+                        samples = newer;
+                        dropped_frames += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if dropped_frames > 0 {
+                pts += dropped_frames as i64 * config.samples_per_frame() as i64;
+                if trace && backlog_logs < 12 {
+                    eprintln!(
+                        "[trace][audio] encoder dropped {} stale capture frame(s)",
+                        dropped_frames
+                    );
+                    backlog_logs += 1;
+                }
+            }
 
             // Validate sample metadata matches encoder config
             if samples.channels != config.channels || samples.sample_rate != config.sample_rate {

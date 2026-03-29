@@ -9,17 +9,14 @@ pub mod encode;
 
 use crate::broadcast::Broadcaster;
 use crate::encode_config::AudioConfig;
-use crossbeam_channel::bounded;
+use crossbeam_channel::unbounded;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::thread;
 
-/// Sunshine uses a 30-frame queue between capture and encode.
-const SAMPLE_QUEUE_CAPACITY: usize = 30;
-/// Encoded packet queue between encode and relay.
-const PACKET_QUEUE_CAPACITY: usize = 60;
+const DEFAULT_MAX_PACKET_BACKLOG: usize = 2;
 
 pub struct AudioPipeline {
     capture: capture::AudioCapture,
@@ -52,9 +49,9 @@ impl AudioPipeline {
         self.running.store(true, Ordering::SeqCst);
 
         // Channel: capture → encode
-        let (sample_tx, sample_rx) = bounded(SAMPLE_QUEUE_CAPACITY);
+        let (sample_tx, sample_rx) = unbounded();
         // Channel: encode → relay
-        let (packet_tx, packet_rx) = bounded(PACKET_QUEUE_CAPACITY);
+        let (packet_tx, packet_rx) = unbounded();
 
         // Detect PulseAudio monitor source
         let monitor_source = capture::detect_monitor_source();
@@ -73,10 +70,36 @@ impl AudioPipeline {
 
         // 3. Relay: forward encoded packets to broadcaster
         let relay_running = Arc::clone(&self.running);
+        let relay_trace = std::env::var_os("ST_TRACE").is_some();
+        let max_packet_backlog = std::env::var("ST_AUDIO_MAX_PACKET_BACKLOG")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 8))
+            .unwrap_or(DEFAULT_MAX_PACKET_BACKLOG);
         let relay_handle = thread::spawn(move || {
+            let mut backlog_logs = 0usize;
             while relay_running.load(Ordering::SeqCst) {
                 match packet_rx.recv() {
-                    Ok(packet) => broadcaster.broadcast(packet.data),
+                    Ok(mut packet) => {
+                        let mut dropped_packets = 0usize;
+                        while packet_rx.len() > max_packet_backlog {
+                            match packet_rx.try_recv() {
+                                Ok(newer) => {
+                                    packet = newer;
+                                    dropped_packets += 1;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if relay_trace && dropped_packets > 0 && backlog_logs < 12 {
+                            eprintln!(
+                                "[trace][audio] relay dropped {} stale encoded packet(s)",
+                                dropped_packets
+                            );
+                            backlog_logs += 1;
+                        }
+                        broadcaster.broadcast(packet.data);
+                    }
                     Err(_) => break,
                 }
             }
