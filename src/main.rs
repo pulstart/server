@@ -1837,75 +1837,74 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
         Some(t) => t,
         None => return,
     };
+    let listen_port = state.listen_port;
     let state = Arc::clone(&state);
     std::thread::spawn(move || {
-        let mut last_attempted_candidates: Option<Vec<SocketAddr>> = None;
-        let mut next_retry_at = Instant::now();
+        let mut last_handled_punch_nonce = 0;
         loop {
             if state.control.shutdown_requested() {
                 break;
             }
+            let pending_punch_nonce = tunnel.pending_client_punch_nonce();
+            if pending_punch_nonce <= last_handled_punch_nonce || tunnel.is_punch_session_active() {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
             if !tunnel.is_hole_punch_ready() {
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
 
-            let socket = match tunnel.take_punch_socket() {
-                Some(s) => s,
-                None => {
-                    std::thread::sleep(Duration::from_secs(5));
+            let socket = match tunnel.clone_punch_socket(listen_port) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    eprintln!("[hole-punch] Failed to prepare punch socket: {e}");
+                    std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
             };
 
             let candidates: Vec<SocketAddr> = tunnel.partner_candidates.lock().unwrap().clone();
             if candidates.is_empty() {
-                // Put socket back and retry.
-                *tunnel.punch_socket.lock().unwrap() = Some(socket);
-                std::thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            if last_attempted_candidates.as_ref() == Some(&candidates)
-                && Instant::now() < next_retry_at
-            {
-                *tunnel.punch_socket.lock().unwrap() = Some(socket);
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
 
             let crypto = match tunnel.crypto_context() {
                 Some(c) => c,
                 None => {
-                    *tunnel.punch_socket.lock().unwrap() = Some(socket);
-                    std::thread::sleep(Duration::from_secs(2));
+                    std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
             };
 
             println!("[hole-punch] Attempting to punch through to {} candidate(s)...", candidates.len());
-            last_attempted_candidates = Some(candidates.clone());
             match st_protocol::tunnel::hole_punch(&socket, &candidates, &crypto, Duration::from_secs(10)) {
                 Ok(peer) => {
-                    next_retry_at = Instant::now();
+                    last_handled_punch_nonce = pending_punch_nonce;
                     println!("[hole-punch] Success! Peer confirmed at {peer}");
+                    tunnel.set_punch_session_active(true);
                     let punched = Arc::new(st_protocol::reliable_udp::PunchedSocket::new(
                         socket, peer, crypto,
                     ));
                     let state2 = Arc::clone(&state);
+                    let tunnel2 = Arc::clone(&tunnel);
                     // Run the punched-client handler in a blocking thread.
                     std::thread::spawn(move || {
+                        struct ActivePunchGuard(Arc<api_client::ApiTunnelState>);
+                        impl Drop for ActivePunchGuard {
+                            fn drop(&mut self) {
+                                self.0.set_punch_session_active(false);
+                            }
+                        }
+                        let _guard = ActivePunchGuard(Arc::clone(&tunnel2));
                         handle_punched_client(punched, state2);
                     });
                 }
                 Err(e) => {
+                    last_handled_punch_nonce = pending_punch_nonce;
                     eprintln!("[hole-punch] Failed: {e}");
-                    next_retry_at = Instant::now() + Duration::from_secs(60);
-                    // Re-register by rebinding a new socket.
-                    if let Ok(new_sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                        *tunnel.punch_socket.lock().unwrap() = Some(new_sock);
-                        tunnel.update_hole_punch_ready();
-                    }
-                    std::thread::sleep(Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_millis(500));
                 }
             }
         }
