@@ -1820,7 +1820,8 @@ async fn run_discovery_beacon(control: Arc<ServerControl>, listen_port: u16) {
             break;
         }
         let token = control.token();
-        let packet = format!("ST_DISCOVER\n{hostname}\n{listen_port}\n{token}");
+        let peer_id = control.peer_id();
+        let packet = format!("ST_DISCOVER\n{hostname}\n{listen_port}\n{token}\n{peer_id}");
         let _ = sock.send_to(packet.as_bytes(), dest).await;
         tokio::time::sleep(DISCOVERY_BEACON_INTERVAL).await;
     }
@@ -1838,6 +1839,8 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
     };
     let state = Arc::clone(&state);
     std::thread::spawn(move || {
+        let mut last_attempted_candidates: Option<Vec<SocketAddr>> = None;
+        let mut next_retry_at = Instant::now();
         loop {
             if state.control.shutdown_requested() {
                 break;
@@ -1862,6 +1865,13 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
+            if last_attempted_candidates.as_ref() == Some(&candidates)
+                && Instant::now() < next_retry_at
+            {
+                *tunnel.punch_socket.lock().unwrap() = Some(socket);
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
 
             let crypto = match tunnel.crypto_context() {
                 Some(c) => c,
@@ -1873,8 +1883,10 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
             };
 
             println!("[hole-punch] Attempting to punch through to {} candidate(s)...", candidates.len());
+            last_attempted_candidates = Some(candidates.clone());
             match st_protocol::tunnel::hole_punch(&socket, &candidates, &crypto, Duration::from_secs(10)) {
                 Ok(peer) => {
+                    next_retry_at = Instant::now();
                     println!("[hole-punch] Success! Peer confirmed at {peer}");
                     let punched = Arc::new(st_protocol::reliable_udp::PunchedSocket::new(
                         socket, peer, crypto,
@@ -1887,6 +1899,7 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                 }
                 Err(e) => {
                     eprintln!("[hole-punch] Failed: {e}");
+                    next_retry_at = Instant::now() + Duration::from_secs(60);
                     // Re-register by rebinding a new socket.
                     if let Ok(new_sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
                         *tunnel.punch_socket.lock().unwrap() = Some(new_sock);
