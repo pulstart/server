@@ -111,6 +111,13 @@ fn configure_direct_udp_socket(socket: &UdpSocket, client_addr: SocketAddr) {
 pub struct EncodedVideoFrame {
     pub data: Vec<u8>,
     pub capture_micros: u64,
+    pub source_seq: u64,
+    pub is_recovery: bool,
+}
+
+pub struct EncodedUnit {
+    pub data: Vec<u8>,
+    pub is_recovery: bool,
 }
 
 /// Backend for sending UDP data: either a direct socket or a punched socket.

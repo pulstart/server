@@ -6,6 +6,7 @@
 use crate::capture::{CapturedFrame, DmaBufPlane, FrameData};
 use crate::colorspace::Colorspace;
 use crate::encode_config::{Codec, EncoderConfig};
+use crate::transport::EncodedUnit;
 
 extern crate ffmpeg_next as ffmpeg;
 extern crate ffmpeg_sys_next as ffi;
@@ -378,7 +379,7 @@ impl VaapiEncoder {
     }
 
     /// Encode a captured frame (DMA-BUF or RAM), returning encoded NAL unit buffers.
-    pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<Vec<u8>>, String> {
+    pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
         match &frame.data {
             FrameData::DmaBuf { planes, drm_format } => {
                 self.encode_dmabuf(planes, *drm_format, frame.width, frame.height)
@@ -394,7 +395,7 @@ impl VaapiEncoder {
         _drm_format: u32,
         width: u32,
         height: u32,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    ) -> Result<Vec<EncodedUnit>, String> {
         unsafe {
             let mut desc: ffi::AVDRMFrameDescriptor = std::mem::zeroed();
             desc.nb_objects = planes.len() as i32;
@@ -468,7 +469,7 @@ impl VaapiEncoder {
     }
 
     /// Encode a RAM (BGRA) frame by uploading to VAAPI via software conversion.
-    fn encode_ram(&mut self, bgra_data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    fn encode_ram(&mut self, bgra_data: &[u8]) -> Result<Vec<EncodedUnit>, String> {
         let bgra_frame = self
             .bgra_frame
             .as_mut()
@@ -542,7 +543,7 @@ impl VaapiEncoder {
     unsafe fn send_and_receive(
         &mut self,
         frame: *mut ffi::AVFrame,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    ) -> Result<Vec<EncodedUnit>, String> {
         let ret = ffi::avcodec_send_frame(self.codec_ctx, frame);
         if ret < 0 {
             return Err(format!("avcodec_send_frame failed: {}", ffmpeg_err(ret)));
@@ -567,7 +568,10 @@ impl VaapiEncoder {
                 ));
             }
             let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
-            nals.push(data.to_vec());
+            nals.push(EncodedUnit {
+                data: data.to_vec(),
+                is_recovery: ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0,
+            });
             ffi::av_packet_unref(pkt);
         }
         ffi::av_packet_free(&mut { pkt });
@@ -614,7 +618,7 @@ impl VaapiEncoder {
         Ok(())
     }
 
-    pub fn flush(&mut self) -> Vec<Vec<u8>> {
+    pub fn flush(&mut self) -> Vec<EncodedUnit> {
         unsafe {
             let _ = ffi::avcodec_send_frame(self.codec_ctx, ptr::null());
         }
@@ -630,7 +634,10 @@ impl VaapiEncoder {
                     break;
                 }
                 let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
-                nals.push(data.to_vec());
+                nals.push(EncodedUnit {
+                    data: data.to_vec(),
+                    is_recovery: ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0,
+                });
                 ffi::av_packet_unref(pkt);
             }
             ffi::av_packet_free(&mut { pkt });

@@ -1,6 +1,6 @@
 use super::super::{CaptureBackend, CapturedCursor, CapturedFrame, DmaBufPlane, FrameData};
 use super::target_frame_interval;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::{
@@ -337,6 +337,8 @@ impl CaptureBackend for KmsCapture {
 
         let handle = thread::spawn(move || {
             let target_interval = target_frame_interval();
+            let trace = std::env::var_os("ST_TRACE").is_some();
+            let mut dropped_frames = 0usize;
 
             while running.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
@@ -353,8 +355,17 @@ impl CaptureBackend for KmsCapture {
 
                 match capture_frame(&card, current_plane, cursor_handle) {
                     Ok(frame) => {
-                        if tx.send(frame).is_err() {
-                            break;
+                        match tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                if trace && dropped_frames < 8 {
+                                    eprintln!(
+                                        "[trace][kms] dropped captured frame because capture channel is full"
+                                    );
+                                }
+                                dropped_frames = dropped_frames.saturating_add(1);
+                            }
+                            Err(TrySendError::Disconnected(_)) => break,
                         }
                     }
                     Err(e) => {

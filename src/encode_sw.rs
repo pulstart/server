@@ -6,6 +6,7 @@
 use crate::capture::{CapturedFrame, FrameData};
 use crate::colorspace::Colorspace;
 use crate::encode_config::{Codec, EncoderConfig};
+use crate::transport::EncodedUnit;
 
 extern crate ffmpeg_next as ffmpeg;
 extern crate ffmpeg_sys_next as ffi;
@@ -213,7 +214,7 @@ impl SoftwareEncoder {
 
     /// Encode a captured frame. DMA-BUF frames are read back directly into the
     /// pre-allocated BGRA frame (single copy, no intermediate Vec).
-    pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<Vec<u8>>, String> {
+    pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
         match &frame.data {
             FrameData::Ram(data) => self.fill_bgra_from_slice(data),
             FrameData::DmaBuf { planes, drm_format } => {
@@ -246,7 +247,7 @@ impl SoftwareEncoder {
     unsafe fn send_and_receive(
         &mut self,
         frame: *mut ffi::AVFrame,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    ) -> Result<Vec<EncodedUnit>, String> {
         let ret = ffi::avcodec_send_frame(self.codec_ctx, frame);
         if ret < 0 {
             return Err(format!("avcodec_send_frame failed: {}", ffmpeg_err(ret)));
@@ -271,7 +272,10 @@ impl SoftwareEncoder {
                 ));
             }
             let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
-            nals.push(data.to_vec());
+            nals.push(EncodedUnit {
+                data: data.to_vec(),
+                is_recovery: ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0,
+            });
             ffi::av_packet_unref(pkt);
         }
         ffi::av_packet_free(&mut { pkt });
@@ -401,7 +405,7 @@ impl SoftwareEncoder {
         Ok(())
     }
 
-    pub fn flush(&mut self) -> Vec<Vec<u8>> {
+    pub fn flush(&mut self) -> Vec<EncodedUnit> {
         unsafe {
             let _ = ffi::avcodec_send_frame(self.codec_ctx, ptr::null());
         }
@@ -417,7 +421,10 @@ impl SoftwareEncoder {
                     break;
                 }
                 let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
-                nals.push(data.to_vec());
+                nals.push(EncodedUnit {
+                    data: data.to_vec(),
+                    is_recovery: ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0,
+                });
                 ffi::av_packet_unref(pkt);
             }
             ffi::av_packet_free(&mut { pkt });

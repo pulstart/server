@@ -8,7 +8,7 @@
 /// On Wayland, use wlr-screencopy (grim) or PipeWire instead.
 use super::super::{CaptureBackend, CapturedCursor, CapturedFrame, FrameData};
 use super::target_frame_interval;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -342,6 +342,8 @@ impl CaptureBackend for X11Capture {
         let handle = thread::spawn(move || {
             let mut state = state;
             let target_interval = target_frame_interval();
+            let trace = std::env::var_os("ST_TRACE").is_some();
+            let mut dropped_frames = 0usize;
 
             while running.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
@@ -379,8 +381,17 @@ impl CaptureBackend for X11Capture {
                         cursor,
                     };
 
-                    if tx.send(frame).is_err() {
-                        break;
+                    match tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            if trace && dropped_frames < 8 {
+                                eprintln!(
+                                    "[trace][x11] dropped captured frame because capture channel is full"
+                                );
+                            }
+                            dropped_frames = dropped_frames.saturating_add(1);
+                        }
+                        Err(TrySendError::Disconnected(_)) => break,
                     }
                 } else {
                     // Clear the error flag and continue

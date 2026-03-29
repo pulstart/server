@@ -1,5 +1,6 @@
 #![allow(dead_code, non_upper_case_globals)]
 
+use crate::transport::EncodedUnit;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::ffi::c_void;
 use std::ptr;
@@ -167,8 +168,8 @@ const K_CM_VIDEO_CODEC_TYPE_H264: u32 = 0x61766331; // 'avc1'
 // ── Encoder ──────────────────────────────────────────────────────────────
 pub struct VTEncoder {
     session: VTCompressionSessionRef,
-    _callback_ctx: *mut Sender<Vec<u8>>,
-    nal_rx: Receiver<Vec<u8>>,
+    _callback_ctx: *mut Sender<EncodedUnit>,
+    nal_rx: Receiver<EncodedUnit>,
     frame_count: i64,
 }
 
@@ -272,7 +273,7 @@ impl VTEncoder {
         Ok(())
     }
 
-    pub fn receive_nals(&self) -> Vec<Vec<u8>> {
+    pub fn receive_nals(&self) -> Vec<EncodedUnit> {
         let mut nals = Vec::new();
         while let Ok(nal) = self.nal_rx.try_recv() {
             nals.push(nal);
@@ -367,7 +368,7 @@ extern "C" fn vt_output_callback(
         return;
     }
 
-    let tx = unsafe { &*(output_callback_ref_con as *const Sender<Vec<u8>>) };
+    let tx = unsafe { &*(output_callback_ref_con as *const Sender<EncodedUnit>) };
 
     let block_buffer = unsafe { CMSampleBufferGetDataBuffer(sample_buffer) };
     if block_buffer.is_null() {
@@ -426,6 +427,9 @@ extern "C" fn vt_output_callback(
     }
 
     if !annex_b.is_empty() {
-        let _ = tx.try_send(annex_b);
+        let _ = tx.try_send(EncodedUnit {
+            data: annex_b,
+            is_recovery: keyframe,
+        });
     }
 }

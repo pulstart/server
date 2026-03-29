@@ -36,7 +36,7 @@ use st_protocol::{
 };
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -59,11 +59,17 @@ const DEFAULT_APP_PORT: u16 = 28_480;
 const DISCOVERY_PORT: u16 = 28_481;
 const DISCOVERY_BEACON_INTERVAL: Duration = Duration::from_secs(2);
 const VIDEO_SUBSCRIBER_CAPACITY: usize = 120;
+const CAPTURE_QUEUE_CAPACITY: usize = 4;
 static TRACE_ENCODE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static NEXT_ENCODED_VIDEO_UNIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 extern "C" {
     fn CVPixelBufferRelease(buf: *mut std::ffi::c_void);
+}
+
+fn next_encoded_video_unit_seq() -> u64 {
+    NEXT_ENCODED_VIDEO_UNIT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Result of the pipeline — either it started OK or it had an error.
@@ -497,7 +503,7 @@ fn run_shared_pipeline(
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     #[cfg(target_os = "linux")] audio_bc: Arc<Broadcaster<Vec<u8>>>,
 ) {
-    let (frame_tx, frame_rx) = bounded(1);
+    let (frame_tx, frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
     let trace = trace_enabled();
 
     let negotiated_fps = EncoderConfig::resolve_target_fps(client_requested_fps);
@@ -889,8 +895,10 @@ fn encode_and_broadcast(
 
     for nal in encoder.receive_nals() {
         broadcaster.broadcast(EncodedVideoFrame {
-            data: nal,
+            data: nal.data,
             capture_micros: captured_micros,
+            source_seq: next_encoded_video_unit_seq(),
+            is_recovery: nal.is_recovery,
         });
     }
 }
@@ -946,7 +954,7 @@ fn encode_and_broadcast(
             if trace_enabled() {
                 let log_index = TRACE_ENCODE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                 if log_index < 12 {
-                    let total_bytes: usize = nals.iter().map(|nal| nal.len()).sum();
+                    let total_bytes: usize = nals.iter().map(|nal| nal.data.len()).sum();
                     eprintln!(
                         "[trace][server] encoder produced {} unit(s), total={} bytes, capture_ts={captured_micros}",
                         nals.len(),
@@ -956,8 +964,10 @@ fn encode_and_broadcast(
             }
             for nal in nals {
                 broadcaster.broadcast(EncodedVideoFrame {
-                    data: nal,
+                    data: nal.data,
                     capture_micros: captured_micros,
+                    source_seq: next_encoded_video_unit_seq(),
+                    is_recovery: nal.is_recovery,
                 });
             }
         }
@@ -991,6 +1001,8 @@ fn run_transport(
     let mut last_video_activity = std::time::Instant::now();
     let mut sent_startup_frame = false;
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
+    let mut waiting_for_recovery_frame = false;
+    let mut last_source_seq = None::<u64>;
 
     // Preserve the very first queued frame so a new subscriber starts from the
     // requested IDR. After startup, collapse backlog to the newest queued
@@ -1005,14 +1017,45 @@ fn run_transport(
                 } else {
                     (frame, 0)
                 };
-                if skipped_frames > 0
-                    && last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250)
-                {
-                    video_bc.request_keyframe();
-                    last_backlog_keyframe_request = Instant::now();
+                let source_gap = last_source_seq
+                    .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
+                    .unwrap_or(0);
+                last_source_seq = Some(frame.source_seq);
+
+                if source_gap > 0 {
+                    waiting_for_recovery_frame = true;
+                    if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                        video_bc.request_keyframe();
+                        last_backlog_keyframe_request = Instant::now();
+                    }
+                    if trace {
+                        let skipped_before_transport = source_gap.saturating_sub(skipped_frames as u64);
+                        eprintln!(
+                            "[trace][server] detected {source_gap} locally dropped video unit(s) for {addr} (drained_now={skipped_frames}, evicted_before_transport={skipped_before_transport}); requesting recovery keyframe"
+                        );
+                    }
+                }
+
+                if waiting_for_recovery_frame && !frame.is_recovery {
+                    if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                        video_bc.request_keyframe();
+                        last_backlog_keyframe_request = Instant::now();
+                    }
                     if trace {
                         eprintln!(
-                            "[trace][server] collapsed {skipped_frames} queued video frame(s) for {addr}; requesting keyframe"
+                            "[trace][server] holding non-recovery video unit source_seq={} for {addr} while waiting for recovery",
+                            frame.source_seq
+                        );
+                    }
+                    continue;
+                }
+
+                if waiting_for_recovery_frame && frame.is_recovery {
+                    waiting_for_recovery_frame = false;
+                    if trace {
+                        eprintln!(
+                            "[trace][server] resumed video for {addr} on recovery unit source_seq={}",
+                            frame.source_seq
                         );
                     }
                 }
@@ -2209,8 +2252,11 @@ fn run_punched_transport(
     running: Arc<AtomicBool>,
 ) {
     let mut sender = UdpSender::from_punched(punched);
+    let trace = trace_enabled();
     let mut sent_startup_frame = false;
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
+    let mut waiting_for_recovery_frame = false;
+    let mut last_source_seq = None::<u64>;
     while running.load(Ordering::SeqCst) {
         match vid_rx.recv_timeout(Duration::from_millis(5)) {
             Ok(frame) => {
@@ -2219,11 +2265,47 @@ fn run_punched_transport(
                 } else {
                     (frame, 0)
                 };
-                if skipped_frames > 0
-                    && last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250)
-                {
-                    video_bc.request_keyframe();
-                    last_backlog_keyframe_request = Instant::now();
+                let source_gap = last_source_seq
+                    .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
+                    .unwrap_or(0);
+                last_source_seq = Some(frame.source_seq);
+
+                if source_gap > 0 {
+                    waiting_for_recovery_frame = true;
+                    if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                        video_bc.request_keyframe();
+                        last_backlog_keyframe_request = Instant::now();
+                    }
+                    if trace {
+                        let skipped_before_transport = source_gap.saturating_sub(skipped_frames as u64);
+                        eprintln!(
+                            "[trace][server] detected {source_gap} locally dropped punched video unit(s) (drained_now={skipped_frames}, evicted_before_transport={skipped_before_transport}); requesting recovery keyframe"
+                        );
+                    }
+                }
+
+                if waiting_for_recovery_frame && !frame.is_recovery {
+                    if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                        video_bc.request_keyframe();
+                        last_backlog_keyframe_request = Instant::now();
+                    }
+                    if trace {
+                        eprintln!(
+                            "[trace][server] holding punched non-recovery video unit source_seq={} while waiting for recovery",
+                            frame.source_seq
+                        );
+                    }
+                    continue;
+                }
+
+                if waiting_for_recovery_frame && frame.is_recovery {
+                    waiting_for_recovery_frame = false;
+                    if trace {
+                        eprintln!(
+                            "[trace][server] resumed punched video on recovery unit source_seq={}",
+                            frame.source_seq
+                        );
+                    }
                 }
                 match sender.send_frame(&frame, unix_time_micros()) {
                     Ok(()) => sent_startup_frame = true,

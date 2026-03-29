@@ -18,7 +18,7 @@
 /// enables steady 60 FPS capture on wlroots compositors (Sway, Hyprland, river, etc.).
 use super::super::{CaptureBackend, CapturedFrame, FrameData};
 use super::target_frame_interval;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -439,6 +439,8 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
 
     let mut shm_buffer: Option<ShmBuffer> = None;
     let target_interval = target_frame_interval();
+    let trace = std::env::var_os("ST_TRACE").is_some();
+    let mut dropped_frames = 0usize;
 
     while running.load(Ordering::SeqCst) {
         let frame_start = Instant::now();
@@ -538,8 +540,17 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
             cursor: None, // wlr-screencopy embeds cursor via overlay_cursor=1
         };
 
-        if tx.send(captured).is_err() {
-            break;
+        match tx.try_send(captured) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                if trace && dropped_frames < 8 {
+                    eprintln!(
+                        "[trace][wayland] dropped captured frame because capture channel is full"
+                    );
+                }
+                dropped_frames = dropped_frames.saturating_add(1);
+            }
+            Err(TrySendError::Disconnected(_)) => break,
         }
 
         // Throttle to target frame rate

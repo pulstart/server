@@ -1,9 +1,10 @@
 use super::{target_fps, CaptureBackend, CapturedFrame};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use screencapturekit::prelude::*;
 
 extern "C" {
     fn CVPixelBufferRetain(buf: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CVPixelBufferRelease(buf: *mut std::ffi::c_void);
 }
 
 struct OutputHandler {
@@ -31,11 +32,16 @@ impl SCStreamOutputTrait for OutputHandler {
             CVPixelBufferRetain(ptr);
         }
 
-        let _ = self.tx.try_send(CapturedFrame {
+        match self.tx.try_send(CapturedFrame {
             pixel_buffer_ptr: ptr,
             width,
             height,
-        });
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(frame)) | Err(TrySendError::Disconnected(frame)) => unsafe {
+                CVPixelBufferRelease(frame.pixel_buffer_ptr);
+            },
+        }
     }
 }
 

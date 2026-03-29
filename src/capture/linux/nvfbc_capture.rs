@@ -2,7 +2,7 @@
 
 use super::super::{CaptureBackend, CapturedFrame, FrameData};
 use super::target_fps;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use libloading::Library;
 use std::cell::Cell;
 use std::ffi::{c_char, c_void, CStr};
@@ -556,6 +556,8 @@ impl CaptureBackend for NvfbcCapture {
 
         let handle = thread::spawn(move || {
             let mut capturer = wrapped_capturer.0;
+            let trace = std::env::var_os("ST_TRACE").is_some();
+            let mut dropped_frames = 0usize;
             while running.load(Ordering::SeqCst) {
                 match capturer.next_frame(
                     CaptureMethod::Blocking,
@@ -570,8 +572,17 @@ impl CaptureBackend for NvfbcCapture {
                             height: frame_info.height,
                             cursor: None,
                         };
-                        if tx.send(frame).is_err() {
-                            break;
+                        match tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                if trace && dropped_frames < 8 {
+                                    eprintln!(
+                                        "[trace][nvfbc] dropped captured frame because capture channel is full"
+                                    );
+                                }
+                                dropped_frames = dropped_frames.saturating_add(1);
+                            }
+                            Err(TrySendError::Disconnected(_)) => break,
                         }
                     }
                     Err(_) => {

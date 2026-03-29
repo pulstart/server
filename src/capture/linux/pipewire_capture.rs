@@ -67,6 +67,16 @@ fn copy_dmabuf_bgrx_frame(
         ));
     }
 
+    // Synchronize CPU reads against the producer before touching the mapped
+    // DMA-BUF. Without this, fast motion can expose partially-written or stale
+    // contents from the compositor.
+    let sync_start: u64 = 5; // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+    let sync_end: u64 = 2 | 4; // DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
+    nix::ioctl_write_ptr_bad!(dma_buf_sync, 0x4008_6200u64, u64);
+    unsafe {
+        let _ = dma_buf_sync(fd.as_raw_fd(), &sync_start);
+    }
+
     let src = unsafe { (mapped as *const u8).add(offset as usize) };
     let mut out = vec![0u8; row_bytes * height as usize];
     if stride == row_bytes {
@@ -84,6 +94,7 @@ fn copy_dmabuf_bgrx_frame(
     }
 
     unsafe {
+        let _ = dma_buf_sync(fd.as_raw_fd(), &sync_end);
         libc::munmap(mapped, mapped_size);
     }
     Ok(out)
@@ -1544,6 +1555,20 @@ fn run_pipewire_stream(
                 let chunk_offset = chunk.offset();
                 let chunk_size = chunk.size();
                 let chunk_stride = chunk.stride();
+                if trace && process_idx < 16 {
+                    let raw_type_label = if raw_type == pw::spa::sys::SPA_DATA_DmaBuf {
+                        "dmabuf"
+                    } else {
+                        "mem"
+                    };
+                    eprintln!(
+                        "[trace][pipewire] buffer #{process_idx}: type={raw_type_label} raw_type={} offset={} size={} stride={}",
+                        raw_type,
+                        chunk_offset,
+                        chunk_size,
+                        chunk_stride
+                    );
+                }
                 let frame = if raw_type == pw::spa::sys::SPA_DATA_DmaBuf {
                     let raw_fd = data.fd();
                     let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
