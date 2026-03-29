@@ -82,16 +82,20 @@ impl UdpSender {
         }
     }
 
-    /// Send raw bytes through the socket, encrypting first if a CryptoContext is present.
-    fn send_bytes(&mut self, plaintext: &[u8]) -> Result<(), String> {
-        match &self.backend {
+    /// Send raw bytes through the backend, encrypting first if a CryptoContext is present.
+    fn send_bytes_with(
+        backend: &SendBackend,
+        encrypt_buf: &mut Vec<u8>,
+        plaintext: &[u8],
+    ) -> Result<(), String> {
+        match backend {
             SendBackend::Direct { socket, crypto } => {
                 if let Some(ref crypto) = crypto {
-                    self.encrypt_buf.clear();
-                    self.encrypt_buf.resize(plaintext.len() + CRYPTO_OVERHEAD, 0);
-                    let n = crypto.encrypt_into(plaintext, &mut self.encrypt_buf);
+                    encrypt_buf.clear();
+                    encrypt_buf.resize(plaintext.len() + CRYPTO_OVERHEAD, 0);
+                    let n = crypto.encrypt_into(plaintext, encrypt_buf);
                     socket
-                        .send(&self.encrypt_buf[..n])
+                        .send(&encrypt_buf[..n])
                         .map_err(|e| format!("send: {e}"))?;
                 } else {
                     socket
@@ -112,37 +116,37 @@ impl UdpSender {
         frame: &EncodedVideoFrame,
         send_micros: u64,
     ) -> Result<(), String> {
-        let packets = self.slicer.slice_with_meta(
+        let backend = &self.backend;
+        let encrypt_buf = &mut self.encrypt_buf;
+        let slicer = &mut self.slicer;
+        let frame_id = self.frame_id;
+        let (packets, parity) = slicer.slice_with_meta_parts(
             &frame.data,
-            self.frame_id,
+            frame_id,
             FrameTimingMeta {
                 capture_ts_micros: frame.capture_micros,
                 send_ts_micros: send_micros,
             },
         );
-        // Collect owned copies first so we release the borrow on self.slicer.
-        let owned: Vec<Vec<u8>> = packets.into_iter().map(|p| p.to_vec()).collect();
-        let parity = self.slicer.parity_packet().map(|p| p.to_vec());
         self.frame_id = self.frame_id.wrapping_add(1);
 
-        let mut delayed_duplicate: Option<Vec<u8>> = None;
-        for (idx, pkt) in owned.iter().enumerate() {
-            if idx == 0 && owned.len() > 1 {
-                delayed_duplicate = Some(pkt.clone());
-            }
-            self.send_bytes(pkt)?;
+        let resend_first_packet = packets.len() > 1;
+        for pkt in packets.iter() {
+            Self::send_bytes_with(backend, encrypt_buf, pkt)?;
         }
-        if let Some(ref p) = parity {
-            self.send_bytes(p)?;
+        if let Some(parity) = parity {
+            Self::send_bytes_with(backend, encrypt_buf, parity)?;
         }
-        if let Some(ref pkt) = delayed_duplicate {
-            self.send_bytes(pkt)?;
+        if resend_first_packet {
+            Self::send_bytes_with(backend, encrypt_buf, &packets[0])?;
         }
         Ok(())
     }
 
     /// Send a single Opus audio packet.
     pub fn send_audio(&mut self, opus_data: &[u8]) -> Result<(), String> {
+        let backend = &self.backend;
+        let encrypt_buf = &mut self.encrypt_buf;
         let header = PacketHeader {
             seq: self.audio_seq,
             frame_id: 0,
@@ -155,10 +159,7 @@ impl UdpSender {
         header.serialize(&mut self.audio_buf[..HEADER_SIZE]);
         self.audio_buf[HEADER_SIZE..].copy_from_slice(opus_data);
 
-        // Clone needed: send_bytes borrows &mut self (for encrypt_buf) while
-        // audio_buf is also part of self.
-        let buf = self.audio_buf.clone();
-        self.send_bytes(&buf)
+        Self::send_bytes_with(backend, encrypt_buf, &self.audio_buf)
     }
 }
 

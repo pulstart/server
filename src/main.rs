@@ -2147,7 +2147,8 @@ fn handle_punched_client(
                             let next_kbps = bitrate_controller.apply_feedback(fb);
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                             if (fb.lost_packets > 0 || fb.dropped_frames > 0)
-                                && last_transport_recovery_keyframe.elapsed() >= Duration::from_secs(1)
+                                && last_transport_recovery_keyframe.elapsed()
+                                    >= Duration::from_millis(250)
                             {
                                 sub.video_bc.request_keyframe();
                                 last_transport_recovery_keyframe = Instant::now();
