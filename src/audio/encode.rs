@@ -37,6 +37,20 @@ fn expected_audio_packet_loss_pct() -> u32 {
         .min(100)
 }
 
+fn opus_application_value(expected_loss: u32) -> &'static str {
+    match std::env::var("ST_AUDIO_OPUS_APPLICATION")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "voip" => "voip",
+        "audio" => "audio",
+        "lowdelay" => "lowdelay",
+        _ if expected_loss > 0 => "audio",
+        _ => "lowdelay",
+    }
+}
+
 impl OpusEncoder {
     fn new(config: &AudioConfig) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
@@ -66,12 +80,14 @@ impl OpusEncoder {
             Self::set_channel_layout(ctx, config.channels);
 
             // Opus-specific options: low delay, CBR
+            let expected_loss = expected_audio_packet_loss_pct();
             let application = std::ffi::CString::new("application").unwrap();
-            let restricted = std::ffi::CString::new("lowdelay").unwrap();
+            let application_value =
+                std::ffi::CString::new(opus_application_value(expected_loss)).unwrap();
             ffi::av_opt_set(
                 (*ctx).priv_data,
                 application.as_ptr(),
-                restricted.as_ptr(),
+                application_value.as_ptr(),
                 0,
             );
 
@@ -79,7 +95,6 @@ impl OpusEncoder {
             let vbr_off = std::ffi::CString::new("off").unwrap();
             ffi::av_opt_set((*ctx).priv_data, vbr_key.as_ptr(), vbr_off.as_ptr(), 0);
 
-            let expected_loss = expected_audio_packet_loss_pct();
             if expected_loss > 0 {
                 let packet_loss_key = std::ffi::CString::new("packet_loss").unwrap();
                 let packet_loss_value =
@@ -126,11 +141,12 @@ impl OpusEncoder {
         }
 
         println!(
-            "[audio] Opus encoder initialized: {}ch, {}Hz, {}kbps, frame={}, fec={} packet_loss={}%",
+            "[audio] Opus encoder initialized: {}ch, {}Hz, {}kbps, frame={}, app={}, fec={} packet_loss={}%",
             config.channels,
             config.sample_rate,
             config.bitrate / 1000,
             samples_per_frame,
+            opus_application_value(expected_audio_packet_loss_pct()),
             if expected_audio_packet_loss_pct() > 0 {
                 "on"
             } else {

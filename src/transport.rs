@@ -1,4 +1,4 @@
-use st_protocol::packet::HEADER_SIZE;
+use st_protocol::packet::{AudioRedundancyMeta, AUDIO_REDUNDANCY_HEADER_SIZE, HEADER_SIZE};
 use st_protocol::reliable_udp::PunchedSocket;
 use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
 use st_protocol::{FrameSlicer, FrameTimingMeta, PacketHeader, PayloadType};
@@ -26,6 +26,12 @@ fn configured_udp_dscp() -> Option<u8> {
         .ok()
         .and_then(|raw| raw.parse::<u8>().ok())
         .filter(|value| *value <= 63)
+}
+
+fn audio_redundancy_enabled() -> bool {
+    std::env::var("ST_AUDIO_REDUNDANCY")
+        .map(|raw| raw != "0")
+        .unwrap_or(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -121,9 +127,12 @@ enum SendBackend {
 pub struct UdpSender {
     backend: SendBackend,
     slicer: FrameSlicer,
+    max_datagram_size: usize,
     frame_id: u32,
     audio_seq: u16,
+    audio_redundancy: bool,
     audio_buf: Vec<u8>,
+    previous_audio: Vec<u8>,
     encrypt_buf: Vec<u8>,
 }
 
@@ -148,9 +157,12 @@ impl UdpSender {
         Ok(Self {
             backend: SendBackend::Direct { socket, crypto },
             slicer: FrameSlicer::with_max_udp(max_udp),
+            max_datagram_size: max_udp,
             frame_id: 0,
             audio_seq: 0,
+            audio_redundancy: audio_redundancy_enabled(),
             audio_buf: Vec::with_capacity(1500),
+            previous_audio: Vec::with_capacity(1500),
             encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
         })
     }
@@ -170,9 +182,12 @@ impl UdpSender {
         Self {
             backend: SendBackend::Punched(punched),
             slicer: FrameSlicer::with_max_udp(max_udp),
+            max_datagram_size: max_udp,
             frame_id: 0,
             audio_seq: 0,
+            audio_redundancy: audio_redundancy_enabled(),
             audio_buf: Vec::with_capacity(1500),
+            previous_audio: Vec::with_capacity(1500),
             encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
         }
     }
@@ -249,12 +264,40 @@ impl UdpSender {
         };
         self.audio_seq = self.audio_seq.wrapping_add(1);
 
-        self.audio_buf.clear();
-        self.audio_buf.resize(HEADER_SIZE + opus_data.len(), 0);
-        header.serialize(&mut self.audio_buf[..HEADER_SIZE]);
-        self.audio_buf[HEADER_SIZE..].copy_from_slice(opus_data);
+        let redundant_len = if self.audio_redundancy
+            && !self.previous_audio.is_empty()
+            && HEADER_SIZE
+                + AUDIO_REDUNDANCY_HEADER_SIZE
+                + opus_data.len()
+                + self.previous_audio.len()
+                <= self.max_datagram_size
+        {
+            self.previous_audio.len().min(u16::MAX as usize) as u16
+        } else {
+            0
+        };
 
-        Self::send_bytes_with(backend, encrypt_buf, &self.audio_buf)
+        self.audio_buf.clear();
+        self.audio_buf.resize(
+            HEADER_SIZE + AUDIO_REDUNDANCY_HEADER_SIZE + opus_data.len() + redundant_len as usize,
+            0,
+        );
+        header.serialize(&mut self.audio_buf[..HEADER_SIZE]);
+        AudioRedundancyMeta { redundant_len }.serialize(
+            &mut self.audio_buf[HEADER_SIZE..HEADER_SIZE + AUDIO_REDUNDANCY_HEADER_SIZE],
+        );
+        let primary_start = HEADER_SIZE + AUDIO_REDUNDANCY_HEADER_SIZE;
+        let primary_end = primary_start + opus_data.len();
+        self.audio_buf[primary_start..primary_end].copy_from_slice(opus_data);
+        if redundant_len > 0 {
+            self.audio_buf[primary_end..primary_end + redundant_len as usize]
+                .copy_from_slice(&self.previous_audio[..redundant_len as usize]);
+        }
+
+        let send_result = Self::send_bytes_with(backend, encrypt_buf, &self.audio_buf);
+        self.previous_audio.clear();
+        self.previous_audio.extend_from_slice(opus_data);
+        send_result
     }
 }
 
