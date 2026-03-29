@@ -973,6 +973,7 @@ fn encode_and_broadcast(
 fn run_transport(
     addr: SocketAddr,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
+    video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     aud_rx: Option<Receiver<Arc<Vec<u8>>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
@@ -988,16 +989,33 @@ fn run_transport(
     let trace = trace_enabled();
     let mut sent_video_units = 0usize;
     let mut last_video_activity = std::time::Instant::now();
+    let mut sent_startup_frame = false;
+    let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
 
-    // Do not drain the per-subscriber queue here. It starts empty at subscribe
-    // time, and the earliest queued frame is typically the fresh IDR requested
-    // for that subscriber during handshake. Dropping it can leave the client
-    // starting from an undecodable P-frame.
+    // Preserve the very first queued frame so a new subscriber starts from the
+    // requested IDR. After startup, collapse backlog to the newest queued
+    // frame so slow clients stay live instead of replaying stale video.
 
     while running.load(Ordering::SeqCst) {
         // Video: blocking recv with short timeout
         match vid_rx.recv_timeout(std::time::Duration::from_millis(5)) {
             Ok(frame) => {
+                let (frame, skipped_frames) = if sent_startup_frame {
+                    take_latest_video_frame(frame, &vid_rx)
+                } else {
+                    (frame, 0)
+                };
+                if skipped_frames > 0
+                    && last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250)
+                {
+                    video_bc.request_keyframe();
+                    last_backlog_keyframe_request = Instant::now();
+                    if trace {
+                        eprintln!(
+                            "[trace][server] collapsed {skipped_frames} queued video frame(s) for {addr}; requesting keyframe"
+                        );
+                    }
+                }
                 if trace && sent_video_units < 12 {
                     eprintln!(
                         "[trace][server] transport send video unit #{sent_video_units} to {addr}: bytes={} capture_ts={}",
@@ -1007,8 +1025,9 @@ fn run_transport(
                 }
                 sent_video_units = sent_video_units.saturating_add(1);
                 last_video_activity = std::time::Instant::now();
-                if let Err(e) = sender.send_frame(&frame, unix_time_micros()) {
-                    eprintln!("[transport] video send error to {addr}: {e}");
+                match sender.send_frame(&frame, unix_time_micros()) {
+                    Ok(()) => sent_startup_frame = true,
+                    Err(e) => eprintln!("[transport] video send error to {addr}: {e}"),
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1038,6 +1057,19 @@ fn run_transport(
             }
         }
     }
+}
+
+fn take_latest_video_frame(
+    first_frame: Arc<EncodedVideoFrame>,
+    vid_rx: &Receiver<Arc<EncodedVideoFrame>>,
+) -> (Arc<EncodedVideoFrame>, usize) {
+    let mut latest = first_frame;
+    let mut skipped = 0usize;
+    while let Ok(newer) = vid_rx.try_recv() {
+        latest = newer;
+        skipped = skipped.saturating_add(1);
+    }
+    (latest, skipped)
 }
 
 #[derive(Debug, Default)]
@@ -1459,10 +1491,12 @@ async fn handle_client(
     let aud_rx: Option<Receiver<Arc<Vec<u8>>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
+    let video_bc = Arc::clone(&sub.video_bc);
     let transport_handle = std::thread::spawn(move || {
         run_transport(
             transport_addr,
             vid_rx,
+            video_bc,
             aud_rx,
             audio_enabled_transport,
             transport_running_clone,
@@ -2059,10 +2093,12 @@ fn handle_punched_client(
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
     let punched_transport = Arc::clone(&punched);
+    let video_bc = Arc::clone(&sub.video_bc);
     let transport_handle = std::thread::spawn(move || {
         run_punched_transport(
             punched_transport,
             vid_rx,
+            video_bc,
             aud_rx,
             audio_enabled_transport,
             transport_running_clone,
@@ -2154,16 +2190,31 @@ fn handle_punched_client(
 fn run_punched_transport(
     punched: Arc<st_protocol::reliable_udp::PunchedSocket>,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
+    video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     aud_rx: Option<Receiver<Arc<Vec<u8>>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 ) {
     let mut sender = UdpSender::from_punched(punched);
+    let mut sent_startup_frame = false;
+    let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
     while running.load(Ordering::SeqCst) {
         match vid_rx.recv_timeout(Duration::from_millis(5)) {
             Ok(frame) => {
-                if let Err(e) = sender.send_frame(&frame, unix_time_micros()) {
-                    eprintln!("[punched-transport] video send error: {e}");
+                let (frame, skipped_frames) = if sent_startup_frame {
+                    take_latest_video_frame(frame, &vid_rx)
+                } else {
+                    (frame, 0)
+                };
+                if skipped_frames > 0
+                    && last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250)
+                {
+                    video_bc.request_keyframe();
+                    last_backlog_keyframe_request = Instant::now();
+                }
+                match sender.send_frame(&frame, unix_time_micros()) {
+                    Ok(()) => sent_startup_frame = true,
+                    Err(e) => eprintln!("[punched-transport] video send error: {e}"),
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
