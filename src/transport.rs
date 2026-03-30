@@ -9,10 +9,12 @@ use std::{mem, os::fd::AsRawFd};
 
 const LOOPBACK_MAX_UDP: usize = 1400;
 const SAFE_NETWORK_MAX_UDP: usize = 1200;
+#[cfg(unix)]
 const DEFAULT_UDP_SEND_BUFFER: i32 = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const DEFAULT_UDP_SO_PRIORITY: i32 = 5;
 
+#[cfg(unix)]
 fn configured_udp_send_buffer() -> i32 {
     std::env::var("ST_UDP_SNDBUF")
         .ok()
@@ -21,6 +23,7 @@ fn configured_udp_send_buffer() -> i32 {
         .unwrap_or(DEFAULT_UDP_SEND_BUFFER)
 }
 
+#[cfg(unix)]
 fn configured_udp_dscp() -> Option<u8> {
     std::env::var("ST_UDP_DSCP")
         .ok()
@@ -43,11 +46,6 @@ fn configured_udp_priority() -> Option<i32> {
             .filter(|value| *value >= 0)
             .unwrap_or(DEFAULT_UDP_SO_PRIORITY),
     )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn configured_udp_priority() -> Option<i32> {
-    None
 }
 
 #[cfg(unix)]
@@ -73,39 +71,35 @@ fn set_udp_socket_int_opt(
     }
 }
 
-#[cfg(not(unix))]
-fn set_udp_socket_int_opt(
-    _socket: &UdpSocket,
-    _level: i32,
-    _optname: i32,
-    _value: i32,
-) -> std::io::Result<()> {
-    Ok(())
-}
-
 fn configure_direct_udp_socket(socket: &UdpSocket, client_addr: SocketAddr) {
-    let _ = set_udp_socket_int_opt(
-        socket,
-        libc::SOL_SOCKET,
-        libc::SO_SNDBUF,
-        configured_udp_send_buffer(),
-    );
+    #[cfg(unix)]
+    {
+        let _ = set_udp_socket_int_opt(
+            socket,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            configured_udp_send_buffer(),
+        );
 
-    if let Some(dscp) = configured_udp_dscp() {
-        let tos = i32::from(dscp) << 2;
-        let (level, optname) = match client_addr.ip() {
-            IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
-                (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
-            }
-            _ => (libc::IPPROTO_IP, libc::IP_TOS),
-        };
-        let _ = set_udp_socket_int_opt(socket, level, optname, tos);
+        if let Some(dscp) = configured_udp_dscp() {
+            let tos = i32::from(dscp) << 2;
+            let (level, optname) = match client_addr.ip() {
+                IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+                    (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+                }
+                _ => (libc::IPPROTO_IP, libc::IP_TOS),
+            };
+            let _ = set_udp_socket_int_opt(socket, level, optname, tos);
+        }
     }
 
     #[cfg(target_os = "linux")]
     if let Some(priority) = configured_udp_priority() {
         let _ = set_udp_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_PRIORITY, priority);
     }
+
+    #[cfg(not(unix))]
+    let _ = (socket, client_addr);
 }
 
 pub struct EncodedVideoFrame {

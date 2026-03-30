@@ -1011,19 +1011,21 @@ fn encode_and_broadcast(
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let frame_ref = if !input.control_active() {
         if let Some(cursor) = &frame.cursor {
-            if let capture::FrameData::Ram(ref data) = frame.data {
-                let mut composited = data.clone();
-                capture::composite_cursor(&mut composited, frame.width, frame.height, cursor);
-                frame_with_cursor = capture::CapturedFrame {
-                    data: capture::FrameData::Ram(composited),
-                    width: frame.width,
-                    height: frame.height,
-                    #[cfg(any(target_os = "linux", target_os = "windows"))]
-                    cursor: None,
-                };
-                &frame_with_cursor
-            } else {
-                frame
+            match &frame.data {
+                capture::FrameData::Ram(data) => {
+                    let mut composited = data.clone();
+                    capture::composite_cursor(&mut composited, frame.width, frame.height, cursor);
+                    frame_with_cursor = capture::CapturedFrame {
+                        data: capture::FrameData::Ram(composited),
+                        width: frame.width,
+                        height: frame.height,
+                        #[cfg(any(target_os = "linux", target_os = "windows"))]
+                        cursor: None,
+                    };
+                    &frame_with_cursor
+                }
+                #[cfg(target_os = "linux")]
+                capture::FrameData::DmaBuf { .. } => frame,
             }
         } else {
             frame

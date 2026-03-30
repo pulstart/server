@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -550,12 +549,18 @@ fn notify_client_connection(snapshot: &ConnectedClientSnapshot) {
             apple_script_string(&body),
             apple_script_string(title)
         );
-        let _ = Command::new("osascript").arg("-e").arg(script).status();
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
     }
 
     #[cfg(target_os = "linux")]
     {
-        let _ = Command::new("notify-send").arg(title).arg(&body).status();
+        let _ = std::process::Command::new("notify-send")
+            .arg(title)
+            .arg(&body)
+            .status();
     }
 
     #[cfg(target_os = "windows")]
