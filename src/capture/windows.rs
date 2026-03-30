@@ -6,7 +6,6 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
     SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC,
@@ -122,11 +121,11 @@ impl GdiCaptureSession {
     fn new() -> Result<Self, String> {
         unsafe {
             let screen_dc = GetDC(None);
-            if screen_dc.0 == 0 {
+            if screen_dc.is_invalid() {
                 return Err("GetDC(NULL) failed".into());
             }
             let memory_dc = CreateCompatibleDC(Some(screen_dc));
-            if memory_dc.0 == 0 {
+            if memory_dc.is_invalid() {
                 let _ = ReleaseDC(None, screen_dc);
                 return Err("CreateCompatibleDC failed".into());
             }
@@ -224,7 +223,7 @@ impl GdiCaptureSession {
                 return Err("virtual desktop size is invalid".into());
             }
 
-            if self.bitmap.0 != 0 {
+            if !self.bitmap.is_invalid() {
                 let _ = SelectObject(self.memory_dc, self.old_bitmap);
                 let _ = DeleteObject(self.bitmap.into());
                 self.bitmap = HBITMAP::default();
@@ -253,11 +252,11 @@ impl GdiCaptureSession {
                 0,
             )
             .map_err(|err| format!("CreateDIBSection failed: {err}"))?;
-            if bitmap.0 == 0 || bits.is_null() {
+            if bitmap.is_invalid() || bits.is_null() {
                 return Err("CreateDIBSection failed".into());
             }
             let old_bitmap = SelectObject(self.memory_dc, bitmap.into());
-            if old_bitmap.0 == 0 {
+            if old_bitmap.is_invalid() {
                 let _ = DeleteObject(bitmap.into());
                 return Err("SelectObject failed".into());
             }
@@ -277,14 +276,14 @@ impl GdiCaptureSession {
 impl Drop for GdiCaptureSession {
     fn drop(&mut self) {
         unsafe {
-            if self.bitmap.0 != 0 {
+            if !self.bitmap.is_invalid() {
                 let _ = SelectObject(self.memory_dc, self.old_bitmap);
                 let _ = DeleteObject(self.bitmap.into());
             }
-            if self.memory_dc.0 != 0 {
+            if !self.memory_dc.is_invalid() {
                 let _ = DeleteDC(self.memory_dc);
             }
-            if self.screen_dc.0 != 0 {
+            if !self.screen_dc.is_invalid() {
                 let _ = ReleaseDC(None, self.screen_dc);
             }
         }

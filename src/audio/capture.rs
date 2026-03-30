@@ -293,7 +293,6 @@ mod platform {
     };
     use std::thread;
     use std::time::Duration;
-    use windows::core::Interface;
     use windows::Win32::Media::Audio::{
         eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
         MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
@@ -306,9 +305,7 @@ mod platform {
         SPEAKER_FRONT_RIGHT, SPEAKER_LOW_FREQUENCY, SPEAKER_SIDE_LEFT, SPEAKER_SIDE_RIGHT,
         WAVE_FORMAT_EXTENSIBLE,
     };
-    use windows::Win32::Media::Multimedia::{
-        KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT,
-    };
+    use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
@@ -547,7 +544,7 @@ mod platform {
                 }
 
                 let sample_count = frames as usize * self.channels as usize;
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data_ptr.is_null() {
+                if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data_ptr.is_null() {
                     pending.extend(std::iter::repeat(0.0f32).take(sample_count));
                 } else {
                     let src = unsafe { std::slice::from_raw_parts(data_ptr as *const f32, sample_count) };

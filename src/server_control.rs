@@ -528,12 +528,15 @@ fn initial_update_state() -> UpdateStateSnapshot {
 }
 
 fn notify_client_connection(snapshot: &ConnectedClientSnapshot) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let age_hint = snapshot
         .connected_at
         .elapsed()
         .unwrap_or(Duration::ZERO)
         .as_secs();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let title = "st-server";
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let body = if age_hint == 0 {
         format!("Client connected: {}", snapshot.addr)
     } else {
@@ -554,6 +557,9 @@ fn notify_client_connection(snapshot: &ConnectedClientSnapshot) {
     {
         let _ = Command::new("notify-send").arg(title).arg(&body).status();
     }
+
+    #[cfg(target_os = "windows")]
+    let _ = snapshot;
 }
 
 #[cfg(target_os = "macos")]

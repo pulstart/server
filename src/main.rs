@@ -574,6 +574,8 @@ fn run_shared_pipeline(
 ) {
     let (frame_tx, frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
     let trace = trace_enabled();
+    #[cfg(target_os = "windows")]
+    let _ = client_hardware_codecs;
 
     let negotiated_fps = EncoderConfig::resolve_target_fps(client_requested_fps);
     capture::set_target_fps(negotiated_fps);
@@ -998,6 +1000,9 @@ fn encode_and_broadcast(
     frame: &capture::CapturedFrame,
     captured_micros: u64,
 ) {
+    #[cfg(target_os = "windows")]
+    let _ = input;
+
     #[cfg(target_os = "linux")]
     input.update_cursor(frame.cursor.as_ref());
 
