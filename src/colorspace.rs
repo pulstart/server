@@ -3,7 +3,7 @@
 /// Defines RGB-to-YUV conversion parameters for SDR and HDR.
 /// Used by encoder backends to set AVFrame colorspace metadata.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 extern crate ffmpeg_sys_next as ffi;
 
 use crate::encode_config::DynamicRange;
@@ -46,7 +46,7 @@ impl Colorspace {
     }
 
     /// Apply colorspace metadata to an FFmpeg AVFrame.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub unsafe fn apply_to_frame(&self, frame: *mut ffi::AVFrame) {
         match self.standard {
             ColorStandard::Bt709 => {
@@ -66,7 +66,7 @@ impl Colorspace {
     }
 
     /// Apply colorspace metadata to an FFmpeg AVCodecContext.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub unsafe fn apply_to_codec_ctx(&self, ctx: *mut ffi::AVCodecContext) {
         match self.standard {
             ColorStandard::Bt709 => {
@@ -86,7 +86,7 @@ impl Colorspace {
     }
 
     /// Software pixel format for this colorspace.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn sw_pixel_format(&self) -> ffi::AVPixelFormat {
         if self.bit_depth > 8 {
             ffi::AVPixelFormat::AV_PIX_FMT_P010LE

@@ -14,38 +14,38 @@ use ksni::menu::{
     CheckmarkItem as LinuxCheckmarkItem, MenuItem as LinuxMenuItem,
     StandardItem as LinuxStandardItem, SubMenu as LinuxSubMenu,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::time::Instant;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::menu::{
     CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder,
 };
-#[cfg(target_os = "macos")]
-use tray_icon::{Icon as MacTrayIcon, TrayIcon, TrayIconBuilder};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use tray_icon::{Icon as DesktopTrayIcon, TrayIcon, TrayIconBuilder};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use winit::application::ApplicationHandler;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const ALLOW_CONNECTIONS_ID: &str = "allow-connections";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const CHECK_UPDATES_ID: &str = "check-updates";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const INSTALL_UPDATE_ID: &str = "install-update";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const QUIT_ID: &str = "quit";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const COPY_TOKEN_ID: &str = "copy-token";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const SET_TOKEN_ID: &str = "set-token";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const DROP_CLIENT_ID_PREFIX: &str = "drop-client:";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const VIDEO_CODEC_PREFIX: &str = "video-codec:";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const VIDEO_BITRATE_PREFIX: &str = "video-bitrate:";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const VIDEO_QUALITY_PREFIX: &str = "video-quality:";
 
 pub fn should_run_tray() -> bool {
@@ -62,6 +62,11 @@ pub fn should_run_tray() -> bool {
     {
         true
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
 }
 
 pub fn run_tray(control: Arc<ServerControl>, tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
@@ -72,7 +77,12 @@ pub fn run_tray(control: Arc<ServerControl>, tunnel_state: Option<Arc<ApiTunnelS
 
     #[cfg(target_os = "macos")]
     {
-        run_macos_tray(control, tunnel_state)
+        run_desktop_tray(control, tunnel_state)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        run_desktop_tray(control, tunnel_state)
     }
 }
 
@@ -367,8 +377,8 @@ fn linux_quality_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<L
         .collect()
 }
 
-#[cfg(target_os = "macos")]
-fn run_macos_tray(control: Arc<ServerControl>, _tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn run_desktop_tray(control: Arc<ServerControl>, _tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|err| format!("Failed to create tray event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(200)));
     let mut app = TrayApp::new(control);
@@ -377,7 +387,7 @@ fn run_macos_tray(control: Arc<ServerControl>, _tunnel_state: Option<Arc<ApiTunn
         .map_err(|err| format!("Tray event loop failed: {err}"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 struct TrayApp {
     control: Arc<ServerControl>,
     tray: Option<TrayIcon>,
@@ -401,7 +411,7 @@ struct TrayApp {
     last_connected: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl TrayApp {
     fn new(control: Arc<ServerControl>) -> Self {
         Self {
@@ -604,8 +614,9 @@ impl TrayApp {
             .with_title("st-server")
             .with_menu_on_left_click(false)
             .with_menu(Box::new(root_menu))
-            .with_icon(macos_icon(false)?);
+            .with_icon(desktop_tray_icon(false)?);
 
+        #[cfg(target_os = "macos")]
         let builder = builder.with_icon_as_template(false);
 
         let tray = builder
@@ -670,7 +681,7 @@ impl TrayApp {
             let _ = tray.set_tooltip(Some(tray_tooltip_text(&self.control)));
             if connected != self.last_connected {
                 self.last_connected = connected;
-                if let Ok(icon) = macos_icon(connected) {
+                if let Ok(icon) = desktop_tray_icon(connected) {
                     let _ = tray.set_icon(Some(icon));
                 }
             }
@@ -760,7 +771,7 @@ impl TrayApp {
             } else if id == SET_TOKEN_ID {
                 let control = Arc::clone(&self.control);
                 std::thread::spawn(move || {
-                    if let Some(new_token) = show_macos_token_input_dialog(&control.token()) {
+                    if let Some(new_token) = show_desktop_token_input_dialog(&control.token()) {
                         if !new_token.is_empty() {
                             control.set_token(new_token);
                         }
@@ -799,7 +810,7 @@ impl TrayApp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl ApplicationHandler for TrayApp {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
         if let Err(err) = self.init_tray() {
@@ -1010,6 +1021,19 @@ fn show_token_input_dialog(current: &str) -> Option<String> {
     None
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn show_desktop_token_input_dialog(current: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return show_macos_token_input_dialog(current);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return show_windows_token_input_dialog(current);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn show_macos_token_input_dialog(current: &str) -> Option<String> {
     let escaped = current.replace('\\', "\\\\").replace('"', "\\\"");
@@ -1023,6 +1047,26 @@ fn show_macos_token_input_dialog(current: &str) -> Option<String> {
     let output = std::process::Command::new("osascript")
         .arg("-e")
         .arg(&script)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_token_input_dialog(current: &str) -> Option<String> {
+    let escaped = current.replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName Microsoft.VisualBasic; \
+         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+         $v = [Microsoft.VisualBasic.Interaction]::InputBox('Enter new authentication token:', 'Set Server Token', '{escaped}'); \
+         if ($v -ne $null) {{ [Console]::Write($v) }}"
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", &script])
         .output()
         .ok()?;
     if output.status.success() {
@@ -1125,9 +1169,9 @@ fn linux_icon(connected: bool) -> ksni::Icon {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn macos_icon(connected: bool) -> Result<MacTrayIcon, String> {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn desktop_tray_icon(connected: bool) -> Result<DesktopTrayIcon, String> {
     let (rgba, width, height) = server_icon_rgba(connected);
-    MacTrayIcon::from_rgba(rgba, width, height)
+    DesktopTrayIcon::from_rgba(rgba, width, height)
         .map_err(|err| format!("Failed to build tray icon: {err}"))
 }

@@ -1,6 +1,6 @@
 mod adaptive_bitrate;
 mod api_client;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod audio;
 mod broadcast;
 mod capture;
@@ -8,7 +8,7 @@ mod colorspace;
 #[cfg(target_os = "linux")]
 mod encode;
 mod encode_config;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod encode_sw;
 #[cfg(target_os = "linux")]
 mod encode_vaapi;
@@ -17,7 +17,7 @@ mod encode_vt;
 mod input;
 mod server_control;
 mod transport;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod tray;
 mod updater;
 
@@ -79,17 +79,21 @@ enum PipelineResult {
 }
 
 /// Encoder wrapper for Linux (VAAPI → NVENC → Software fallback chain).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 enum EncoderKind {
+    #[cfg(target_os = "linux")]
     Vaapi(encode_vaapi::VaapiEncoder),
+    #[cfg(target_os = "linux")]
     Nvenc(encode::NvencEncoder),
     Software(encode_sw::SoftwareEncoder),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Clone, Copy, Debug)]
 enum EncoderBackend {
+    #[cfg(target_os = "linux")]
     Vaapi,
+    #[cfg(target_os = "linux")]
     Nvenc,
     Software,
 }
@@ -125,15 +129,17 @@ fn create_linux_encoder(config: &EncoderConfig) -> Result<EncoderKind, String> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn create_linux_encoder_for_backend(
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn create_encoder_for_backend(
     config: &EncoderConfig,
     backend: EncoderBackend,
 ) -> Result<EncoderKind, String> {
     match backend {
+        #[cfg(target_os = "linux")]
         EncoderBackend::Vaapi => encode_vaapi::VaapiEncoder::with_config(config)
             .map(EncoderKind::Vaapi)
             .map_err(|err| format!("VAAPI reconfigure failed: {err}")),
+        #[cfg(target_os = "linux")]
         EncoderBackend::Nvenc => encode::NvencEncoder::with_config(config)
             .map(EncoderKind::Nvenc)
             .map_err(|err| format!("NVENC reconfigure failed: {err}")),
@@ -189,28 +195,34 @@ fn client_hardware_video_codecs(display: Option<ClientDisplayInfo>) -> VideoCode
         .unwrap_or_else(VideoCodecSupport::empty)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn encoder_name(encoder: &EncoderKind) -> &'static str {
     match encoder {
+        #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(_) => "vaapi",
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(_) => "nvenc",
         EncoderKind::Software(_) => "software",
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn encoder_backend(encoder: &EncoderKind) -> EncoderBackend {
     match encoder {
+        #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(_) => EncoderBackend::Vaapi,
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(_) => EncoderBackend::Nvenc,
         EncoderKind::Software(_) => EncoderBackend::Software,
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn encoder_backend_name(backend: EncoderBackend) -> &'static str {
     match backend {
+        #[cfg(target_os = "linux")]
         EncoderBackend::Vaapi => "vaapi",
+        #[cfg(target_os = "linux")]
         EncoderBackend::Nvenc => "nvenc",
         EncoderBackend::Software => "software",
     }
@@ -318,25 +330,82 @@ fn select_linux_encoder(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "windows")]
+fn select_windows_encoder(
+    width: u32,
+    height: u32,
+    framerate: u32,
+    client_supported_codecs: VideoCodecSupport,
+    control: &ServerControl,
+) -> Result<(EncoderConfig, EncoderKind), String> {
+    let forced_codec = control.forced_codec();
+    let forced_quality = control.forced_quality();
+    let codec_order = if let Some(codec) = forced_codec {
+        encode_config::Codec::preferred_order(Some(codec))
+    } else {
+        EncoderConfig::preferred_codec_order_from_env()
+    };
+
+    let mut failures = Vec::new();
+    for codec in codec_order {
+        if !client_supported_codecs.supports(codec.to_stream_codec()) {
+            failures.push(format!(
+                "{} skipped: client does not support it",
+                codec_name(codec.to_stream_codec())
+            ));
+            continue;
+        }
+
+        let mut config =
+            EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
+        if let Some(quality) = forced_quality {
+            config.quality = quality;
+        }
+
+        match encode_sw::SoftwareEncoder::with_config(&config) {
+            Ok(encoder) => {
+                println!(
+                    "[encoder] Selected {} with software backend",
+                    codec_name(config.stream_codec())
+                );
+                return Ok((config, EncoderKind::Software(encoder)));
+            }
+            Err(err) => failures.push(format!(
+                "{} software encode unavailable: {err}",
+                codec_name(codec.to_stream_codec())
+            )),
+        }
+    }
+
+    Err(format!(
+        "No mutually supported video codec could start.\n  {}",
+        failures.join("\n  ")
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn request_next_keyframe(encoder: &mut EncoderKind) {
     match encoder {
+        #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(e) => e.reset_for_keyframe(),
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(e) => e.reset_for_keyframe(),
         EncoderKind::Software(e) => e.reset_for_keyframe(),
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn update_encoder_bitrate(encoder: &mut EncoderKind, config: &EncoderConfig) -> Result<(), String> {
     match encoder {
+        #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(e) => e.update_bitrate(config),
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(e) => e.update_bitrate(config),
         EncoderKind::Software(e) => e.update_bitrate(config),
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn should_schedule_bitrate_reconfigure(
     current_kbps: u32,
     target_kbps: u32,
@@ -372,7 +441,7 @@ fn encoder_name(_encoder: &encode_vt::VTEncoder) -> &'static str {
 
 struct SharedPipeline {
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     audio_bc: Arc<Broadcaster<Vec<u8>>>,
     stream_config: StreamConfig,
     session_debug: SessionDebugInfo,
@@ -390,17 +459,17 @@ impl SharedPipeline {
         control: Arc<ServerControl>,
     ) -> Result<(Self, ClientSubscription), String> {
         let video_bc = Arc::new(Broadcaster::new());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let audio_bc = Arc::new(Broadcaster::new());
         let (vid_sub_id, vid_rx) = video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let (aud_sub_id, aud_rx) = audio_bc.subscribe(30)?;
 
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (status_tx, status_rx) = bounded::<PipelineResult>(1);
 
         let vbc = Arc::clone(&video_bc);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let abc = Arc::clone(&audio_bc);
 
         let handle = std::thread::spawn(move || {
@@ -413,7 +482,7 @@ impl SharedPipeline {
                 input,
                 control,
                 vbc,
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 abc,
             );
         });
@@ -422,7 +491,7 @@ impl SharedPipeline {
             Ok(PipelineResult::Started(stream_config, rate_control, session_debug)) => Ok((
                 Self {
                     video_bc: Arc::clone(&video_bc),
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     audio_bc: Arc::clone(&audio_bc),
                     stream_config,
                     session_debug,
@@ -434,9 +503,9 @@ impl SharedPipeline {
                     vid_sub_id,
                     vid_rx,
                     video_bc: Arc::clone(&video_bc),
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     aud_sub_id,
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     aud_rx,
                 },
             )),
@@ -462,9 +531,9 @@ struct ClientSubscription {
     vid_sub_id: u64,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     aud_sub_id: u64,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     aud_rx: Receiver<Arc<Vec<u8>>>,
 }
 
@@ -481,7 +550,7 @@ struct ServerState {
     tunnel_state: Option<Arc<api_client::ApiTunnelState>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct PendingEncoderRebuild {
     config: EncoderConfig,
     backend: EncoderBackend,
@@ -501,7 +570,7 @@ fn run_shared_pipeline(
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    #[cfg(target_os = "linux")] audio_bc: Arc<Broadcaster<Vec<u8>>>,
+    #[cfg(any(target_os = "linux", target_os = "windows"))] audio_bc: Arc<Broadcaster<Vec<u8>>>,
 ) {
     let (frame_tx, frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
     let trace = trace_enabled();
@@ -549,7 +618,7 @@ fn run_shared_pipeline(
     }
     let mut trace_capture_frames = 1usize;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let audio_config = encode_config::AudioConfig::from_env();
 
     #[cfg(target_os = "linux")]
@@ -559,6 +628,23 @@ fn run_shared_pipeline(
         negotiated_fps,
         client_supported_codecs,
         client_hardware_codecs,
+        &control,
+    ) {
+        Ok(selected) => selected,
+        Err(msg) => {
+            eprintln!("{msg}");
+            capture_backend.stop();
+            let _ = status_tx.send(PipelineResult::Error(msg));
+            return;
+        }
+    };
+
+    #[cfg(target_os = "windows")]
+    let (config, mut encoder) = match select_windows_encoder(
+        first_frame.width,
+        first_frame.height,
+        negotiated_fps,
+        client_supported_codecs,
         &control,
     ) {
         Ok(selected) => selected,
@@ -613,7 +699,7 @@ fn run_shared_pipeline(
     };
 
     // Start audio pipeline (Linux only) — broadcasts to audio_bc
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut audio_pipeline = {
         let mut ap = audio::AudioPipeline::new();
         match ap.start(audio_config.clone(), audio_bc) {
@@ -623,7 +709,7 @@ fn run_shared_pipeline(
         ap
     };
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let stream_config = config.to_stream_config(&audio_config);
     #[cfg(target_os = "macos")]
     let stream_config = StreamConfig {
@@ -663,11 +749,11 @@ fn run_shared_pipeline(
     ));
 
     // Encode and broadcast the first frame
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut current_config = config.clone();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut pending_encoder_rebuild: Option<PendingEncoderRebuild> = None;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut last_encoder_reconfigure = Instant::now();
     encode_and_broadcast(
         &mut encoder,
@@ -721,7 +807,7 @@ fn run_shared_pipeline(
         // Only encode when there are subscribers (save GPU/CPU when idle)
         if video_bc.subscriber_count() > 0 {
             // Force IDR when a new subscriber just joined (so it can start decoding)
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             if video_bc.take_keyframe_request() {
                 if trace {
                     eprintln!("[trace][server] taking pending keyframe request");
@@ -731,7 +817,7 @@ fn run_shared_pipeline(
             #[cfg(target_os = "macos")]
             let _ = video_bc.take_keyframe_request(); // VT encoder always starts with IDR
 
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 let rebuild_result = if let Some(pending) = pending_encoder_rebuild.as_ref() {
                     match pending.rx.try_recv() {
@@ -815,8 +901,7 @@ fn run_shared_pipeline(
                             let (rebuild_tx, rebuild_rx) = bounded(1);
                             let rebuild_config = next_config.clone();
                             std::thread::spawn(move || {
-                                let result =
-                                    create_linux_encoder_for_backend(&rebuild_config, backend);
+                                let result = create_encoder_for_backend(&rebuild_config, backend);
                                 let _ = rebuild_tx.send(result);
                             });
                             if trace {
@@ -855,11 +940,13 @@ fn run_shared_pipeline(
     // Cleanup
     #[cfg(target_os = "macos")]
     encoder.flush();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     match &mut encoder {
+        #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(e) => {
             e.flush();
         }
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(e) => {
             e.flush();
         }
@@ -867,7 +954,7 @@ fn run_shared_pipeline(
             e.flush();
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     audio_pipeline.stop();
     capture_backend.stop();
     input.clear_for_stop();
@@ -903,7 +990,7 @@ fn encode_and_broadcast(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn encode_and_broadcast(
     encoder: &mut EncoderKind,
     broadcaster: &Broadcaster<EncodedVideoFrame>,
@@ -911,12 +998,15 @@ fn encode_and_broadcast(
     frame: &capture::CapturedFrame,
     captured_micros: u64,
 ) {
+    #[cfg(target_os = "linux")]
     input.update_cursor(frame.cursor.as_ref());
 
     // Composite cursor onto RAM frames before encoding when no controller owns input.
     // During active control, the cursor is sent separately to the client and kept
     // out of the encoded frame.
+    #[cfg(target_os = "linux")]
     let frame_with_cursor;
+    #[cfg(target_os = "linux")]
     let frame_ref = if !input.control_active() {
         if let Some(cursor) = &frame.cursor {
             if let capture::FrameData::Ram(ref data) = frame.data {
@@ -943,9 +1033,13 @@ fn encode_and_broadcast(
     } else {
         frame
     };
+    #[cfg(target_os = "windows")]
+    let frame_ref = frame;
 
     let result = match encoder {
+        #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(e) => e.encode(frame_ref),
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(e) => e.encode(frame_ref),
         EncoderKind::Software(e) => e.encode(frame_ref),
     };
@@ -1140,13 +1234,13 @@ fn client_display_fps_hint(display: Option<ClientDisplayInfo>) -> Option<u32> {
 fn unsubscribe_and_maybe_stop_pipeline(
     state: &Arc<ServerState>,
     vid_sub_id: u64,
-    #[cfg(target_os = "linux")] aud_sub_id: u64,
+    #[cfg(any(target_os = "linux", target_os = "windows"))] aud_sub_id: u64,
 ) {
     let pipeline_to_stop = {
         let mut pipeline = state.pipeline.lock().unwrap();
         let should_stop = if let Some(p) = pipeline.as_ref() {
             p.video_bc.unsubscribe(vid_sub_id);
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             p.audio_bc.unsubscribe(aud_sub_id);
             p.video_bc.subscriber_count() == 0
         } else {
@@ -1420,16 +1514,16 @@ async fn handle_client(
                 ));
             }
             let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             let (aud_id, aud_rx) = p.audio_bc.subscribe(30)?;
             Ok((
                 ClientSubscription {
                     vid_sub_id: vid_id,
                     vid_rx,
                     video_bc: Arc::clone(&p.video_bc),
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     aud_sub_id: aud_id,
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     aud_rx,
                 },
                 p.stream_config,
@@ -1455,7 +1549,12 @@ async fn handle_client(
     if registered_client.disconnect_requested() {
         rate_control.unregister_client(sub.vid_sub_id);
         let _ = state.input.release_control(client_id);
-        unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+        unsubscribe_and_maybe_stop_pipeline(
+            &state,
+            sub.vid_sub_id,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            sub.aud_sub_id,
+        );
         return;
     }
     rate_control.register_client(sub.vid_sub_id);
@@ -1501,21 +1600,36 @@ async fn handle_client(
             eprintln!("[client {addr}] timed out waiting for media-ready ack");
             rate_control.unregister_client(sub.vid_sub_id);
             let _ = state.input.release_control(client_id);
-            unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+            unsubscribe_and_maybe_stop_pipeline(
+                &state,
+                sub.vid_sub_id,
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                sub.aud_sub_id,
+            );
             return;
         }
         Err(err) => {
             eprintln!("[client {addr}] failed waiting for media-ready ack: {err}");
             rate_control.unregister_client(sub.vid_sub_id);
             let _ = state.input.release_control(client_id);
-            unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+            unsubscribe_and_maybe_stop_pipeline(
+                &state,
+                sub.vid_sub_id,
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                sub.aud_sub_id,
+            );
             return;
         }
     }
     if registered_client.disconnect_requested() {
         rate_control.unregister_client(sub.vid_sub_id);
         let _ = state.input.release_control(client_id);
-        unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+        unsubscribe_and_maybe_stop_pipeline(
+            &state,
+            sub.vid_sub_id,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            sub.aud_sub_id,
+        );
         return;
     }
 
@@ -1528,9 +1642,9 @@ async fn handle_client(
     let transport_addr = SocketAddr::new(addr.ip(), client_media_port(startup_prefs.display));
     sub.video_bc.request_keyframe();
     let vid_rx = sub.vid_rx;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let aud_rx = Some(sub.aud_rx);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let aud_rx: Option<Receiver<Arc<Vec<u8>>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
@@ -1662,7 +1776,12 @@ async fn handle_client(
     rate_control.unregister_client(sub.vid_sub_id);
     let _ = state.input.release_control(client_id);
 
-    unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+    unsubscribe_and_maybe_stop_pipeline(
+        &state,
+        sub.vid_sub_id,
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        sub.aud_sub_id,
+    );
 
     let _ = transport_handle.join();
 
@@ -1836,6 +1955,7 @@ fn get_screen_resolution() -> Option<(u32, u32)> {
 
 async fn run_discovery_beacon(control: Arc<ServerControl>, listen_port: u16) {
     let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
         .or_else(|_| std::env::var("HOST"))
         .unwrap_or_else(|_| {
             std::fs::read_to_string("/etc/hostname")
@@ -2071,16 +2191,16 @@ fn handle_punched_client(
                 ))
             } else {
                 let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 let (aud_id, aud_rx) = p.audio_bc.subscribe(30)?;
                 Ok((
                     ClientSubscription {
                         vid_sub_id: vid_id,
                         vid_rx,
                         video_bc: Arc::clone(&p.video_bc),
-                        #[cfg(target_os = "linux")]
+                        #[cfg(any(target_os = "linux", target_os = "windows"))]
                         aud_sub_id: aud_id,
-                        #[cfg(target_os = "linux")]
+                        #[cfg(any(target_os = "linux", target_os = "windows"))]
                         aud_rx,
                     },
                     p.stream_config,
@@ -2132,7 +2252,12 @@ fn handle_punched_client(
         eprintln!("[punched] Timeout waiting for ClientReadyForMedia from {peer}");
         rate_control.unregister_client(sub.vid_sub_id);
         let _ = state.input.release_control(client_id);
-        unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+        unsubscribe_and_maybe_stop_pipeline(
+            &state,
+            sub.vid_sub_id,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            sub.aud_sub_id,
+        );
         return;
     }
 
@@ -2141,9 +2266,9 @@ fn handle_punched_client(
     let transport_running = Arc::new(AtomicBool::new(true));
     sub.video_bc.request_keyframe();
     let vid_rx = sub.vid_rx;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let aud_rx = Some(sub.aud_rx);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let aud_rx: Option<Receiver<Arc<Vec<u8>>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
@@ -2238,7 +2363,12 @@ fn handle_punched_client(
     let _ = transport_handle.join();
     rate_control.unregister_client(sub.vid_sub_id);
     let _ = state.input.release_control(client_id);
-    unsubscribe_and_maybe_stop_pipeline(&state, sub.vid_sub_id, #[cfg(target_os = "linux")] sub.aud_sub_id);
+    unsubscribe_and_maybe_stop_pipeline(
+        &state,
+        sub.vid_sub_id,
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        sub.aud_sub_id,
+    );
     println!("[punched] Client {peer} disconnected");
 }
 
@@ -2460,7 +2590,7 @@ fn main() {
     let tunnel_state = Some(Arc::new(api_client::ApiTunnelState::new()));
     let state = build_server_state(Arc::clone(&control), listen_port, tunnel_state.clone());
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     if tray::should_run_tray() {
         control.start_automatic_update_checks();
         let server_state = Arc::clone(&state);

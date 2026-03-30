@@ -13,6 +13,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  FFMPEG_VERSION: "8.0"
+  FFMPEG_BUILD_TAG: "latest"
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -23,13 +27,20 @@ jobs:
         include:
           - name: Linux x64
             os: ubuntu-24.04
+            build_kind: unix
             package_id: linux-x64
           - name: macOS x64
             os: macos-15-intel
+            build_kind: unix
             package_id: macos-x64
           - name: macOS arm64
             os: macos-15
+            build_kind: unix
             package_id: macos-arm64
+          - name: Windows x64
+            os: windows-2022
+            build_kind: windows
+            package_id: windows-x64
 
     steps:
       - name: Checkout server with submodules
@@ -70,11 +81,48 @@ jobs:
             libxtst-dev \
             pkg-config
 
-      - name: Build release
+      - name: Cache pre-built FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-prebuilt
+          key: ${{ runner.os }}-ffmpeg-${{ env.FFMPEG_VERSION }}-${{ env.FFMPEG_BUILD_TAG }}
+
+      - name: Install Windows FFmpeg SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ffmpegZip = "ffmpeg-n${{ env.FFMPEG_VERSION }}-${{ env.FFMPEG_BUILD_TAG }}-win64-lgpl-shared-${{ env.FFMPEG_VERSION }}.zip"
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/${{ env.FFMPEG_BUILD_TAG }}/$ffmpegZip"
+          $downloadDir = "${{ github.workspace }}\ffmpeg-prebuilt"
+          New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+          $zipPath = "$downloadDir\$ffmpegZip"
+          if (-not (Test-Path $zipPath)) {
+            Write-Host "Downloading $ffmpegUrl ..."
+            Invoke-WebRequest -Uri $ffmpegUrl -OutFile $zipPath -UseBasicParsing
+          }
+          Expand-Archive -Path $zipPath -DestinationPath $downloadDir -Force
+          $extractedDir = Get-ChildItem -Path $downloadDir -Directory | Where-Object { $_.Name -like "ffmpeg-*" } | Select-Object -First 1
+          echo "FFMPEG_DIR=$($extractedDir.FullName)" >> $env:GITHUB_ENV
+          Write-Host "FFmpeg extracted to $($extractedDir.FullName)"
+
+      - name: Build Unix release
+        if: matrix.build_kind == 'unix'
         run: cargo build --release --locked
 
       - name: Package Unix artifact
+        if: matrix.build_kind == 'unix'
         run: bash ./scripts/package-unix.sh --platform ${{ matrix.package_id }}
+
+      - name: Build Windows release
+        if: matrix.build_kind == 'windows'
+        shell: pwsh
+        run: .\scripts\build-windows-msvc.ps1 -Configuration release -Platform ${{ matrix.package_id }} -FfmpegDir "${{ env.FFMPEG_DIR }}"
+
+      - name: Package Windows artifact
+        if: matrix.build_kind == 'windows'
+        shell: pwsh
+        run: .\scripts\package-windows-release.ps1 -Configuration release -Platform ${{ matrix.package_id }}
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4

@@ -14,6 +14,22 @@ use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::POINT;
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+    VIRTUAL_KEY, WHEEL_DELTA, XBUTTON1, XBUTTON2,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
+};
 
 const MAX_CURSOR_SHAPE_RGBA_BYTES: usize = u16::MAX as usize - 16;
 static TRACE_CURSOR_UPDATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -136,6 +152,8 @@ enum InputBackend {
     Uinput(UinputMouseController),
     #[cfg(target_os = "linux")]
     PortalRemoteDesktop(Arc<RemoteDesktopPortalSession>),
+    #[cfg(target_os = "windows")]
+    Windows(WindowsInputController),
     #[cfg(target_os = "macos")]
     Macos(MacosMouseController),
 }
@@ -227,6 +245,8 @@ impl InputRuntime {
             InputBackend::Uinput(_) => ControllerState::Available,
             #[cfg(target_os = "linux")]
             InputBackend::PortalRemoteDesktop(_) => ControllerState::Available,
+            #[cfg(target_os = "windows")]
+            InputBackend::Windows(_) => ControllerState::Available,
             #[cfg(target_os = "macos")]
             InputBackend::Macos(_) => ControllerState::Available,
         }
@@ -293,7 +313,32 @@ impl InputRuntime {
             return;
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(target_os = "windows")]
+        {
+            match WindowsInputController::new() {
+                Ok(controller) => {
+                    println!("[input] Windows input enabled for {capture_backend}");
+                    inner.backend = InputBackend::Windows(controller);
+                    inner.backend_label = "windows/sendinput".to_string();
+                    inner.capabilities = InputCapabilities {
+                        mouse_absolute: true,
+                        mouse_relative: true,
+                        keyboard: true,
+                        separate_cursor: false,
+                        hover_capture: false,
+                    };
+                }
+                Err(err) => {
+                    eprintln!("[input] Windows input unavailable: {err}");
+                    inner.backend = InputBackend::Unavailable;
+                    inner.backend_label = format!("unavailable ({err})");
+                    inner.capabilities = InputCapabilities::default();
+                }
+            }
+            return;
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             let _ = capture_backend;
             inner.backend = InputBackend::Unavailable;
@@ -605,6 +650,8 @@ impl InputRuntimeInner {
                             }
                         }
                     }
+                    #[cfg(target_os = "windows")]
+                    InputBackend::Windows(controller) => controller.button(button, pressed),
                     #[cfg(target_os = "macos")]
                     InputBackend::Macos(controller) => controller.button(button, pressed),
                 }
@@ -626,6 +673,8 @@ impl InputRuntimeInner {
                     log_portal_error("notify_pointer_motion_absolute", e);
                 }
             }
+            #[cfg(target_os = "windows")]
+            InputBackend::Windows(controller) => controller.move_absolute(x, y),
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.move_absolute(x, y),
         }
@@ -644,6 +693,8 @@ impl InputRuntimeInner {
                     log_portal_error("notify_pointer_motion_relative", e);
                 }
             }
+            #[cfg(target_os = "windows")]
+            InputBackend::Windows(controller) => controller.move_relative(dx, dy),
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.move_relative(dx, dy),
         }
@@ -662,6 +713,8 @@ impl InputRuntimeInner {
                     log_portal_error("notify_pointer_axis_discrete", e);
                 }
             }
+            #[cfg(target_os = "windows")]
+            InputBackend::Windows(controller) => controller.scroll(delta_x, delta_y),
             #[cfg(target_os = "macos")]
             InputBackend::Macos(controller) => controller.scroll(delta_x, delta_y),
         }
@@ -693,6 +746,8 @@ impl InputRuntimeInner {
                         }
                     }
                 }
+                #[cfg(target_os = "windows")]
+                InputBackend::Windows(controller) => controller.key(key, now_pressed),
                 #[cfg(target_os = "macos")]
                 InputBackend::Macos(controller) => controller.key(key, now_pressed),
             }
@@ -714,6 +769,279 @@ fn button_mappings() -> [(u8, u32); 5] {
         (MOUSE_BUTTON_EXTRA1, 8),
         (MOUSE_BUTTON_EXTRA2, 9),
     ]
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsInputController {
+    origin_x: i32,
+    origin_y: i32,
+    width: i32,
+    height: i32,
+    tracked_x: i32,
+    tracked_y: i32,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsInputController {
+    fn new() -> Result<Self, String> {
+        let (origin_x, origin_y, width, height) = windows_virtual_screen_metrics();
+        if width <= 0 || height <= 0 {
+            return Err("virtual desktop size unavailable".into());
+        }
+
+        let mut point = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut point);
+        }
+
+        Ok(Self {
+            origin_x,
+            origin_y,
+            width,
+            height,
+            tracked_x: point.x,
+            tracked_y: point.y,
+        })
+    }
+
+    fn move_absolute(&mut self, x: u16, y: u16) {
+        self.refresh_virtual_screen();
+        let width = self.width.max(1) as i64;
+        let height = self.height.max(1) as i64;
+        self.tracked_x =
+            self.origin_x + ((x as i64 * (width - 1).max(0) + 32767) / 65535) as i32;
+        self.tracked_y =
+            self.origin_y + ((y as i64 * (height - 1).max(0) + 32767) / 65535) as i32;
+
+        self.send_mouse(MOUSEINPUT {
+            dx: normalize_windows_absolute(self.tracked_x - self.origin_x, self.width),
+            dy: normalize_windows_absolute(self.tracked_y - self.origin_y, self.height),
+            mouseData: 0,
+            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            time: 0,
+            dwExtraInfo: 0,
+        });
+    }
+
+    fn move_relative(&mut self, dx: i16, dy: i16) {
+        self.refresh_virtual_screen();
+        self.tracked_x =
+            (self.tracked_x + dx as i32).clamp(self.origin_x, self.origin_x + self.width - 1);
+        self.tracked_y =
+            (self.tracked_y + dy as i32).clamp(self.origin_y, self.origin_y + self.height - 1);
+        self.send_mouse(MOUSEINPUT {
+            dx: dx as i32,
+            dy: dy as i32,
+            mouseData: 0,
+            dwFlags: MOUSEEVENTF_MOVE,
+            time: 0,
+            dwExtraInfo: 0,
+        });
+    }
+
+    fn button(&mut self, button: u32, pressed: bool) {
+        let (flags, mouse_data) = match (button, pressed) {
+            (1, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+            (1, false) => (MOUSEEVENTF_LEFTUP, 0),
+            (2, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+            (2, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+            (3, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+            (3, false) => (MOUSEEVENTF_RIGHTUP, 0),
+            (8, true) => (MOUSEEVENTF_XDOWN, XBUTTON1 as u32),
+            (8, false) => (MOUSEEVENTF_XUP, XBUTTON1 as u32),
+            (9, true) => (MOUSEEVENTF_XDOWN, XBUTTON2 as u32),
+            (9, false) => (MOUSEEVENTF_XUP, XBUTTON2 as u32),
+            _ => return,
+        };
+        self.send_mouse(MOUSEINPUT {
+            dx: 0,
+            dy: 0,
+            mouseData: mouse_data,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        });
+    }
+
+    fn scroll(&mut self, delta_x: i16, delta_y: i16) {
+        if delta_y != 0 {
+            self.send_mouse(MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: (delta_y as i32 * WHEEL_DELTA as i32) as u32,
+                dwFlags: MOUSEEVENTF_WHEEL,
+                time: 0,
+                dwExtraInfo: 0,
+            });
+        }
+        if delta_x != 0 {
+            self.send_mouse(MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: (delta_x as i32 * WHEEL_DELTA as i32) as u32,
+                dwFlags: MOUSEEVENTF_HWHEEL,
+                time: 0,
+                dwExtraInfo: 0,
+            });
+        }
+    }
+
+    fn key(&mut self, key: KeyboardKey, pressed: bool) {
+        let Some((scan_code, extended)) = windows_key_scan_code(key) else {
+            return;
+        };
+        let mut flags = KEYEVENTF_SCANCODE;
+        if extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if !pressed {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        self.send_keyboard(KEYBDINPUT {
+            wVk: VIRTUAL_KEY(0),
+            wScan: scan_code,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        });
+    }
+
+    fn refresh_virtual_screen(&mut self) {
+        let (origin_x, origin_y, width, height) = windows_virtual_screen_metrics();
+        self.origin_x = origin_x;
+        self.origin_y = origin_y;
+        self.width = width.max(1);
+        self.height = height.max(1);
+    }
+
+    fn send_mouse(&self, input: MOUSEINPUT) {
+        let inputs = [INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 { mi: input },
+        }];
+        unsafe {
+            let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+
+    fn send_keyboard(&self, input: KEYBDINPUT) {
+        let inputs = [INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: input },
+        }];
+        unsafe {
+            let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_virtual_screen_metrics() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_absolute(coord: i32, span: i32) -> i32 {
+    if span <= 1 {
+        0
+    } else {
+        (((coord as i64) * 65535 + ((span - 1) as i64 / 2)) / ((span - 1) as i64)) as i32
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_key_scan_code(key: KeyboardKey) -> Option<(u16, bool)> {
+    Some(match key {
+        KeyboardKey::Escape => (0x01, false),
+        KeyboardKey::Tab => (0x0F, false),
+        KeyboardKey::Backspace => (0x0E, false),
+        KeyboardKey::Enter => (0x1C, false),
+        KeyboardKey::Space => (0x39, false),
+        KeyboardKey::Insert => (0x52, true),
+        KeyboardKey::Delete => (0x53, true),
+        KeyboardKey::Home => (0x47, true),
+        KeyboardKey::End => (0x4F, true),
+        KeyboardKey::PageUp => (0x49, true),
+        KeyboardKey::PageDown => (0x51, true),
+        KeyboardKey::ArrowUp => (0x48, true),
+        KeyboardKey::ArrowDown => (0x50, true),
+        KeyboardKey::ArrowLeft => (0x4B, true),
+        KeyboardKey::ArrowRight => (0x4D, true),
+        KeyboardKey::Minus => (0x0C, false),
+        KeyboardKey::Equals => (0x0D, false),
+        KeyboardKey::OpenBracket => (0x1A, false),
+        KeyboardKey::CloseBracket => (0x1B, false),
+        KeyboardKey::Backslash => (0x2B, false),
+        KeyboardKey::Semicolon => (0x27, false),
+        KeyboardKey::Quote => (0x28, false),
+        KeyboardKey::Backtick => (0x29, false),
+        KeyboardKey::Comma => (0x33, false),
+        KeyboardKey::Period => (0x34, false),
+        KeyboardKey::Slash => (0x35, false),
+        KeyboardKey::Num0 => (0x0B, false),
+        KeyboardKey::Num1 => (0x02, false),
+        KeyboardKey::Num2 => (0x03, false),
+        KeyboardKey::Num3 => (0x04, false),
+        KeyboardKey::Num4 => (0x05, false),
+        KeyboardKey::Num5 => (0x06, false),
+        KeyboardKey::Num6 => (0x07, false),
+        KeyboardKey::Num7 => (0x08, false),
+        KeyboardKey::Num8 => (0x09, false),
+        KeyboardKey::Num9 => (0x0A, false),
+        KeyboardKey::A => (0x1E, false),
+        KeyboardKey::B => (0x30, false),
+        KeyboardKey::C => (0x2E, false),
+        KeyboardKey::D => (0x20, false),
+        KeyboardKey::E => (0x12, false),
+        KeyboardKey::F => (0x21, false),
+        KeyboardKey::G => (0x22, false),
+        KeyboardKey::H => (0x23, false),
+        KeyboardKey::I => (0x17, false),
+        KeyboardKey::J => (0x24, false),
+        KeyboardKey::K => (0x25, false),
+        KeyboardKey::L => (0x26, false),
+        KeyboardKey::M => (0x32, false),
+        KeyboardKey::N => (0x31, false),
+        KeyboardKey::O => (0x18, false),
+        KeyboardKey::P => (0x19, false),
+        KeyboardKey::Q => (0x10, false),
+        KeyboardKey::R => (0x13, false),
+        KeyboardKey::S => (0x1F, false),
+        KeyboardKey::T => (0x14, false),
+        KeyboardKey::U => (0x16, false),
+        KeyboardKey::V => (0x2F, false),
+        KeyboardKey::W => (0x11, false),
+        KeyboardKey::X => (0x2D, false),
+        KeyboardKey::Y => (0x15, false),
+        KeyboardKey::Z => (0x2C, false),
+        KeyboardKey::F1 => (0x3B, false),
+        KeyboardKey::F2 => (0x3C, false),
+        KeyboardKey::F3 => (0x3D, false),
+        KeyboardKey::F4 => (0x3E, false),
+        KeyboardKey::F5 => (0x3F, false),
+        KeyboardKey::F6 => (0x40, false),
+        KeyboardKey::F7 => (0x41, false),
+        KeyboardKey::F8 => (0x42, false),
+        KeyboardKey::F9 => (0x43, false),
+        KeyboardKey::F10 => (0x44, false),
+        KeyboardKey::F11 => (0x57, false),
+        KeyboardKey::F12 => (0x58, false),
+        KeyboardKey::LeftShift => (0x2A, false),
+        KeyboardKey::LeftCtrl => (0x1D, false),
+        KeyboardKey::LeftAlt => (0x38, false),
+        KeyboardKey::LeftMeta => (0x5B, true),
+        KeyboardKey::RightShift => (0x36, false),
+        KeyboardKey::RightCtrl => (0x1D, true),
+        KeyboardKey::RightAlt => (0x38, true),
+        KeyboardKey::RightMeta => (0x5C, true),
+    })
 }
 
 #[cfg(target_os = "linux")]

@@ -16,9 +16,9 @@ pub struct DmaBufPlane {
 }
 
 /// Frame payload: either CPU-accessible bytes or GPU DMA-BUF planes.
-#[cfg(target_os = "linux")]
 pub enum FrameData {
     Ram(Vec<u8>),
+    #[cfg(target_os = "linux")]
     DmaBuf {
         planes: Vec<DmaBufPlane>,
         drm_format: u32,
@@ -53,7 +53,7 @@ pub struct CapturedFrame {
     /// Raw CVPixelBufferRef on macOS (retained — caller must release).
     #[cfg(target_os = "macos")]
     pub pixel_buffer_ptr: *mut std::ffi::c_void,
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     pub data: FrameData,
     pub width: u32,
     pub height: u32,
@@ -64,7 +64,7 @@ pub struct CapturedFrame {
 }
 
 // SAFETY: The CVPixelBufferRef is retained and owned by this struct.
-// On Linux, OwnedFd is Send and Vec<u8> is Send.
+// On Linux, OwnedFd is Send and Vec<u8> is Send. On Windows, Ram frames are Vec<u8>.
 unsafe impl Send for CapturedFrame {}
 
 pub trait CaptureBackend: Send {
@@ -89,3 +89,8 @@ pub use macos::PlatformCapture;
 pub mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::PlatformCapture;
+
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::PlatformCapture;

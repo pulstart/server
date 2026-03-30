@@ -11,6 +11,12 @@ use std::time::Duration;
 use tar::Archive;
 use tempfile::TempDir;
 use zip::ZipArchive;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::{
+    OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+};
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/pulstart/server/releases/latest";
 const APPLY_UPDATE_FLAG: &str = "--apply-update";
@@ -72,6 +78,7 @@ pub fn supported_target_label() -> Result<&'static str, String> {
         ("linux", "x86_64") => Ok("linux-x64"),
         ("macos", "x86_64") => Ok("macos-x64"),
         ("macos", "aarch64") => Ok("macos-arm64"),
+        ("windows", "x86_64") => Ok("windows-x64"),
         (os, arch) => Err(format!("Updater is not supported on {os}/{arch}.")),
     }
 }
@@ -231,6 +238,7 @@ fn asset_suffix() -> Result<&'static str, String> {
         ("linux", "x86_64") => Ok("-linux-x64.tar.gz"),
         ("macos", "x86_64") => Ok("-macos-x64.zip"),
         ("macos", "aarch64") => Ok("-macos-arm64.zip"),
+        ("windows", "x86_64") => Ok("-windows-x64.zip"),
         _ => Err(supported_target_label().unwrap_err()),
     }
 }
@@ -238,7 +246,7 @@ fn asset_suffix() -> Result<&'static str, String> {
 fn archive_kind() -> Result<ArchiveKind, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok(ArchiveKind::TarGz),
-        ("macos", "x86_64") | ("macos", "aarch64") => Ok(ArchiveKind::Zip),
+        ("macos", "x86_64") | ("macos", "aarch64") | ("windows", "x86_64") => Ok(ArchiveKind::Zip),
         _ => Err(supported_target_label().unwrap_err()),
     }
 }
@@ -355,9 +363,35 @@ fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to locate current executable: {e}"))?;
+    let script = format!(
+        "Start-Process -FilePath '{}' -Verb RunAs -Wait -ArgumentList @('{}','{}','{}')",
+        powershell_escape(&current_exe.to_string_lossy()),
+        powershell_escape(ELEVATED_COPY_FLAG),
+        powershell_escape(&package_root.to_string_lossy()),
+        powershell_escape(&install_root.to_string_lossy()),
+    );
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .status()
+        .map_err(|e| format!("Failed to request elevated permissions: {e}"))?;
+    if !status.success() {
+        return Err("Elevated update was cancelled or failed.".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_escape(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 fn wait_for_process_exit(pid: u32) -> Result<(), String> {
@@ -378,6 +412,23 @@ fn process_exists(pid: u32) -> bool {
         true
     } else {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_exists(pid: u32) -> bool {
+    unsafe {
+        let handle = match OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => return false,
+        };
+        let wait = WaitForSingleObject(handle, 0);
+        let _ = CloseHandle(handle);
+        wait == WAIT_TIMEOUT
     }
 }
 

@@ -217,6 +217,7 @@ impl SoftwareEncoder {
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
         match &frame.data {
             FrameData::Ram(data) => self.fill_bgra_from_slice(data),
+            #[cfg(target_os = "linux")]
             FrameData::DmaBuf { planes, drm_format } => {
                 self.fill_bgra_from_dmabuf(planes, *drm_format, frame.width, frame.height)?;
             }
@@ -306,6 +307,7 @@ impl SoftwareEncoder {
     }
 
     /// Read DMA-BUF pixels directly into the pre-allocated BGRA frame via mmap.
+    #[cfg(target_os = "linux")]
     fn fill_bgra_from_dmabuf(
         &mut self,
         planes: &[crate::capture::DmaBufPlane],
