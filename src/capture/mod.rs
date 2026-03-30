@@ -2,7 +2,11 @@ use crossbeam_channel::Sender;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "windows")]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 static TARGET_FPS: AtomicU32 = AtomicU32::new(60);
 
@@ -23,13 +27,24 @@ pub enum FrameData {
         planes: Vec<DmaBufPlane>,
         drm_format: u32,
     },
+    #[cfg(target_os = "windows")]
+    D3D11Texture {
+        texture: Arc<D3D11FrameTexture>,
+        array_index: u32,
+    },
+}
+
+#[cfg(target_os = "windows")]
+pub struct D3D11FrameTexture {
+    pub texture: ID3D11Texture2D,
 }
 
 /// Cursor image captured alongside the main frame.
 ///
 /// Used by backends that can expose a separate cursor plane or metadata.
-/// Today that includes KMS, X11, PipeWire cursor metadata mode, and Windows GDI.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// Today that includes KMS, X11, PipeWire cursor metadata mode, Windows GDI,
+/// and macOS ScreenCaptureKit with AppKit cursor extraction.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 #[derive(Clone)]
 pub struct CapturedCursor {
     /// ARGB8888 pixel data (pre-multiplied alpha), row-major.
@@ -59,21 +74,39 @@ pub struct CapturedFrame {
     pub height: u32,
     /// Cursor data for backends that capture cursor separately.
     /// `None` when cursor is already embedded in the frame or currently hidden.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     pub cursor: Option<CapturedCursor>,
 }
 
 // SAFETY: The CVPixelBufferRef is retained and owned by this struct.
-// On Linux, OwnedFd is Send and Vec<u8> is Send. On Windows, Ram frames are Vec<u8>.
+// On Linux, OwnedFd is Send and Vec<u8> is Send. On Windows, Ram frames are Vec<u8>
+// and D3D11 frame textures are carried behind Arc-wrapped COM handles.
 unsafe impl Send for CapturedFrame {}
 
 /// Composite cursor onto a BGRA frame in-place (software alpha blending).
 ///
 /// Cursor pixels are stored as BGRA bytes in memory, which matches the frame
 /// memory layout used by the software encode path on little-endian targets.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub fn composite_cursor(
     frame_data: &mut [u8],
+    frame_width: u32,
+    frame_height: u32,
+    cursor: &CapturedCursor,
+) {
+    composite_cursor_with_stride(
+        frame_data,
+        frame_width as usize * 4,
+        frame_width,
+        frame_height,
+        cursor,
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub fn composite_cursor_with_stride(
+    frame_data: &mut [u8],
+    frame_stride: usize,
     frame_width: u32,
     frame_height: u32,
     cursor: &CapturedCursor,
@@ -100,7 +133,7 @@ pub fn composite_cursor(
             }
 
             let cursor_offset = ((cy * cw + cx) * 4) as usize;
-            let frame_offset = ((fy * fw + fx) * 4) as usize;
+            let frame_offset = fy as usize * frame_stride + fx as usize * 4;
 
             if cursor_offset + 3 >= cursor.pixels.len() || frame_offset + 3 >= frame_data.len() {
                 continue;

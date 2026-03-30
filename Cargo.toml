@@ -20,11 +20,13 @@ tempfile = "3"
 ureq = { version = "2", default-features = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avcodec", "avformat", "swscale"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSBitmapImageRep", "NSCursor", "NSImage", "NSImageRep"] }
 screencapturekit = "1.5"
 tray-icon = { version = "0.21", default-features = false }
 winit = "0.30"
@@ -48,7 +50,11 @@ tray-icon = { version = "0.21", default-features = false }
 winit = "0.30"
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
     "Win32_Media_Multimedia",

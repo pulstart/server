@@ -17,6 +17,11 @@ use ffmpeg::util::frame::Video as VideoFrame;
 
 use std::ffi::CString;
 use std::ptr;
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
 
 pub struct SoftwareEncoder {
     codec_ctx: *mut ffi::AVCodecContext,
@@ -28,6 +33,8 @@ pub struct SoftwareEncoder {
     height: u32,
     yuv_frame: VideoFrame,
     bgra_frame: VideoFrame,
+    #[cfg(target_os = "windows")]
+    staging_texture: Option<ID3D11Texture2D>,
 }
 
 unsafe impl Send for SoftwareEncoder {}
@@ -209,6 +216,8 @@ impl SoftwareEncoder {
             height: config.height,
             yuv_frame,
             bgra_frame,
+            #[cfg(target_os = "windows")]
+            staging_texture: None,
         })
     }
 
@@ -217,6 +226,13 @@ impl SoftwareEncoder {
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
         match &frame.data {
             FrameData::Ram(data) => self.fill_bgra_from_slice(data),
+            #[cfg(target_os = "windows")]
+            FrameData::D3D11Texture {
+                texture,
+                array_index,
+            } => {
+                self.fill_bgra_from_d3d11(texture, *array_index, frame.width, frame.height)?;
+            }
             #[cfg(target_os = "linux")]
             FrameData::DmaBuf { planes, drm_format } => {
                 self.fill_bgra_from_dmabuf(planes, *drm_format, frame.width, frame.height)?;
@@ -304,6 +320,119 @@ impl SoftwareEncoder {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn fill_bgra_from_d3d11(
+        &mut self,
+        texture: &crate::capture::D3D11FrameTexture,
+        array_index: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let source = &texture.texture;
+        let device = unsafe {
+            source
+                .GetDevice()
+                .map_err(|err| format!("ID3D11Texture2D::GetDevice failed: {err}"))?
+        };
+        let context = unsafe {
+            device
+                .GetImmediateContext()
+                .map_err(|err| format!("ID3D11Device::GetImmediateContext failed: {err}"))?
+        };
+
+        let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            source.GetDesc(&mut source_desc);
+        }
+
+        let recreate_staging = self
+            .staging_texture
+            .as_ref()
+            .map(|staging| {
+                let mut staging_desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe {
+                    staging.GetDesc(&mut staging_desc);
+                }
+                staging_desc.Width != source_desc.Width
+                    || staging_desc.Height != source_desc.Height
+                    || staging_desc.Format != source_desc.Format
+            })
+            .unwrap_or(true);
+
+        if recreate_staging {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: source_desc.Width,
+                Height: source_desc.Height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: source_desc.Format,
+                SampleDesc: source_desc.SampleDesc,
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging = None;
+            unsafe {
+                device
+                    .CreateTexture2D(&desc, None, Some(&mut staging))
+                    .map_err(|err| format!("CreateTexture2D for staging failed: {err}"))?;
+            }
+            self.staging_texture = Some(
+                staging.ok_or_else(|| "CreateTexture2D for staging returned null".to_string())?,
+            );
+        }
+
+        let staging = self
+            .staging_texture
+            .as_ref()
+            .ok_or_else(|| "staging texture missing after creation".to_string())?;
+        unsafe {
+            if array_index == 0 && source_desc.ArraySize <= 1 {
+                context.CopyResource(staging, source);
+            } else {
+                let source_subresource = array_index.saturating_mul(source_desc.MipLevels);
+                context.CopySubresourceRegion(
+                    staging,
+                    0,
+                    0,
+                    0,
+                    0,
+                    source,
+                    source_subresource,
+                    None,
+                );
+            }
+        }
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            context
+                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|err| format!("ID3D11DeviceContext::Map failed: {err}"))?;
+        }
+
+        let result = (|| -> Result<(), String> {
+            let src_stride = mapped.RowPitch as usize;
+            let row_bytes = (width as usize) * 4;
+            let dst_stride = self.bgra_frame.stride(0);
+            let src = mapped.pData as *const u8;
+
+            for row in 0..height as usize {
+                let src_row = unsafe { std::slice::from_raw_parts(src.add(row * src_stride), row_bytes) };
+                let dst_start = row * dst_stride;
+                self.bgra_frame.data_mut(0)[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(src_row);
+            }
+            Ok(())
+        })();
+
+        unsafe {
+            context.Unmap(staging, 0);
+        }
+        result
     }
 
     /// Read DMA-BUF pixels directly into the pre-allocated BGRA frame via mmap.

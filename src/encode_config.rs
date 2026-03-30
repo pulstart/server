@@ -139,6 +139,7 @@ impl EncoderConfig {
     const DEFAULT_MAX_BITRATE_KBPS: u32 = 100_000;
     const DEFAULT_FRAMERATE: u32 = 60;
     const MAX_NEGOTIATED_FPS: u32 = 360;
+    const SVTAV1_MIN_BUFFER_MS: i64 = 20;
 
     fn default_gop_size(framerate: u32) -> u32 {
         framerate.clamp(30, 120)
@@ -256,6 +257,10 @@ impl EncoderConfig {
         self.bitrate_kbps as i64 * 1000
     }
 
+    fn buffer_size_for_duration_ms(&self, duration_ms: i64) -> i64 {
+        self.bitrate_bps().saturating_mul(duration_ms) / 1000
+    }
+
     pub fn with_bitrate_kbps(&self, bitrate_kbps: u32) -> Self {
         let mut next = self.clone();
         next.bitrate_kbps = bitrate_kbps.clamp(self.min_bitrate_kbps, self.max_bitrate_kbps);
@@ -271,14 +276,22 @@ impl EncoderConfig {
     }
 
     /// Compute VBV buffer size in bits (Sunshine style: bitrate / fps for HW, larger for SW).
+    ///
+    /// `libsvtav1` derives a VBV duration from `rc_buffer_size` and rejects values below 20 ms.
+    /// High-refresh software AV1 sessions can otherwise dip under that minimum.
     pub fn vbv_buffer_size(&self, is_software: bool) -> i32 {
         let bps = self.bitrate_bps();
         let size = if is_software {
-            bps / ((self.framerate as i64 * 10) / 15)
+            bps.saturating_mul(15) / ((self.framerate.max(1) as i64) * 10)
         } else {
-            bps / self.framerate as i64
+            bps / self.framerate.max(1) as i64
         };
-        size as i32
+        let size = if is_software && self.codec == Codec::Av1 {
+            size.max(self.buffer_size_for_duration_ms(Self::SVTAV1_MIN_BUFFER_MS))
+        } else {
+            size
+        };
+        size.min(i32::MAX as i64) as i32
     }
 
     pub fn ffmpeg_vaapi_codec_name(&self) -> &'static str {
@@ -294,6 +307,24 @@ impl EncoderConfig {
             Codec::H264 => "h264_nvenc",
             Codec::Hevc => "hevc_nvenc",
             Codec::Av1 => "av1_nvenc",
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn ffmpeg_amf_codec_name(&self) -> &'static str {
+        match self.codec {
+            Codec::H264 => "h264_amf",
+            Codec::Hevc => "hevc_amf",
+            Codec::Av1 => "av1_amf",
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn ffmpeg_mf_codec_name(&self) -> &'static str {
+        match self.codec {
+            Codec::H264 => "h264_mf",
+            Codec::Hevc => "hevc_mf",
+            Codec::Av1 => "av1_mf",
         }
     }
 
@@ -408,5 +439,49 @@ impl AudioConfig {
 
     pub fn total_samples_per_frame(&self) -> usize {
         (self.samples_per_frame() * self.channels) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(codec: Codec, framerate: u32) -> EncoderConfig {
+        EncoderConfig {
+            width: 1920,
+            height: 1080,
+            framerate,
+            bitrate_kbps: 20_000,
+            min_bitrate_kbps: 5_000,
+            max_bitrate_kbps: 100_000,
+            codec,
+            dynamic_range: DynamicRange::Sdr,
+            chroma: ChromaSampling::Yuv420,
+            gop_size: EncoderConfig::default_gop_size(framerate),
+            max_b_frames: 0,
+            low_delay: true,
+            quality: QualityPreset::Balanced,
+        }
+    }
+
+    #[test]
+    fn software_av1_vbv_buffer_is_clamped_at_high_refresh_rates() {
+        let config = config(Codec::Av1, 144);
+
+        assert_eq!(config.vbv_buffer_size(true), 400_000);
+    }
+
+    #[test]
+    fn software_av1_vbv_buffer_keeps_existing_size_when_already_large_enough() {
+        let config = config(Codec::Av1, 60);
+
+        assert_eq!(config.vbv_buffer_size(true), 500_000);
+    }
+
+    #[test]
+    fn software_h264_vbv_buffer_keeps_existing_high_refresh_behavior() {
+        let config = config(Codec::H264, 144);
+
+        assert_eq!(config.vbv_buffer_size(true), 208_333);
     }
 }

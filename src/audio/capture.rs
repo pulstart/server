@@ -283,6 +283,382 @@ mod platform {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::{AudioConfig, AudioSamples};
+    use crate::macos_display::{describe_display, select_capture_display};
+    use crossbeam_channel::Sender;
+    use screencapturekit::{cm::AudioBufferList, prelude::*};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    const MAX_AUDIO_FORMAT_ERRORS: usize = 12;
+
+    pub struct AudioCapture {
+        stream: Option<SCStream>,
+    }
+
+    impl AudioCapture {
+        pub fn new() -> Self {
+            Self { stream: None }
+        }
+
+        pub fn start(
+            &mut self,
+            config: AudioConfig,
+            _device: Option<String>,
+            tx: Sender<AudioSamples>,
+        ) -> Result<(), String> {
+            if self.stream.is_some() {
+                return Err("Audio capture already running".into());
+            }
+
+            let display = select_capture_display()?;
+            println!(
+                "[audio] macOS ScreenCaptureKit using {}",
+                describe_display(&display)
+            );
+
+            let filter = SCContentFilter::create()
+                .with_display(&display)
+                .with_excluding_windows(&[])
+                .build();
+            let stream_config = SCStreamConfiguration::new()
+                .with_width(display.width().max(1))
+                .with_height(display.height().max(1))
+                .with_captures_audio(true)
+                .with_sample_rate(config.sample_rate as i32)
+                .with_channel_count(config.channels as i32)
+                .with_excludes_current_process_audio(true);
+            let frame_samples = config.total_samples_per_frame() as usize;
+
+            let mut stream = SCStream::new_with_delegate(
+                &filter,
+                &stream_config,
+                ErrorHandler::new(|err| eprintln!("[audio] ScreenCaptureKit stream error: {err:?}")),
+            );
+            stream.add_output_handler(
+                AudioOutputHandler {
+                    tx,
+                    pending: Mutex::new(Vec::with_capacity(frame_samples * 3)),
+                    frame_samples,
+                    sample_rate: config.sample_rate,
+                    channels: config.channels,
+                    format_errors: AtomicUsize::new(0),
+                },
+                SCStreamOutputType::Audio,
+            );
+            stream
+                .start_capture()
+                .map_err(|err| format!("Failed to start ScreenCaptureKit audio capture: {err:?}"))?;
+
+            println!(
+                "[audio] ScreenCaptureKit audio capture started ({}ch, {}Hz, frame={} samples)",
+                config.channels,
+                config.sample_rate,
+                config.total_samples_per_frame()
+            );
+            self.stream = Some(stream);
+            Ok(())
+        }
+
+        pub fn stop(&mut self) {
+            if let Some(stream) = self.stream.take() {
+                let _ = stream.stop_capture();
+            }
+        }
+    }
+
+    pub fn detect_monitor_source() -> Option<String> {
+        Some("default-screencapturekit".to_string())
+    }
+
+    struct AudioOutputHandler {
+        tx: Sender<AudioSamples>,
+        pending: Mutex<Vec<f32>>,
+        frame_samples: usize,
+        sample_rate: u32,
+        channels: u32,
+        format_errors: AtomicUsize,
+    }
+
+    impl SCStreamOutputTrait for AudioOutputHandler {
+        fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType) {
+            if of_type != SCStreamOutputType::Audio {
+                return;
+            }
+
+            let mut decoded = match decode_audio_samples(&sample_buffer, self.sample_rate, self.channels) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    let log_idx = self.format_errors.fetch_add(1, Ordering::Relaxed);
+                    if log_idx < MAX_AUDIO_FORMAT_ERRORS {
+                        eprintln!("[audio] ScreenCaptureKit audio sample dropped: {err}");
+                    }
+                    return;
+                }
+            };
+            if decoded.is_empty() {
+                return;
+            }
+
+            let mut pending = self.pending.lock().unwrap();
+            pending.append(&mut decoded);
+            while pending.len() >= self.frame_samples {
+                let frame = pending.drain(..self.frame_samples).collect::<Vec<_>>();
+                if self
+                    .tx
+                    .send(AudioSamples {
+                        data: frame,
+                        channels: self.channels,
+                        sample_rate: self.sample_rate,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn decode_audio_samples(
+        sample_buffer: &CMSampleBuffer,
+        expected_sample_rate: u32,
+        expected_channels: u32,
+    ) -> Result<Vec<f32>, String> {
+        if !sample_buffer.is_valid() {
+            return Err("invalid sample buffer".into());
+        }
+
+        let format = sample_buffer
+            .format_description()
+            .ok_or_else(|| "missing audio format description".to_string())?;
+        if !format.is_audio() {
+            return Err("received non-audio sample".into());
+        }
+        if !format.is_pcm() {
+            return Err(format!(
+                "unsupported audio codec {}",
+                format.media_subtype_string()
+            ));
+        }
+
+        let sample_rate = format
+            .audio_sample_rate()
+            .map(|rate| rate.round().max(1.0) as u32)
+            .unwrap_or(expected_sample_rate);
+        let channels = format
+            .audio_channel_count()
+            .unwrap_or(expected_channels)
+            .max(1);
+        if sample_rate != expected_sample_rate || channels != expected_channels {
+            return Err(format!(
+                "got {}ch/{}Hz, expected {}ch/{}Hz",
+                channels, sample_rate, expected_channels, expected_sample_rate
+            ));
+        }
+
+        let bits_per_channel = format
+            .audio_bits_per_channel()
+            .unwrap_or(if format.audio_is_float() { 32 } else { 16 });
+        let bytes_per_sample = bytes_per_sample(bits_per_channel, format.audio_is_float())?;
+        let buffer_list = sample_buffer
+            .audio_buffer_list()
+            .ok_or_else(|| "audio sample missing buffer list".to_string())?;
+        if buffer_list.num_buffers() == 0 {
+            return Ok(Vec::new());
+        }
+
+        if buffer_list.num_buffers() == 1 {
+            let buffer = buffer_list
+                .get(0)
+                .ok_or_else(|| "missing interleaved audio buffer".to_string())?;
+            let data = buffer.data();
+            let interleaved_channels = if buffer.number_channels == 0 {
+                channels as usize
+            } else {
+                buffer.number_channels as usize
+            };
+            if interleaved_channels != channels as usize {
+                return Err(format!(
+                    "interleaved audio buffer reports {} channels, expected {}",
+                    interleaved_channels, channels
+                ));
+            }
+            decode_interleaved(
+                data,
+                channels as usize,
+                bytes_per_sample,
+                bits_per_channel,
+                format.audio_is_float(),
+                format.audio_is_big_endian(),
+            )
+        } else {
+            if buffer_list.num_buffers() != channels as usize {
+                return Err(format!(
+                    "planar audio buffer count {} does not match {} channels",
+                    buffer_list.num_buffers(),
+                    channels
+                ));
+            }
+            decode_planar(
+                &buffer_list,
+                channels as usize,
+                bytes_per_sample,
+                bits_per_channel,
+                format.audio_is_float(),
+                format.audio_is_big_endian(),
+            )
+        }
+    }
+
+    fn bytes_per_sample(bits_per_channel: u32, is_float: bool) -> Result<usize, String> {
+        match (is_float, bits_per_channel) {
+            (true, 32) => Ok(4),
+            (false, 16) => Ok(2),
+            (false, 32) => Ok(4),
+            _ => Err(format!(
+                "unsupported PCM layout: float={} bits={}",
+                is_float, bits_per_channel
+            )),
+        }
+    }
+
+    fn decode_interleaved(
+        data: &[u8],
+        channels: usize,
+        bytes_per_sample: usize,
+        bits_per_channel: u32,
+        is_float: bool,
+        big_endian: bool,
+    ) -> Result<Vec<f32>, String> {
+        let frame_bytes = bytes_per_sample
+            .checked_mul(channels)
+            .ok_or_else(|| "audio frame size overflow".to_string())?;
+        if frame_bytes == 0 || data.len() % frame_bytes != 0 {
+            return Err(format!(
+                "interleaved audio payload size {} is not aligned to {}-byte frames",
+                data.len(),
+                frame_bytes
+            ));
+        }
+
+        let mut samples = Vec::with_capacity(data.len() / bytes_per_sample);
+        for sample in data.chunks_exact(bytes_per_sample) {
+            samples.push(decode_sample(
+                sample,
+                bits_per_channel,
+                is_float,
+                big_endian,
+            )?);
+        }
+        Ok(samples)
+    }
+
+    fn decode_planar(
+        buffer_list: &AudioBufferList,
+        channels: usize,
+        bytes_per_sample: usize,
+        bits_per_channel: u32,
+        is_float: bool,
+        big_endian: bool,
+    ) -> Result<Vec<f32>, String> {
+        let mut channel_data = Vec::with_capacity(channels);
+        let mut frames = None;
+
+        for channel_index in 0..channels {
+            let buffer = buffer_list
+                .get(channel_index)
+                .ok_or_else(|| format!("missing channel buffer {channel_index}"))?;
+            let data = buffer.data();
+            if data.len() % bytes_per_sample != 0 {
+                return Err(format!(
+                    "planar channel {} payload size {} is not aligned to {}-byte samples",
+                    channel_index,
+                    data.len(),
+                    bytes_per_sample
+                ));
+            }
+            let channel_frames = data.len() / bytes_per_sample;
+            match frames {
+                Some(existing) if existing != channel_frames => {
+                    return Err(format!(
+                        "planar channel {} has {} frames, expected {}",
+                        channel_index, channel_frames, existing
+                    ));
+                }
+                None => frames = Some(channel_frames),
+                _ => {}
+            }
+            channel_data.push(data);
+        }
+
+        let frames = frames.unwrap_or(0);
+        let mut samples = Vec::with_capacity(frames * channels);
+        for frame_index in 0..frames {
+            let start = frame_index * bytes_per_sample;
+            let end = start + bytes_per_sample;
+            for data in &channel_data {
+                samples.push(decode_sample(
+                    &data[start..end],
+                    bits_per_channel,
+                    is_float,
+                    big_endian,
+                )?);
+            }
+        }
+        Ok(samples)
+    }
+
+    fn decode_sample(
+        bytes: &[u8],
+        bits_per_channel: u32,
+        is_float: bool,
+        big_endian: bool,
+    ) -> Result<f32, String> {
+        match (is_float, bits_per_channel) {
+            (true, 32) => {
+                let bytes: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| "invalid float32 sample size".to_string())?;
+                Ok(if big_endian {
+                    f32::from_be_bytes(bytes)
+                } else {
+                    f32::from_le_bytes(bytes)
+                })
+            }
+            (false, 16) => {
+                let bytes: [u8; 2] = bytes
+                    .try_into()
+                    .map_err(|_| "invalid int16 sample size".to_string())?;
+                let value = if big_endian {
+                    i16::from_be_bytes(bytes)
+                } else {
+                    i16::from_le_bytes(bytes)
+                };
+                Ok(value as f32 / i16::MAX as f32)
+            }
+            (false, 32) => {
+                let bytes: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| "invalid int32 sample size".to_string())?;
+                let value = if big_endian {
+                    i32::from_be_bytes(bytes)
+                } else {
+                    i32::from_le_bytes(bytes)
+                };
+                Ok(value as f32 / i32::MAX as f32)
+            }
+            _ => Err(format!(
+                "unsupported PCM layout: float={} bits={}",
+                is_float, bits_per_channel
+            )),
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
     use super::{AudioConfig, AudioSamples};

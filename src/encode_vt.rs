@@ -171,6 +171,7 @@ pub struct VTEncoder {
     _callback_ctx: *mut Sender<EncodedUnit>,
     nal_rx: Receiver<EncodedUnit>,
     frame_count: i64,
+    framerate: u32,
 }
 
 unsafe impl Send for VTEncoder {}
@@ -249,11 +250,12 @@ impl VTEncoder {
             _callback_ctx: ctx_ptr,
             nal_rx,
             frame_count: 0,
+            framerate: framerate.max(1),
         })
     }
 
     pub fn encode_pixel_buffer(&mut self, pixel_buffer: CVPixelBufferRef) -> Result<(), String> {
-        let pts = cm_time(self.frame_count, 60);
+        let pts = cm_time(self.frame_count, self.framerate as i32);
         self.frame_count += 1;
 
         let status = unsafe {
@@ -269,6 +271,24 @@ impl VTEncoder {
         };
         if status != 0 {
             return Err(format!("VTCompressionSessionEncodeFrame failed: {status}"));
+        }
+        Ok(())
+    }
+
+    pub fn update_bitrate(&mut self, bitrate_bps: u32) -> Result<(), String> {
+        let bitrate = cf_number_i32(bitrate_bps.min(i32::MAX as u32) as i32);
+        let status = unsafe {
+            VTSessionSetProperty(
+                self.session,
+                kVTCompressionPropertyKey_AverageBitRate,
+                bitrate as CFTypeRef,
+            )
+        };
+        unsafe {
+            CFRelease(bitrate as CFTypeRef);
+        }
+        if status != 0 {
+            return Err(format!("VTSessionSetProperty(AverageBitRate) failed: {status}"));
         }
         Ok(())
     }
