@@ -481,6 +481,7 @@ fn capture_xfixes_cursor(display: *mut x11_ffi::Display) -> Option<CapturedCurso
 ///
 /// The cursor pixels are ARGB8888 (native byte order). The frame is BGRA8888.
 /// On little-endian systems: ARGB in memory = [B, G, R, A] which matches BGRA.
+#[allow(dead_code)]
 pub fn composite_cursor(
     frame_data: &mut [u8],
     frame_width: u32,

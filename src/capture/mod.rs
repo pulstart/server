@@ -28,8 +28,8 @@ pub enum FrameData {
 /// Cursor image captured alongside the main frame.
 ///
 /// Used by backends that can expose a separate cursor plane or metadata.
-/// Today that includes KMS, X11, and PipeWire cursor metadata mode.
-#[cfg(target_os = "linux")]
+/// Today that includes KMS, X11, PipeWire cursor metadata mode, and Windows GDI.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Clone)]
 pub struct CapturedCursor {
     /// ARGB8888 pixel data (pre-multiplied alpha), row-major.
@@ -57,15 +57,88 @@ pub struct CapturedFrame {
     pub data: FrameData,
     pub width: u32,
     pub height: u32,
-    /// Cursor data for backends that capture cursor separately (KMS, X11, PipeWire metadata).
+    /// Cursor data for backends that capture cursor separately.
     /// `None` when cursor is already embedded in the frame or currently hidden.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub cursor: Option<CapturedCursor>,
 }
 
 // SAFETY: The CVPixelBufferRef is retained and owned by this struct.
 // On Linux, OwnedFd is Send and Vec<u8> is Send. On Windows, Ram frames are Vec<u8>.
 unsafe impl Send for CapturedFrame {}
+
+/// Composite cursor onto a BGRA frame in-place (software alpha blending).
+///
+/// Cursor pixels are stored as BGRA bytes in memory, which matches the frame
+/// memory layout used by the software encode path on little-endian targets.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn composite_cursor(
+    frame_data: &mut [u8],
+    frame_width: u32,
+    frame_height: u32,
+    cursor: &CapturedCursor,
+) {
+    if !cursor.visible || cursor.pixels.is_empty() {
+        return;
+    }
+
+    let fw = frame_width as i32;
+    let fh = frame_height as i32;
+    let cw = cursor.width as i32;
+    let ch = cursor.height as i32;
+
+    for cy in 0..ch {
+        let fy = cursor.y + cy;
+        if fy < 0 || fy >= fh {
+            continue;
+        }
+
+        for cx in 0..cw {
+            let fx = cursor.x + cx;
+            if fx < 0 || fx >= fw {
+                continue;
+            }
+
+            let cursor_offset = ((cy * cw + cx) * 4) as usize;
+            let frame_offset = ((fy * fw + fx) * 4) as usize;
+
+            if cursor_offset + 3 >= cursor.pixels.len() || frame_offset + 3 >= frame_data.len() {
+                continue;
+            }
+
+            let cb = cursor.pixels[cursor_offset];
+            let cg = cursor.pixels[cursor_offset + 1];
+            let cr = cursor.pixels[cursor_offset + 2];
+            let ca = cursor.pixels[cursor_offset + 3];
+
+            if ca == 0 {
+                continue;
+            }
+
+            if ca == 255 {
+                frame_data[frame_offset] = cb;
+                frame_data[frame_offset + 1] = cg;
+                frame_data[frame_offset + 2] = cr;
+                frame_data[frame_offset + 3] = 255;
+            } else {
+                let alpha = ca as u32;
+                let inv_alpha = 255 - alpha;
+
+                frame_data[frame_offset] =
+                    ((cb as u32 * alpha + frame_data[frame_offset] as u32 * inv_alpha) / 255) as u8;
+                frame_data[frame_offset + 1] = ((cg as u32
+                    * alpha
+                    + frame_data[frame_offset + 1] as u32 * inv_alpha)
+                    / 255) as u8;
+                frame_data[frame_offset + 2] = ((cr as u32
+                    * alpha
+                    + frame_data[frame_offset + 2] as u32 * inv_alpha)
+                    / 255) as u8;
+                frame_data[frame_offset + 3] = 255;
+            }
+        }
+    }
+}
 
 pub trait CaptureBackend: Send {
     fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String>;

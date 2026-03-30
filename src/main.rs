@@ -1000,32 +1000,25 @@ fn encode_and_broadcast(
     frame: &capture::CapturedFrame,
     captured_micros: u64,
 ) {
-    #[cfg(target_os = "windows")]
-    let _ = input;
-
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     input.update_cursor(frame.cursor.as_ref());
 
     // Composite cursor onto RAM frames before encoding when no controller owns input.
     // During active control, the cursor is sent separately to the client and kept
     // out of the encoded frame.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let frame_with_cursor;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let frame_ref = if !input.control_active() {
         if let Some(cursor) = &frame.cursor {
             if let capture::FrameData::Ram(ref data) = frame.data {
                 let mut composited = data.clone();
-                capture::linux::x11_capture::composite_cursor(
-                    &mut composited,
-                    frame.width,
-                    frame.height,
-                    cursor,
-                );
+                capture::composite_cursor(&mut composited, frame.width, frame.height, cursor);
                 frame_with_cursor = capture::CapturedFrame {
                     data: capture::FrameData::Ram(composited),
                     width: frame.width,
                     height: frame.height,
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     cursor: None,
                 };
                 &frame_with_cursor
@@ -1038,8 +1031,6 @@ fn encode_and_broadcast(
     } else {
         frame
     };
-    #[cfg(target_os = "windows")]
-    let frame_ref = frame;
 
     let result = match encoder {
         #[cfg(target_os = "linux")]

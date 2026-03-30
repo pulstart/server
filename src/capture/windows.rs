@@ -1,4 +1,4 @@
-use super::{target_fps, CaptureBackend, CapturedFrame, FrameData};
+use super::{target_fps, CaptureBackend, CapturedCursor, CapturedFrame, FrameData};
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -8,12 +8,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC,
-    HGDIOBJ, SRCCOPY,
+    GetObjectW, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
+    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, GetCursorInfo, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics, HCURSOR, ICONINFO, CURSORINFO,
+    CURSOR_SHOWING, DI_NORMAL, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
 };
 
 pub struct PlatformCapture {
@@ -61,7 +62,7 @@ fn run_capture_loop(
     tx: Sender<CapturedFrame>,
     running: Arc<AtomicBool>,
 ) {
-    let mut frame_interval = frame_interval();
+    let mut target_interval = frame_interval();
     let mut next_metrics_check = Instant::now();
 
     while running.load(Ordering::SeqCst) {
@@ -72,7 +73,7 @@ fn run_capture_loop(
                 thread::sleep(Duration::from_millis(250));
                 continue;
             }
-            frame_interval = frame_interval();
+            target_interval = frame_interval();
             next_metrics_check = frame_started + Duration::from_secs(1);
         }
 
@@ -93,8 +94,8 @@ fn run_capture_loop(
         }
 
         let elapsed = frame_started.elapsed();
-        if elapsed < frame_interval {
-            thread::sleep(frame_interval - elapsed);
+        if elapsed < target_interval {
+            thread::sleep(target_interval - elapsed);
         }
     }
 }
@@ -113,6 +114,7 @@ struct GdiCaptureSession {
     origin_y: i32,
     width: i32,
     height: i32,
+    cursor_cache: Option<CapturedCursor>,
 }
 
 unsafe impl Send for GdiCaptureSession {}
@@ -140,6 +142,7 @@ impl GdiCaptureSession {
                 origin_y: 0,
                 width: 0,
                 height: 0,
+                cursor_cache: None,
             };
             session.recreate_bitmap()?;
             Ok(session)
@@ -170,49 +173,168 @@ impl GdiCaptureSession {
                 0,
                 self.width,
                 self.height,
-                self.screen_dc,
+                Some(self.screen_dc),
                 self.origin_x,
                 self.origin_y,
                 SRCCOPY | CAPTUREBLT,
             )
-            .ok()
             .map_err(|err| format!("BitBlt failed: {err}"))?;
-
-            self.draw_cursor();
 
             let len = (self.width as usize)
                 .saturating_mul(self.height as usize)
                 .saturating_mul(4);
             let pixels = std::slice::from_raw_parts(self.bits as *const u8, len).to_vec();
+            let cursor = self.capture_cursor();
             Ok(CapturedFrame {
                 data: FrameData::Ram(pixels),
                 width: self.width as u32,
                 height: self.height as u32,
+                cursor,
             })
         }
     }
 
-    fn draw_cursor(&self) {
+    fn capture_cursor(&mut self) -> Option<CapturedCursor> {
         unsafe {
             let mut info = CURSORINFO {
                 cbSize: std::mem::size_of::<CURSORINFO>() as u32,
                 ..Default::default()
             };
-            if GetCursorInfo(&mut info).is_ok() && info.flags == CURSOR_SHOWING {
-                let x = info.ptScreenPos.x - self.origin_x;
-                let y = info.ptScreenPos.y - self.origin_y;
-                let _ = DrawIconEx(
-                    self.memory_dc,
-                    x,
-                    y,
-                    info.hCursor.into(),
-                    0,
-                    0,
-                    0,
-                    None,
-                    DI_NORMAL,
-                );
+            if GetCursorInfo(&mut info).is_err() {
+                return None;
             }
+
+            let serial = info.hCursor.0 as usize as u64;
+            let cached_hotspot = self
+                .cursor_cache
+                .as_ref()
+                .map(|cursor| (cursor.hotspot_x, cursor.hotspot_y))
+                .unwrap_or((0, 0));
+
+            if info.flags != CURSOR_SHOWING || serial == 0 {
+                return Some(CapturedCursor {
+                    pixels: Vec::new(),
+                    x: info.ptScreenPos.x - self.origin_x - cached_hotspot.0 as i32,
+                    y: info.ptScreenPos.y - self.origin_y - cached_hotspot.1 as i32,
+                    hotspot_x: cached_hotspot.0,
+                    hotspot_y: cached_hotspot.1,
+                    width: 0,
+                    height: 0,
+                    shape_serial: serial,
+                    visible: false,
+                });
+            }
+
+            let needs_refresh = self
+                .cursor_cache
+                .as_ref()
+                .map(|cursor| cursor.shape_serial != serial)
+                .unwrap_or(true);
+            if needs_refresh {
+                match self.load_cursor_shape(info.hCursor) {
+                    Ok(cursor) => self.cursor_cache = Some(cursor),
+                    Err(err) => {
+                        eprintln!("[capture] Windows cursor capture failed: {err}");
+                        return None;
+                    }
+                }
+            }
+
+            let mut cursor = self.cursor_cache.clone()?;
+            cursor.shape_serial = serial;
+            cursor.x = info.ptScreenPos.x - self.origin_x - cursor.hotspot_x as i32;
+            cursor.y = info.ptScreenPos.y - self.origin_y - cursor.hotspot_y as i32;
+            cursor.visible = true;
+            Some(cursor)
+        }
+    }
+
+    fn load_cursor_shape(&self, cursor: HCURSOR) -> Result<CapturedCursor, String> {
+        unsafe {
+            let mut icon_info = ICONINFO::default();
+            GetIconInfo(cursor.into(), &mut icon_info)
+                .map_err(|err| format!("GetIconInfo failed: {err}"))?;
+
+            let shape = (|| {
+                let (width, height) =
+                    cursor_bitmap_dimensions(icon_info.hbmColor, icon_info.hbmMask)?;
+                if width <= 0 || height <= 0 {
+                    return Err("cursor bitmap size is invalid".to_string());
+                }
+
+                let cursor_dc = CreateCompatibleDC(Some(self.screen_dc));
+                if cursor_dc.is_invalid() {
+                    return Err("CreateCompatibleDC for cursor failed".to_string());
+                }
+
+                let mut bmi = BITMAPINFO::default();
+                bmi.bmiHeader = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                };
+
+                let result = (|| {
+                    let mut bits = std::ptr::null_mut();
+                    let bitmap = CreateDIBSection(
+                        Some(self.screen_dc),
+                        &bmi,
+                        DIB_RGB_COLORS,
+                        &mut bits,
+                        None,
+                        0,
+                    )
+                    .map_err(|err| format!("CreateDIBSection for cursor failed: {err}"))?;
+                    if bitmap.is_invalid() || bits.is_null() {
+                        return Err("CreateDIBSection for cursor returned invalid objects".to_string());
+                    }
+
+                    let old_bitmap = SelectObject(cursor_dc, bitmap.into());
+                    if old_bitmap.is_invalid() {
+                        let _ = DeleteObject(bitmap.into());
+                        return Err("SelectObject for cursor failed".to_string());
+                    }
+
+                    let len = (width as usize)
+                        .saturating_mul(height as usize)
+                        .saturating_mul(4);
+                    std::ptr::write_bytes(bits.cast::<u8>(), 0, len);
+                    DrawIconEx(cursor_dc, 0, 0, cursor.into(), width, height, 0, None, DI_NORMAL)
+                        .map_err(|err| format!("DrawIconEx for cursor failed: {err}"))?;
+
+                    let pixels = std::slice::from_raw_parts(bits as *const u8, len).to_vec();
+                    let _ = SelectObject(cursor_dc, old_bitmap);
+                    let _ = DeleteObject(bitmap.into());
+
+                    Ok(CapturedCursor {
+                        pixels,
+                        x: 0,
+                        y: 0,
+                        hotspot_x: icon_info.xHotspot,
+                        hotspot_y: icon_info.yHotspot,
+                        width: width as u32,
+                        height: height as u32,
+                        shape_serial: cursor.0 as usize as u64,
+                        visible: true,
+                    })
+                })();
+
+                let _ = DeleteDC(cursor_dc);
+                result
+            })();
+
+            if !icon_info.hbmColor.is_invalid() {
+                let _ = DeleteObject(icon_info.hbmColor.into());
+            }
+            if !icon_info.hbmMask.is_invalid() {
+                let _ = DeleteObject(icon_info.hbmMask.into());
+            }
+
+            shape
         }
     }
 
@@ -298,4 +420,33 @@ fn current_virtual_screen_metrics() -> (i32, i32, i32, i32) {
         let height = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
         (origin_x, origin_y, width, height)
     }
+}
+
+fn cursor_bitmap_dimensions(color_bitmap: HBITMAP, mask_bitmap: HBITMAP) -> Result<(i32, i32), String> {
+    let (bitmap, monochrome) = if !color_bitmap.is_invalid() {
+        (color_bitmap, false)
+    } else if !mask_bitmap.is_invalid() {
+        (mask_bitmap, true)
+    } else {
+        return Err("cursor icon has no usable bitmaps".into());
+    };
+
+    let mut info = BITMAP::default();
+    let bytes_written = unsafe {
+        GetObjectW(
+            bitmap.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut info as *mut _ as *mut core::ffi::c_void),
+        )
+    };
+    if bytes_written <= 0 {
+        return Err("GetObjectW failed for cursor bitmap".into());
+    }
+
+    let height = if monochrome {
+        info.bmHeight / 2
+    } else {
+        info.bmHeight
+    };
+    Ok((info.bmWidth, height))
 }

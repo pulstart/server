@@ -45,7 +45,7 @@ fn log_portal_error(method: &str, err: impl std::fmt::Display) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::capture::CapturedCursor;
 
 pub struct InputRuntime {
@@ -57,7 +57,7 @@ fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn resize_rgba_premultiplied_nearest(
     src: &[u8],
     src_width: u16,
@@ -82,7 +82,7 @@ fn resize_rgba_premultiplied_nearest(
     out
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn fit_cursor_shape_to_payload_budget(mut shape: CursorShape) -> (CursorShape, bool) {
     if shape.rgba.len() <= MAX_CURSOR_SHAPE_RGBA_BYTES {
         return (shape, false);
@@ -251,7 +251,7 @@ impl InputRuntime {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn control_active(&self) -> bool {
         self.inner.lock().unwrap().controller_id.is_some()
     }
@@ -323,8 +323,8 @@ impl InputRuntime {
                         mouse_absolute: true,
                         mouse_relative: true,
                         keyboard: true,
-                        separate_cursor: false,
-                        hover_capture: false,
+                        separate_cursor: true,
+                        hover_capture: true,
                     };
                 }
                 Err(err) => {
@@ -361,7 +361,7 @@ impl InputRuntime {
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn update_cursor(&self, cursor: Option<&CapturedCursor>) {
         let mut inner = self.inner.lock().unwrap();
         if !inner.capabilities.separate_cursor {
@@ -1043,7 +1043,7 @@ fn windows_key_scan_code(key: KeyboardKey) -> Option<(u16, bool)> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn bgra_to_rgba_premultiplied(src: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(src.len());
     for chunk in src.chunks_exact(4) {
