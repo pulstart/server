@@ -9,7 +9,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::core::Interface;
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -183,12 +183,11 @@ fn run_dxgi_capture_loop(
     tx: Sender<CapturedFrame>,
     running: Arc<AtomicBool>,
 ) {
-    let mut target_interval = frame_interval();
     let mut last_texture: Option<Weak<D3D11FrameTexture>> = None;
 
     while running.load(Ordering::SeqCst) {
         let frame_started = Instant::now();
-        target_interval = frame_interval();
+        let target_interval = frame_interval();
 
         match session.try_acquire_texture() {
             Ok(Some(texture)) => last_texture = Some(Arc::downgrade(&texture)),
@@ -291,8 +290,8 @@ struct DxgiCaptureSession {
 
 impl DxgiCaptureSession {
     fn new() -> Result<Self, String> {
-        let (_, output, desc) = select_output()?;
-        let (device, context) = create_device_for_output(&output)?;
+        let (adapter, output, desc) = select_output()?;
+        let (device, context) = create_device_for_output(&adapter)?;
         let duplication = unsafe {
             output
                 .DuplicateOutput(&device)
@@ -439,6 +438,10 @@ struct CursorCapture {
     origin_y: i32,
     cursor_cache: Option<CapturedCursor>,
 }
+
+// SAFETY: CursorCapture owns the screen DC and is moved into a single capture
+// thread before use; it is not accessed concurrently across threads.
+unsafe impl Send for CursorCapture {}
 
 impl CursorCapture {
     fn new(origin_x: i32, origin_y: i32) -> Result<Self, String> {
@@ -846,7 +849,7 @@ fn create_device_for_output(
         D3D11CreateDevice(
             adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
-            None,
+            HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             Some(&feature_levels),
             D3D11_SDK_VERSION,
@@ -863,7 +866,7 @@ fn create_device_for_output(
 
     if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
         unsafe {
-            multithread.SetMultithreadProtected(true);
+            let _ = multithread.SetMultithreadProtected(true);
         }
     }
 

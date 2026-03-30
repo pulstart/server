@@ -11,8 +11,6 @@ use crate::transport::EncodedUnit;
 extern crate ffmpeg_next as ffmpeg;
 extern crate ffmpeg_sys_next as ffi;
 
-use ffmpeg::format::Pixel;
-
 use std::ffi::{c_void, CString};
 use std::mem::ManuallyDrop;
 use std::ptr;
@@ -144,7 +142,7 @@ impl WindowsHwEncoder {
 
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
 
-        let device = unsafe {
+        let device: ID3D11Device = unsafe {
             capture_texture
                 .texture
                 .GetDevice()
@@ -152,7 +150,7 @@ impl WindowsHwEncoder {
         };
         if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
             unsafe {
-                multithread.SetMultithreadProtected(true);
+                let _ = multithread.SetMultithreadProtected(true);
             }
         }
         let device_context = unsafe {
@@ -190,7 +188,7 @@ impl WindowsHwEncoder {
         unsafe {
             (*ctx).width = config.width as i32;
             (*ctx).height = config.height as i32;
-            (*ctx).pix_fmt = Pixel::D3D11.into();
+            (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
             (*ctx).time_base = ffi::AVRational {
                 num: 1,
                 den: config.framerate as i32,
@@ -288,7 +286,7 @@ impl WindowsHwEncoder {
                 return Err("av_frame_alloc failed".into());
             }
 
-            (*hw_frame).format = Pixel::D3D11.into() as i32;
+            (*hw_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32;
             (*hw_frame).width = self.width as i32;
             (*hw_frame).height = self.height as i32;
 
@@ -300,7 +298,7 @@ impl WindowsHwEncoder {
 
             let output_texture = borrowed_frame_texture(hw_frame)?;
             let output_array_index = (*hw_frame).data[1] as usize as u32;
-            self.blit_texture(source, source_array_index, output_texture, output_array_index)?;
+            self.blit_texture(source, source_array_index, &output_texture, output_array_index)?;
 
             self.colorspace.apply_to_frame(hw_frame);
             (*hw_frame).pts = self.frame_index;
@@ -545,7 +543,7 @@ fn create_hw_frames_ctx(
 
     let result = unsafe {
         let frames_ctx = (*frames_ref).data as *mut ffi::AVHWFramesContext;
-        (*frames_ctx).format = Pixel::D3D11.into();
+        (*frames_ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
         (*frames_ctx).sw_format = Colorspace::for_dynamic_range(config.dynamic_range).sw_pixel_format();
         (*frames_ctx).width = config.width as i32;
         (*frames_ctx).height = config.height as i32;
@@ -698,11 +696,10 @@ fn create_output_view(
     view.ok_or_else(|| "CreateVideoProcessorOutputView returned null view".into())
 }
 
-unsafe fn borrowed_frame_texture<'a>(
-    frame: *mut ffi::AVFrame,
-) -> Result<&'a ID3D11Texture2D, String> {
+unsafe fn borrowed_frame_texture(frame: *mut ffi::AVFrame) -> Result<ID3D11Texture2D, String> {
     let raw = (*frame).data[0] as *mut c_void;
     ID3D11Texture2D::from_raw_borrowed(&raw)
+        .cloned()
         .ok_or_else(|| "AVFrame D3D11 output texture was null".into())
 }
 

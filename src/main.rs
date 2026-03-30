@@ -1182,7 +1182,7 @@ fn encode_and_broadcast(
                 Err(err) => {
                     eprintln!("[capture] macOS cursor composite lock failed: {err}");
                 }
-            }
+            };
         }
     }
 

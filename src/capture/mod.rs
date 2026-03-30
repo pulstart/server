@@ -6,7 +6,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(target_os = "windows")]
-use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 static TARGET_FPS: AtomicU32 = AtomicU32::new(60);
 

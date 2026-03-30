@@ -163,7 +163,7 @@ impl CursorTracker {
         let cursor = current_system_cursor();
         let serial = cursor
             .as_ref()
-            .map(cursor_shape_serial)
+            .map(|cursor| cursor_shape_serial(cursor))
             .or_else(|| self.cached_shape.as_ref().map(|shape| shape.shape_serial))
             .unwrap_or(0);
         let cached_hotspot = self
