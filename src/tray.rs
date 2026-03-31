@@ -1049,23 +1049,8 @@ fn copy_to_clipboard(text: &str) {
 }
 
 #[cfg(target_os = "linux")]
-fn show_token_input_dialog(current: &str) -> Option<String> {
-    // Try zenity first, then kdialog
-    if let Ok(output) = std::process::Command::new("zenity")
-        .args([
-            "--entry",
-            "--title=Set Server Token",
-            "--text=Enter new authentication token:",
-            &format!("--entry-text={current}"),
-        ])
-        .output()
-    {
-        if output.status.success() {
-            return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
-        }
-        return None;
-    }
-    if let Ok(output) = std::process::Command::new("kdialog")
+fn try_kdialog(current: &str) -> Result<Option<String>, String> {
+    match std::process::Command::new("kdialog")
         .args([
             "--inputbox",
             "Enter new authentication token:",
@@ -1075,10 +1060,65 @@ fn show_token_input_dialog(current: &str) -> Option<String> {
         ])
         .output()
     {
-        if output.status.success() {
-            return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        Ok(output) => {
+            if output.status.success() {
+                Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+            } else {
+                // Non-zero exit (e.g. user cancelled) is not an error
+                Ok(None)
+            }
         }
-        return None;
+        Err(err) => Err(format!("kdialog not available: {err}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_zenity(current: &str) -> Result<Option<String>, String> {
+    match std::process::Command::new("zenity")
+        .args([
+            "--entry",
+            "--title=Set Server Token",
+            "--text=Enter new authentication token:",
+            &format!("--entry-text={current}"),
+        ])
+        .output()
+    {
+        Ok(output) => {
+            if output.status.success() {
+                Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(err) => Err(format!("zenity not available: {err}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn show_token_input_dialog(current: &str) -> Option<String> {
+    // On KDE, prefer kdialog — it handles Wayland activation tokens natively.
+    // zenity (GTK4/libadwaita) can fail to show its window on KDE Plasma Wayland
+    // when launched from a background D-Bus callback (no XDG activation token).
+    let prefer_kde = std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|d| d.contains("KDE"))
+        .unwrap_or(false);
+
+    let (first, second): (
+        fn(&str) -> Result<Option<String>, String>,
+        fn(&str) -> Result<Option<String>, String>,
+    ) = if prefer_kde {
+        (try_kdialog, try_zenity)
+    } else {
+        (try_zenity, try_kdialog)
+    };
+
+    match first(current) {
+        Ok(result) => return result,
+        Err(err) => eprintln!("[tray] {err}"),
+    }
+    match second(current) {
+        Ok(result) => return result,
+        Err(err) => eprintln!("[tray] {err}"),
     }
     eprintln!("[tray] No dialog tool found (tried zenity, kdialog)");
     None
