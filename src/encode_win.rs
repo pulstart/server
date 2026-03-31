@@ -24,10 +24,10 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
     ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
     ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
-    D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_READ, D3D11_MAP_WRITE_DISCARD,
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_SDK_VERSION, D3D11_TEX2D_ARRAY_VPOV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_USAGE_DYNAMIC,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
     D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
@@ -320,11 +320,8 @@ impl WindowsHwEncoder {
             use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
 
             // 1. Copy source texture to staging texture (both on capture GPU)
-            let src_sub = if source_index > 0 {
-                windows::Win32::Graphics::Direct3D11::D3D11CalcSubresource(0, source_index, 1)
-            } else {
-                0
-            };
+            // D3D11CalcSubresource(MipSlice, ArraySlice, MipLevels) = MipSlice + ArraySlice * MipLevels
+            let src_sub = source_index; // mip 0, array=source_index, 1 mip level
             staging.capture_context.CopySubresourceRegion(
                 &staging.staging_texture,
                 0,
@@ -778,8 +775,6 @@ impl WindowsHwEncoder {
 
         let bgra_format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
         let sample_desc = windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
-        let zero_misc = windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(0);
-        let zero_bind = windows::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(0);
 
         // Staging texture on capture device (GPU → CPU read)
         let staging_desc = D3D11_TEXTURE2D_DESC {
@@ -787,9 +782,9 @@ impl WindowsHwEncoder {
             MipLevels: 1, ArraySize: 1,
             Format: bgra_format, SampleDesc: sample_desc,
             Usage: D3D11_USAGE_STAGING,
-            BindFlags: zero_bind,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ,
-            MiscFlags: zero_misc,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
         };
         let staging_texture = unsafe {
             let mut tex = None;
@@ -804,9 +799,9 @@ impl WindowsHwEncoder {
             MipLevels: 1, ArraySize: 1,
             Format: bgra_format, SampleDesc: sample_desc,
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET,
-            CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_FLAG(0),
-            MiscFlags: zero_misc,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
         };
         let upload_texture = unsafe {
             let mut tex = None;
