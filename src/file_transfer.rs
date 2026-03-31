@@ -947,7 +947,7 @@ pub fn set_clipboard_file(path: &Path) {
 #[cfg(target_os = "windows")]
 pub fn set_clipboard_file(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
@@ -994,8 +994,8 @@ pub fn set_clipboard_file(path: &Path) {
             let _ = GlobalUnlock(hmem);
         }
 
-        // GlobalAlloc returns *mut c_void, HANDLE also wraps *mut c_void.
-        let handle = HANDLE(hmem.0);
+        // HGLOBAL(*mut c_void) → HANDLE(*mut c_void) for SetClipboardData.
+        let handle = windows::Win32::Foundation::HANDLE(hmem.0);
         let _ = SetClipboardData(CF_HDROP, Some(handle));
         let _ = CloseClipboard();
     }
