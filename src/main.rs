@@ -241,7 +241,6 @@ fn stream_chroma_name(chroma: VideoChromaSampling) -> &'static str {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn encoder_chroma_name(chroma: encode_config::ChromaSampling) -> &'static str {
     match chroma {
         encode_config::ChromaSampling::Yuv420 => "yuv420",
@@ -597,7 +596,7 @@ fn select_macos_encoder(
     height: u32,
     framerate: u32,
     client_supported_codecs: VideoCodecSupport,
-    client_supported_yuv444_codecs: VideoCodecSupport,
+    _client_supported_yuv444_codecs: VideoCodecSupport,
     control: &ServerControl,
 ) -> Result<(EncoderConfig, encode_vt::VTEncoder), String> {
     let forced_codec = control.forced_codec();

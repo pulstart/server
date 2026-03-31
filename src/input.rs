@@ -28,7 +28,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, WHEEL_DELTA, XBUTTON1, XBUTTON2,
+    SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
 };
 
 const MAX_CURSOR_SHAPE_RGBA_BYTES: usize = u16::MAX as usize - 16;
@@ -775,12 +775,14 @@ fn button_mappings() -> [(u8, u32); 5] {
     ]
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Default)]
 struct WheelAccumulator {
     x_units: i32,
     y_units: i32,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl WheelAccumulator {
     fn push_and_take_steps(&mut self, delta_x: i16, delta_y: i16) -> (i16, i16) {
         (
@@ -790,6 +792,7 @@ impl WheelAccumulator {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wheel_units_to_steps(pending_units: &mut i32, delta_units: i16) -> i16 {
     *pending_units += i32::from(delta_units);
     let step_units = i32::from(MOUSE_WHEEL_STEP_UNITS);

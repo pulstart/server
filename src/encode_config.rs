@@ -146,6 +146,7 @@ impl EncoderConfig {
     }
 
     /// Build config for the given resolution, reading overrides from env vars.
+    #[cfg(target_os = "linux")]
     pub fn from_env(width: u32, height: u32) -> Self {
         Self::from_env_with_framerate_and_codec(
             width,
@@ -155,7 +156,8 @@ impl EncoderConfig {
         )
     }
 
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub fn from_env_with_framerate(width: u32, height: u32, framerate: u32) -> Self {
         Self::from_env_with_framerate_and_codec(
             width,
@@ -277,6 +279,7 @@ impl EncoderConfig {
         next
     }
 
+    #[cfg(target_os = "linux")]
     pub fn with_chroma_sampling(&self, chroma: ChromaSampling) -> Self {
         let mut next = self.clone();
         next.chroma = chroma;
@@ -310,6 +313,7 @@ impl EncoderConfig {
         size.min(i32::MAX as i64) as i32
     }
 
+    #[cfg(target_os = "linux")]
     pub fn ffmpeg_vaapi_codec_name(&self) -> &'static str {
         match self.codec {
             Codec::H264 => "h264_vaapi",
