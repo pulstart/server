@@ -82,7 +82,7 @@ const WINDOWS_TOKEN_DIALOG_OK_ID: usize = 1;
 #[cfg(target_os = "windows")]
 const WINDOWS_TOKEN_DIALOG_CANCEL_ID: usize = 2;
 #[cfg(target_os = "windows")]
-const WINDOWS_TOKEN_DIALOG_EDIT_ID: isize = 100;
+const WINDOWS_TOKEN_DIALOG_EDIT_ID: usize = 100;
 #[cfg(target_os = "windows")]
 static WINDOWS_TOKEN_DIALOG_CLASS: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -1285,6 +1285,11 @@ fn wide_null(value: &str) -> Vec<u16> {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_dialog_control_id(id: usize) -> HMENU {
+    HMENU(id as *mut std::ffi::c_void)
+}
+
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn windows_token_dialog_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -1370,7 +1375,7 @@ unsafe fn create_windows_token_dialog_controls(hwnd: HWND) -> Result<(), String>
         396,
         24,
         Some(hwnd),
-        Some(HMENU(WINDOWS_TOKEN_DIALOG_EDIT_ID)),
+        Some(windows_dialog_control_id(WINDOWS_TOKEN_DIALOG_EDIT_ID)),
         None,
         None,
     )
@@ -1388,7 +1393,7 @@ unsafe fn create_windows_token_dialog_controls(hwnd: HWND) -> Result<(), String>
         75,
         26,
         Some(hwnd),
-        Some(HMENU(WINDOWS_TOKEN_DIALOG_OK_ID as isize)),
+        Some(windows_dialog_control_id(WINDOWS_TOKEN_DIALOG_OK_ID)),
         None,
         None,
     )
@@ -1406,7 +1411,7 @@ unsafe fn create_windows_token_dialog_controls(hwnd: HWND) -> Result<(), String>
         75,
         26,
         Some(hwnd),
-        Some(HMENU(WINDOWS_TOKEN_DIALOG_CANCEL_ID as isize)),
+        Some(windows_dialog_control_id(WINDOWS_TOKEN_DIALOG_CANCEL_ID)),
         None,
         None,
     )
