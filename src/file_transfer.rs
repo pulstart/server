@@ -947,7 +947,6 @@ pub fn set_clipboard_file(path: &Path) {
 #[cfg(target_os = "windows")]
 pub fn set_clipboard_file(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
@@ -964,7 +963,7 @@ pub fn set_clipboard_file(path: &Path) {
     let data_size = header_size as usize + (wide_path.len() + 2) * 2; // path + null + final null
 
     unsafe {
-        if OpenClipboard(HWND::default()).is_err() {
+        if OpenClipboard(None).is_err() {
             return;
         }
         let _ = EmptyClipboard();

@@ -328,7 +328,6 @@ end try"#;
 
 #[cfg(target_os = "windows")]
 fn detect_clipboard_files() -> Vec<PathBuf> {
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard,
     };
@@ -340,7 +339,7 @@ fn detect_clipboard_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     unsafe {
-        if OpenClipboard(HWND::default()).is_err() {
+        if OpenClipboard(None).is_err() {
             return files;
         }
 
