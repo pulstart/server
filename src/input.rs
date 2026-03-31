@@ -4,6 +4,7 @@ use st_protocol::{
     MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
     MOUSE_WHEEL_STEP_UNITS,
 };
+use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use crate::capture::linux::{active_remote_desktop_session, RemoteDesktopPortalSession};
 #[cfg(target_os = "linux")]
@@ -134,8 +135,7 @@ struct InputRuntimeInner {
     backend_label: String,
     capabilities: InputCapabilities,
     controller_id: Option<u32>,
-    last_input_seq_client_id: Option<u32>,
-    last_input_seq: Option<u16>,
+    last_input_seq_by_client: BTreeMap<u32, u16>,
     button_mask: u8,
     keyboard_state: [u8; KEYBOARD_STATE_BYTES],
     cursor_shape: Option<CursorShape>,
@@ -178,8 +178,7 @@ impl InputRuntime {
                 backend_label: "unavailable".to_string(),
                 capabilities: InputCapabilities::default(),
                 controller_id: None,
-                last_input_seq_client_id: None,
-                last_input_seq: None,
+                last_input_seq_by_client: BTreeMap::new(),
                 button_mask: 0,
                 keyboard_state: [0u8; KEYBOARD_STATE_BYTES],
                 cursor_shape: None,
@@ -261,6 +260,7 @@ impl InputRuntime {
         let mut inner = self.inner.lock().unwrap();
         inner.release_all_inputs();
         inner.controller_id = None;
+        inner.last_input_seq_by_client.clear();
         inner.button_mask = 0;
         inner.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
         inner.cursor_shape = None;
@@ -354,6 +354,7 @@ impl InputRuntime {
         inner.backend_label = "unavailable".to_string();
         inner.capabilities = InputCapabilities::default();
         inner.controller_id = None;
+        inner.last_input_seq_by_client.clear();
         inner.button_mask = 0;
         inner.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
         inner.cursor_shape = None;
@@ -481,11 +482,11 @@ impl InputRuntime {
 
     pub fn cursor_messages(
         &self,
-        client_id: u32,
+        _client_id: u32,
         versions: &mut CursorVersionCursor,
     ) -> Vec<ControlMessage> {
         let inner = self.inner.lock().unwrap();
-        if inner.controller_id != Some(client_id) {
+        if inner.controller_id.is_none() {
             return Vec::new();
         }
 
@@ -574,12 +575,13 @@ impl InputRuntime {
             InputPacket::MouseWheel(packet) => packet.client_id,
             InputPacket::KeyboardState(packet) => packet.client_id,
         };
-        if inner.controller_id != Some(client_id) {
+        if matches!(inner.backend, InputBackend::Unavailable) {
             return;
         }
         if !inner.accept_input_seq(client_id, seq) {
             return;
         }
+        inner.activate_controller(client_id);
 
         match packet {
             InputPacket::MouseAbsolute(packet) => {
@@ -606,17 +608,24 @@ impl InputRuntime {
 
 impl InputRuntimeInner {
     fn accept_input_seq(&mut self, client_id: u32, seq: u16) -> bool {
-        if self.last_input_seq_client_id == Some(client_id) {
-            if let Some(last_seq) = self.last_input_seq {
-                if !input_seq_is_newer(seq, last_seq) {
-                    return false;
-                }
+        if let Some(last_seq) = self.last_input_seq_by_client.get(&client_id).copied() {
+            if !input_seq_is_newer(seq, last_seq) {
+                return false;
             }
         }
 
-        self.last_input_seq_client_id = Some(client_id);
-        self.last_input_seq = Some(seq);
+        self.last_input_seq_by_client.insert(client_id, seq);
         true
+    }
+
+    fn activate_controller(&mut self, client_id: u32) {
+        if self.controller_id == Some(client_id) {
+            return;
+        }
+        self.release_all_inputs();
+        self.controller_id = Some(client_id);
+        self.button_mask = 0;
+        self.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
     }
 
     fn release_all_inputs(&mut self) {

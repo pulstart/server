@@ -2092,9 +2092,21 @@ async fn handle_client(
     let mut buf = [0u8; 64];
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
+    let mut last_controller_state = controller_state;
     loop {
         if registered_client.disconnect_requested() {
             break;
+        }
+        let controller_state = state.input.controller_state_for(client_id);
+        if controller_state != last_controller_state {
+            if stream
+                .write_all(&ControlMessage::ControllerState(controller_state).serialize())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            last_controller_state = controller_state;
         }
         let mut clipboard_write_failed = false;
         while let Ok(message) = clipboard_control_rx.try_recv() {
@@ -2166,16 +2178,16 @@ async fn handle_client(
                             let _ = stream.write_all(&pong.serialize()).await;
                         }
                         ControlMessage::AcquireControl => {
-                            let state_msg = ControlMessage::ControllerState(
-                                state.input.acquire_control(client_id),
-                            );
+                            let next_state = state.input.acquire_control(client_id);
+                            let state_msg = ControlMessage::ControllerState(next_state);
                             cursor_versions = CursorVersionCursor::default();
+                            last_controller_state = next_state;
                             let _ = stream.write_all(&state_msg.serialize()).await;
                         }
                         ControlMessage::ReleaseControl => {
-                            let state_msg = ControlMessage::ControllerState(
-                                state.input.release_control(client_id),
-                            );
+                            let next_state = state.input.release_control(client_id);
+                            let state_msg = ControlMessage::ControllerState(next_state);
+                            last_controller_state = next_state;
                             let _ = stream.write_all(&state_msg.serialize()).await;
                         }
                         ControlMessage::RequestKeyframe => {
@@ -2749,6 +2761,7 @@ fn handle_punched_client(
     let mut bitrate_controller = ClientRateController::from_state(rate_control.as_ref());
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
+    let mut last_controller_state = controller_state;
     let _ = punched.set_nonblocking(false);
     let _ = punched.set_read_timeout(Some(Duration::from_millis(50)));
 
@@ -2757,6 +2770,11 @@ fn handle_punched_client(
             break;
         }
         punched.tick();
+        let controller_state = state.input.controller_state_for(client_id);
+        if controller_state != last_controller_state {
+            let _ = punched.send_control(&ControlMessage::ControllerState(controller_state).serialize());
+            last_controller_state = controller_state;
+        }
         while let Ok(message) = clipboard_control_rx.try_recv() {
             let _ = punched.send_control(&message.serialize());
         }
@@ -2783,16 +2801,16 @@ fn handle_punched_client(
                             }
                         }
                         ControlMessage::AcquireControl => {
-                            let state_msg = ControlMessage::ControllerState(
-                                state.input.acquire_control(client_id),
-                            );
+                            let next_state = state.input.acquire_control(client_id);
+                            let state_msg = ControlMessage::ControllerState(next_state);
                             cursor_versions = CursorVersionCursor::default();
+                            last_controller_state = next_state;
                             let _ = punched.send_control(&state_msg.serialize());
                         }
                         ControlMessage::ReleaseControl => {
-                            let state_msg = ControlMessage::ControllerState(
-                                state.input.release_control(client_id),
-                            );
+                            let next_state = state.input.release_control(client_id);
+                            let state_msg = ControlMessage::ControllerState(next_state);
+                            last_controller_state = next_state;
                             let _ = punched.send_control(&state_msg.serialize());
                         }
                         ControlMessage::RequestKeyframe => {

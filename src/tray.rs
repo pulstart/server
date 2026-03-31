@@ -766,10 +766,17 @@ impl TrayApp {
             } else if id == INSTALL_UPDATE_ID {
                 self.control.begin_update_install();
             } else if id == COPY_TOKEN_ID {
-                copy_to_clipboard(&self.control.token());
+                let token = self.control.token();
+                std::thread::spawn(move || {
+                    #[cfg(target_os = "windows")]
+                    std::thread::sleep(Duration::from_millis(120));
+                    copy_to_clipboard(&token);
+                });
             } else if id == SET_TOKEN_ID {
                 let control = Arc::clone(&self.control);
                 std::thread::spawn(move || {
+                    #[cfg(target_os = "windows")]
+                    std::thread::sleep(Duration::from_millis(120));
                     if let Some(new_token) = show_desktop_token_input_dialog(&control.token()) {
                         if !new_token.is_empty() {
                             control.set_token(new_token);
@@ -974,13 +981,32 @@ fn connected_since_label(client: &ConnectedClientSnapshot) -> String {
 }
 
 fn copy_to_clipboard(text: &str) {
-    match arboard::Clipboard::new() {
-        Ok(mut clipboard) => {
-            if let Err(err) = clipboard.set_text(text) {
-                eprintln!("[tray] Failed to copy to clipboard: {err}");
+    #[cfg(target_os = "windows")]
+    const ATTEMPTS: usize = 8;
+    #[cfg(not(target_os = "windows"))]
+    const ATTEMPTS: usize = 1;
+
+    for attempt in 0..ATTEMPTS {
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.set_text(text) {
+                Ok(()) => return,
+                Err(err) => {
+                    if attempt + 1 == ATTEMPTS {
+                        eprintln!("[tray] Failed to copy to clipboard: {err}");
+                        return;
+                    }
+                }
+            },
+            Err(err) => {
+                if attempt + 1 == ATTEMPTS {
+                    eprintln!("[tray] Failed to open clipboard: {err}");
+                    return;
+                }
             }
         }
-        Err(err) => eprintln!("[tray] Failed to open clipboard: {err}"),
+
+        #[cfg(target_os = "windows")]
+        std::thread::sleep(Duration::from_millis(40));
     }
 }
 
@@ -1059,20 +1085,71 @@ fn show_macos_token_input_dialog(current: &str) -> Option<String> {
 fn show_windows_token_input_dialog(current: &str) -> Option<String> {
     let escaped = current.replace('\'', "''");
     let script = format!(
-        "Add-Type -AssemblyName Microsoft.VisualBasic; \
-         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-         $v = [Microsoft.VisualBasic.Interaction]::InputBox('Enter new authentication token:', 'Set Server Token', '{escaped}'); \
-         if ($v -ne $null) {{ [Console]::Write($v) }}"
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+         Add-Type -AssemblyName System.Windows.Forms; \
+         Add-Type -AssemblyName System.Drawing; \
+         [System.Windows.Forms.Application]::EnableVisualStyles(); \
+         $form = New-Object System.Windows.Forms.Form; \
+         $form.Text = 'Set Server Token'; \
+         $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen; \
+         $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog; \
+         $form.ClientSize = New-Object System.Drawing.Size(420, 132); \
+         $form.MaximizeBox = $false; \
+         $form.MinimizeBox = $false; \
+         $form.ShowInTaskbar = $false; \
+         $form.TopMost = $true; \
+         $form.Font = New-Object System.Drawing.Font('Segoe UI', 9); \
+         $label = New-Object System.Windows.Forms.Label; \
+         $label.AutoSize = $true; \
+         $label.Location = New-Object System.Drawing.Point(12, 14); \
+         $label.Text = 'Enter new authentication token:'; \
+         $form.Controls.Add($label); \
+         $textBox = New-Object System.Windows.Forms.TextBox; \
+         $textBox.Location = New-Object System.Drawing.Point(12, 40); \
+         $textBox.Size = New-Object System.Drawing.Size(396, 24); \
+         $textBox.Text = '{escaped}'; \
+         $form.Controls.Add($textBox); \
+         $okButton = New-Object System.Windows.Forms.Button; \
+         $okButton.Text = 'OK'; \
+         $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK; \
+         $okButton.Location = New-Object System.Drawing.Point(252, 88); \
+         $okButton.Size = New-Object System.Drawing.Size(75, 26); \
+         $okButton.UseVisualStyleBackColor = $true; \
+         $form.Controls.Add($okButton); \
+         $cancelButton = New-Object System.Windows.Forms.Button; \
+         $cancelButton.Text = 'Cancel'; \
+         $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; \
+         $cancelButton.Location = New-Object System.Drawing.Point(333, 88); \
+         $cancelButton.Size = New-Object System.Drawing.Size(75, 26); \
+         $cancelButton.UseVisualStyleBackColor = $true; \
+         $form.Controls.Add($cancelButton); \
+         $form.AcceptButton = $okButton; \
+         $form.CancelButton = $cancelButton; \
+         $form.Add_Shown({ $form.Activate(); $textBox.SelectAll(); $textBox.Focus(); }); \
+         if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Write($textBox.Text) }}"
     );
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-STA", "-Command", &script])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
+    for program in ["powershell.exe", "powershell"] {
+        match std::process::Command::new(program)
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-STA", "-Command", &script])
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!(
+                    "[tray] Windows token dialog via {program} failed: {} {}",
+                    output.status,
+                    stderr.trim()
+                );
+            }
+            Err(err) => {
+                eprintln!("[tray] Failed to launch {program} for token dialog: {err}");
+            }
+        }
     }
+    None
 }
 
 /// Flat 2D monitor icon with status dot.
