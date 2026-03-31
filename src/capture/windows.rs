@@ -815,12 +815,11 @@ fn select_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC), St
             let output1 = output
                 .cast::<IDXGIOutput1>()
                 .map_err(|err| format!("IDXGIOutput->IDXGIOutput1 cast failed: {err}"))?;
-            let mut desc = DXGI_OUTPUT_DESC::default();
-            unsafe {
+            let desc = unsafe {
                 output
-                    .GetDesc(&mut desc)
-                    .map_err(|err| format!("IDXGIOutput::GetDesc failed: {err}"))?;
-            }
+                    .GetDesc()
+                    .map_err(|err| format!("IDXGIOutput::GetDesc failed: {err}"))?
+            };
             if !desc.AttachedToDesktop.as_bool() {
                 continue;
             }
