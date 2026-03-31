@@ -18,7 +18,7 @@ use ksni::menu::{
 use std::time::Instant;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::menu::{
-    CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder,
+    CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder,
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::{Icon as DesktopTrayIcon, TrayIcon, TrayIconBuilder};
@@ -555,11 +555,10 @@ impl TrayApp {
         video_submenu.append(&bitrate_submenu).map_err(|err| format!("Failed to append bitrate submenu: {err}"))?;
         video_submenu.append(&quality_submenu).map_err(|err| format!("Failed to append quality submenu: {err}"))?;
 
-        let root_menu = SubmenuBuilder::new()
-            .text("st-server")
-            .enabled(true)
-            .build()
-            .map_err(|err| format!("Failed to build tray menu: {err}"))?;
+        // Use a real root menu for the tray popup. On Windows, attaching a
+        // Submenu as the tray context menu goes through muda's submenu
+        // subclass path, which is crash-prone when the popup activates.
+        let root_menu = Menu::new();
         root_menu
             .append(&version_item)
             .map_err(|err| format!("Failed to append tray version item: {err}"))?;

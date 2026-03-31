@@ -18,6 +18,7 @@ use pipewire as pw;
 use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
 use pw::spa::pod::{ChoiceValue, Pod, Property, PropertyFlags, Value};
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes};
+use st_protocol::MOUSE_WHEEL_STEP_UNITS;
 
 const PIPEWIRE_CURSOR_META_SIZE: i32 = (std::mem::size_of::<pw::spa::sys::spa_meta_cursor>()
     + std::mem::size_of::<pw::spa::sys::spa_meta_bitmap>()
@@ -705,6 +706,7 @@ pub(crate) struct RemoteDesktopPortalSession {
     logical_width: Mutex<f64>,
     logical_height: Mutex<f64>,
     tracked_pos: Mutex<Option<(f64, f64)>>,
+    pending_scroll_units: Mutex<(i32, i32)>,
 }
 
 impl RemoteDesktopPortalSession {
@@ -721,6 +723,7 @@ impl RemoteDesktopPortalSession {
             logical_width: Mutex::new(stream_info.logical_width),
             logical_height: Mutex::new(stream_info.logical_height),
             tracked_pos: Mutex::new(None),
+            pending_scroll_units: Mutex::new((0, 0)),
         }
     }
 
@@ -936,6 +939,30 @@ impl RemoteDesktopPortalSession {
                 Ok(())
             })
         })
+    }
+
+    pub(crate) fn notify_pointer_axis_units(
+        &self,
+        delta_x: i16,
+        delta_y: i16,
+    ) -> Result<(), String> {
+        let (step_x, step_y) = {
+            let mut pending = self.pending_scroll_units.lock().unwrap();
+            pending.0 += i32::from(delta_x);
+            pending.1 += i32::from(delta_y);
+            let step_units = i32::from(MOUSE_WHEEL_STEP_UNITS);
+            let step_x = (pending.0 / step_units)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let step_y = (pending.1 / step_units)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            pending.0 -= i32::from(step_x) * step_units;
+            pending.1 -= i32::from(step_y) * step_units;
+            (step_x, step_y)
+        };
+        if step_x == 0 && step_y == 0 {
+            return Ok(());
+        }
+        self.notify_pointer_axis_discrete(step_x, step_y)
     }
 
     pub(crate) fn notify_keyboard_keycode(

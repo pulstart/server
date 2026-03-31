@@ -2,6 +2,7 @@ use st_protocol::{
     ControlMessage, ControllerState, CursorShape, CursorState, InputCapabilities, InputPacket,
     KeyboardKey, KEYBOARD_STATE_BYTES, MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2,
     MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
+    MOUSE_WHEEL_STEP_UNITS,
 };
 #[cfg(target_os = "linux")]
 use crate::capture::linux::{active_remote_desktop_session, RemoteDesktopPortalSession};
@@ -712,8 +713,8 @@ impl InputRuntimeInner {
             InputBackend::Uinput(controller) => controller.scroll(delta_x, delta_y),
             #[cfg(target_os = "linux")]
             InputBackend::PortalRemoteDesktop(controller) => {
-                if let Err(e) = controller.notify_pointer_axis_discrete(delta_x, delta_y) {
-                    log_portal_error("notify_pointer_axis_discrete", e);
+                if let Err(e) = controller.notify_pointer_axis_units(delta_x, delta_y) {
+                    log_portal_error("notify_pointer_axis_units", e);
                 }
             }
             #[cfg(target_os = "windows")]
@@ -772,6 +773,30 @@ fn button_mappings() -> [(u8, u32); 5] {
         (MOUSE_BUTTON_EXTRA1, 8),
         (MOUSE_BUTTON_EXTRA2, 9),
     ]
+}
+
+#[derive(Default)]
+struct WheelAccumulator {
+    x_units: i32,
+    y_units: i32,
+}
+
+impl WheelAccumulator {
+    fn push_and_take_steps(&mut self, delta_x: i16, delta_y: i16) -> (i16, i16) {
+        (
+            wheel_units_to_steps(&mut self.x_units, delta_x),
+            wheel_units_to_steps(&mut self.y_units, delta_y),
+        )
+    }
+}
+
+fn wheel_units_to_steps(pending_units: &mut i32, delta_units: i16) -> i16 {
+    *pending_units += i32::from(delta_units);
+    let step_units = i32::from(MOUSE_WHEEL_STEP_UNITS);
+    let steps = (*pending_units / step_units)
+        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    *pending_units -= i32::from(steps) * step_units;
+    steps
 }
 
 #[cfg(target_os = "windows")]
@@ -871,7 +896,7 @@ impl WindowsInputController {
             self.send_mouse(MOUSEINPUT {
                 dx: 0,
                 dy: 0,
-                mouseData: (delta_y as i32 * WHEEL_DELTA as i32) as u32,
+                mouseData: delta_y as i32 as u32,
                 dwFlags: MOUSEEVENTF_WHEEL,
                 time: 0,
                 dwExtraInfo: 0,
@@ -881,7 +906,7 @@ impl WindowsInputController {
             self.send_mouse(MOUSEINPUT {
                 dx: 0,
                 dy: 0,
-                mouseData: (delta_x as i32 * WHEEL_DELTA as i32) as u32,
+                mouseData: delta_x as i32 as u32,
                 dwFlags: MOUSEEVENTF_HWHEEL,
                 time: 0,
                 dwExtraInfo: 0,
@@ -1211,6 +1236,10 @@ const REL_HWHEEL: u16 = 0x06;
 #[cfg(target_os = "linux")]
 const REL_WHEEL: u16 = 0x08;
 #[cfg(target_os = "linux")]
+const REL_WHEEL_HI_RES: u16 = 0x0b;
+#[cfg(target_os = "linux")]
+const REL_HWHEEL_HI_RES: u16 = 0x0c;
+#[cfg(target_os = "linux")]
 const KEY_ESC: u16 = 1;
 #[cfg(target_os = "linux")]
 const KEY_1: u16 = 2;
@@ -1417,6 +1446,7 @@ nix::ioctl_none!(ui_dev_destroy, b'U', 2);
 #[cfg(target_os = "linux")]
 struct UinputMouseController {
     file: File,
+    wheel_accumulator: WheelAccumulator,
 }
 
 #[cfg(target_os = "linux")]
@@ -1454,6 +1484,10 @@ impl UinputMouseController {
             ui_set_relbit(fd, REL_Y as _).map_err(|e| format!("UI_SET_RELBIT y: {e}"))?;
             ui_set_relbit(fd, REL_WHEEL as _).map_err(|e| format!("UI_SET_RELBIT wheel: {e}"))?;
             ui_set_relbit(fd, REL_HWHEEL as _).map_err(|e| format!("UI_SET_RELBIT hwheel: {e}"))?;
+            ui_set_relbit(fd, REL_WHEEL_HI_RES as _)
+                .map_err(|e| format!("UI_SET_RELBIT wheel hi-res: {e}"))?;
+            ui_set_relbit(fd, REL_HWHEEL_HI_RES as _)
+                .map_err(|e| format!("UI_SET_RELBIT hwheel hi-res: {e}"))?;
         }
 
         let mut setup = UinputSetup {
@@ -1475,7 +1509,10 @@ impl UinputMouseController {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            wheel_accumulator: WheelAccumulator::default(),
+        })
     }
 
     fn move_absolute(&mut self, _x: u16, _y: u16) {}
@@ -1499,13 +1536,27 @@ impl UinputMouseController {
     }
 
     fn scroll(&mut self, delta_x: i16, delta_y: i16) {
+        let mut emitted = false;
         if delta_y != 0 {
-            let _ = self.emit(EV_REL, REL_WHEEL, delta_y as i32);
+            let _ = self.emit(EV_REL, REL_WHEEL_HI_RES, delta_y as i32);
+            emitted = true;
         }
         if delta_x != 0 {
-            let _ = self.emit(EV_REL, REL_HWHEEL, delta_x as i32);
+            let _ = self.emit(EV_REL, REL_HWHEEL_HI_RES, delta_x as i32);
+            emitted = true;
         }
-        let _ = self.sync();
+        let (step_x, step_y) = self.wheel_accumulator.push_and_take_steps(delta_x, delta_y);
+        if step_y != 0 {
+            let _ = self.emit(EV_REL, REL_WHEEL, step_y as i32);
+            emitted = true;
+        }
+        if step_x != 0 {
+            let _ = self.emit(EV_REL, REL_HWHEEL, step_x as i32);
+            emitted = true;
+        }
+        if emitted {
+            let _ = self.sync();
+        }
     }
 
     fn key(&mut self, key: KeyboardKey, pressed: bool) {
@@ -1809,6 +1860,7 @@ struct MacosMouseController {
     height: f64,
     current_pos: CGPoint,
     button_mask: u8,
+    wheel_accumulator: WheelAccumulator,
 }
 
 #[cfg(target_os = "macos")]
@@ -1840,6 +1892,7 @@ impl MacosMouseController {
             height,
             current_pos,
             button_mask: 0,
+            wheel_accumulator: WheelAccumulator::default(),
         })
     }
 
@@ -1866,13 +1919,17 @@ impl MacosMouseController {
     }
 
     fn scroll(&mut self, delta_x: i16, delta_y: i16) {
+        let (step_x, step_y) = self.wheel_accumulator.push_and_take_steps(delta_x, delta_y);
+        if step_x == 0 && step_y == 0 {
+            return;
+        }
         let event = unsafe {
             CGEventCreateScrollWheelEvent(
                 std::ptr::null_mut(),
                 KCG_SCROLL_EVENT_UNIT_LINE,
                 2,
-                delta_y as i32,
-                delta_x as i32,
+                step_y as i32,
+                step_x as i32,
             )
         };
         if !event.is_null() {
@@ -2164,6 +2221,7 @@ struct X11InputController {
     height: i32,
     tracked_x: i32,
     tracked_y: i32,
+    wheel_accumulator: WheelAccumulator,
 }
 
 #[cfg(target_os = "linux")]
@@ -2224,6 +2282,7 @@ impl X11InputController {
             height,
             tracked_x,
             tracked_y,
+            wheel_accumulator: WheelAccumulator::default(),
         })
     }
 
@@ -2261,8 +2320,9 @@ impl X11InputController {
     }
 
     fn scroll(&mut self, delta_x: i16, delta_y: i16) {
-        self.scroll_axis(delta_y, 4, 5);
-        self.scroll_axis(delta_x, 6, 7);
+        let (step_x, step_y) = self.wheel_accumulator.push_and_take_steps(delta_x, delta_y);
+        self.scroll_axis(step_y, 4, 5);
+        self.scroll_axis(step_x, 6, 7);
     }
 
     fn key(&mut self, key: KeyboardKey, pressed: bool) {
