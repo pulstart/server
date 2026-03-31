@@ -6,6 +6,7 @@ mod api_client;
 mod audio;
 mod broadcast;
 mod capture;
+mod clipboard;
 mod colorspace;
 #[cfg(target_os = "linux")]
 mod encode;
@@ -37,8 +38,8 @@ use transport::{EncodedVideoFrame, UdpSender};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use st_protocol::{
-    ClientDisplayInfo, ClockSyncPong, ControlMessage, InputSession, SessionDebugInfo, StreamConfig,
-    VideoChromaSampling, VideoCodec, VideoCodecSupport,
+    ClientDisplayInfo, ClockSyncPong, ControlMessage, ControllerState, InputSession,
+    SessionDebugInfo, StreamConfig, VideoChromaSampling, VideoCodec, VideoCodecSupport,
 };
 use std::net::SocketAddr;
 use std::sync::{
@@ -2076,6 +2077,16 @@ async fn handle_client(
     }
 
     println!("[pipeline] Client {addr} subscribed (transport started)");
+    let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
+    let mut clipboard_sync = clipboard::ClipboardSync::start(
+        "server",
+        false,
+        {
+            let input = Arc::clone(&state.input);
+            move || input.controller_state_for(client_id) == ControllerState::OwnedByYou
+        },
+        clipboard_control_tx,
+    );
 
     // Hold TCP open — read control messages from client
     let mut buf = [0u8; 64];
@@ -2083,6 +2094,16 @@ async fn handle_client(
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     loop {
         if registered_client.disconnect_requested() {
+            break;
+        }
+        let mut clipboard_write_failed = false;
+        while let Ok(message) = clipboard_control_rx.try_recv() {
+            if stream.write_all(&message.serialize()).await.is_err() {
+                clipboard_write_failed = true;
+                break;
+            }
+        }
+        if clipboard_write_failed {
             break;
         }
         let mut cursor_write_failed = false;
@@ -2160,6 +2181,13 @@ async fn handle_client(
                         ControlMessage::RequestKeyframe => {
                             sub.video_bc.request_keyframe();
                         }
+                        ControlMessage::ClipboardText(text) => {
+                            if state.input.controller_state_for(client_id)
+                                == ControllerState::OwnedByYou
+                            {
+                                clipboard_sync.set_remote_text(text);
+                            }
+                        }
                         ControlMessage::ClientDisplayInfo(_)
                         | ControlMessage::ClientReadyForMedia
                         | ControlMessage::InputSession(_)
@@ -2178,6 +2206,7 @@ async fn handle_client(
     }
 
     println!("Client {addr} disconnected.");
+    clipboard_sync.stop();
     transport_running.store(false, Ordering::SeqCst);
     rate_control.unregister_client(sub.vid_sub_id);
     let _ = state.input.release_control(client_id);
@@ -2705,6 +2734,16 @@ fn handle_punched_client(
 
     let _ = punched.send_control(&ControlMessage::StreamStarted.serialize());
     println!("[punched] Client {peer} subscribed (transport started)");
+    let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
+    let mut clipboard_sync = clipboard::ClipboardSync::start(
+        "server-punched",
+        false,
+        {
+            let input = Arc::clone(&state.input);
+            move || input.controller_state_for(client_id) == ControllerState::OwnedByYou
+        },
+        clipboard_control_tx,
+    );
 
     // --- Control loop: read from punched socket ---
     let mut bitrate_controller = ClientRateController::from_state(rate_control.as_ref());
@@ -2718,6 +2757,9 @@ fn handle_punched_client(
             break;
         }
         punched.tick();
+        while let Ok(message) = clipboard_control_rx.try_recv() {
+            let _ = punched.send_control(&message.serialize());
+        }
 
         // Read from punched socket.
         match punched.try_recv() {
@@ -2756,6 +2798,13 @@ fn handle_punched_client(
                         ControlMessage::RequestKeyframe => {
                             sub.video_bc.request_keyframe();
                         }
+                        ControlMessage::ClipboardText(text) => {
+                            if state.input.controller_state_for(client_id)
+                                == ControllerState::OwnedByYou
+                            {
+                                clipboard_sync.set_remote_text(text);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -2777,6 +2826,7 @@ fn handle_punched_client(
     }
 
     // Cleanup.
+    clipboard_sync.stop();
     transport_running.store(false, Ordering::SeqCst);
     let _ = transport_handle.join();
     rate_control.unregister_client(sub.vid_sub_id);
