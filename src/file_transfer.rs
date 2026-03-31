@@ -994,8 +994,8 @@ pub fn set_clipboard_file(path: &Path) {
             let _ = GlobalUnlock(hmem);
         }
 
-        // HGLOBAL is a *mut c_void; HANDLE wraps isize — convert via raw pointer.
-        let handle = HANDLE(hmem.0 as *mut _ as isize);
+        // GlobalAlloc returns *mut c_void, HANDLE also wraps *mut c_void.
+        let handle = HANDLE(hmem.0);
         let _ = SetClipboardData(CF_HDROP, Some(handle));
         let _ = CloseClipboard();
     }

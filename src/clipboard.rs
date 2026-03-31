@@ -328,10 +328,11 @@ end try"#;
 
 #[cfg(target_os = "windows")]
 fn detect_clipboard_files() -> Vec<PathBuf> {
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard,
     };
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock, HGLOBAL};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows::Win32::UI::Shell::DragQueryFileW;
 
     const CF_HDROP: u32 = 15;
@@ -344,8 +345,8 @@ fn detect_clipboard_files() -> Vec<PathBuf> {
 
         let handle = GetClipboardData(CF_HDROP);
         if let Ok(handle) = handle {
-            let hglobal = HGLOBAL(handle.0 as *mut _);
-            let ptr = GlobalLock(hglobal);
+            // HANDLE and the old HGLOBAL are both *mut c_void in windows 0.61
+            let ptr = GlobalLock(handle.0);
             if !ptr.is_null() {
                 let hdrop = windows::Win32::UI::Shell::HDROP(ptr as _);
                 let count = DragQueryFileW(hdrop, 0xFFFFFFFF, None);
@@ -356,7 +357,7 @@ fn detect_clipboard_files() -> Vec<PathBuf> {
                     let path = String::from_utf16_lossy(&buf[..len]);
                     files.push(PathBuf::from(path));
                 }
-                let _ = GlobalUnlock(hglobal);
+                let _ = GlobalUnlock(handle.0);
             }
         }
 
