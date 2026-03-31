@@ -56,7 +56,7 @@ impl ClipboardSync {
         outbound_tx: Sender<ControlMessage>,
     ) -> Self
     where
-        F: Fn() -> bool + Send + Sync + 'static,
+        F: Fn() -> bool + Send + 'static,
     {
         Self::start_inner(label, send_initial_snapshot_on_activate, is_active, outbound_tx, None, None)
     }
@@ -70,7 +70,7 @@ impl ClipboardSync {
         suppressed: SuppressedPaths,
     ) -> Self
     where
-        F: Fn() -> bool + Send + Sync + 'static,
+        F: Fn() -> bool + Send + 'static,
     {
         Self::start_inner(
             label,
@@ -91,31 +91,25 @@ impl ClipboardSync {
         suppressed: Option<SuppressedPaths>,
     ) -> Self
     where
-        F: Fn() -> bool + Send + Sync + 'static,
+        F: Fn() -> bool + Send + 'static,
     {
         let (remote_tx, remote_rx) = crossbeam_channel::bounded::<String>(REMOTE_CHANNEL_BOUND);
         let stop = Arc::new(AtomicBool::new(false));
-        let is_active: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(is_active);
 
         let stop_flag = Arc::clone(&stop);
-        let is_active_text = Arc::clone(&is_active);
         let thread = thread::spawn(move || {
-            run_clipboard_loop(
-                label,
-                send_initial_snapshot_on_activate,
-                move || is_active_text(),
-                outbound_tx,
-                remote_rx,
-                stop_flag,
-            );
+            // is_active / send_initial_snapshot_on_activate are unused now — clipboard
+            // text sync is always active while connected. Keep the params in the public
+            // API for backward compat but drop them here.
+            let _ = (is_active, send_initial_snapshot_on_activate);
+            run_clipboard_loop(label, outbound_tx, remote_rx, stop_flag);
         });
 
         let file_thread = file_tx.map(|tx| {
             let stop_flag = Arc::clone(&stop);
             let suppressed = suppressed.unwrap_or_else(new_suppressed_paths);
-            let is_active_file = Arc::clone(&is_active);
             thread::spawn(move || {
-                run_file_clipboard_loop(tx, stop_flag, suppressed, move || is_active_file());
+                run_file_clipboard_loop(tx, stop_flag, suppressed);
             })
         });
 
@@ -148,22 +142,17 @@ impl Drop for ClipboardSync {
     }
 }
 
-fn run_clipboard_loop<F>(
+fn run_clipboard_loop(
     label: &'static str,
-    send_initial_snapshot_on_activate: bool,
-    is_active: F,
     outbound_tx: Sender<ControlMessage>,
     remote_rx: Receiver<String>,
     stop: Arc<AtomicBool>,
-) where
-    F: Fn() -> bool + Send + 'static,
-{
+) {
     let mut clipboard: Option<arboard::Clipboard> = None;
     let mut last_log = Instant::now() - CLIPBOARD_ERROR_LOG_INTERVAL;
     let mut pending_remote: Option<String> = None;
     let mut last_synced_text: Option<String> = None;
     let mut last_sent = Instant::now() - CLIPBOARD_SEND_MIN_INTERVAL;
-    let mut was_active = false;
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(text) = remote_rx.try_recv() {
@@ -208,35 +197,32 @@ fn run_clipboard_loop<F>(
             }
         }
 
-        let active = is_active();
-        if active {
-            let send_snapshot = send_initial_snapshot_on_activate && !was_active;
-            match clipboard.as_mut().unwrap().get_text() {
-                Ok(text) => {
-                    let text = clamp_clipboard_text(&text);
-                    let changed = last_synced_text.as_deref() != Some(text.as_str());
-                    let rate_ok = last_sent.elapsed() >= CLIPBOARD_SEND_MIN_INTERVAL;
-                    if send_snapshot || (changed && rate_ok) {
-                        if outbound_tx
-                            .send(ControlMessage::ClipboardText(text.clone()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                        if trace_enabled() {
-                            eprintln!(
-                                "[clipboard] {label}: sent local text ({} bytes)",
-                                text.len()
-                            );
-                        }
-                        last_synced_text = Some(text);
-                        last_sent = Instant::now();
+        // Poll local clipboard for text changes and sync outbound.
+        // No control-ownership gate — clipboard sync is always active while connected.
+        match clipboard.as_mut().unwrap().get_text() {
+            Ok(text) => {
+                let text = clamp_clipboard_text(&text);
+                let changed = last_synced_text.as_deref() != Some(text.as_str());
+                let rate_ok = last_sent.elapsed() >= CLIPBOARD_SEND_MIN_INTERVAL;
+                if changed && rate_ok {
+                    if outbound_tx
+                        .send(ControlMessage::ClipboardText(text.clone()))
+                        .is_err()
+                    {
+                        break;
                     }
+                    if trace_enabled() {
+                        eprintln!(
+                            "[clipboard] {label}: sent local text ({} bytes)",
+                            text.len()
+                        );
+                    }
+                    last_synced_text = Some(text);
+                    last_sent = Instant::now();
                 }
-                Err(_) => {}
             }
+            Err(_) => {}
         }
-        was_active = active;
         thread::sleep(CLIPBOARD_POLL_INTERVAL);
     }
 }
@@ -245,23 +231,15 @@ fn run_clipboard_loop<F>(
 // File clipboard detection (platform-specific)
 // ---------------------------------------------------------------------------
 
-fn run_file_clipboard_loop<F>(
+fn run_file_clipboard_loop(
     file_tx: Sender<PathBuf>,
     stop: Arc<AtomicBool>,
     suppressed: SuppressedPaths,
-    is_active: F,
-) where
-    F: Fn() -> bool + Send + 'static,
-{
+) {
     let mut last_files: Vec<PathBuf> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(FILE_POLL_INTERVAL);
-
-        // Only detect and send files when we have control.
-        if !is_active() {
-            continue;
-        }
 
         let files = detect_clipboard_files();
         if !files.is_empty() && files != last_files {

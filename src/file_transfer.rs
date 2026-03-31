@@ -140,6 +140,23 @@ impl FileTransferManager {
         shared_state: SharedTransferState,
         suppressed_paths: SuppressedPaths,
     ) -> Self {
+        Self::start_configured(mode, shared_state, suppressed_paths, false)
+    }
+
+    pub fn start_auto_accept(
+        mode: TransportMode,
+        shared_state: SharedTransferState,
+        suppressed_paths: SuppressedPaths,
+    ) -> Self {
+        Self::start_configured(mode, shared_state, suppressed_paths, true)
+    }
+
+    fn start_configured(
+        mode: TransportMode,
+        shared_state: SharedTransferState,
+        suppressed_paths: SuppressedPaths,
+        auto_accept: bool,
+    ) -> Self {
         let (inbound_tx, inbound_rx) = crossbeam_channel::bounded::<FtInbound>(64);
         let (outbound_tx, outbound_rx) = crossbeam_channel::bounded::<FtOutbound>(64);
         let state_clone = Arc::clone(&shared_state);
@@ -147,7 +164,7 @@ impl FileTransferManager {
         let stop_flag = Arc::clone(&stop);
 
         let thread = thread::spawn(move || {
-            run_manager(mode, inbound_rx, outbound_tx, state_clone, stop_flag, suppressed_paths);
+            run_manager(mode, inbound_rx, outbound_tx, state_clone, stop_flag, suppressed_paths, auto_accept);
         });
 
         Self {
@@ -201,6 +218,7 @@ fn run_manager(
     shared_state: SharedTransferState,
     stop: Arc<AtomicBool>,
     suppressed_paths: SuppressedPaths,
+    auto_accept: bool,
 ) {
     let mut next_transfer_id: u32 = 1;
     let mut sending: HashMap<u32, SendState> = HashMap::new();
@@ -227,14 +245,27 @@ fn run_manager(
                     file_size,
                     file_name,
                 } => {
-                    handle_offer_received(
-                        transfer_id,
-                        file_size,
-                        &file_name,
-                        mode,
-                        &outbound_tx,
-                        &shared_state,
-                    );
+                    if auto_accept {
+                        // Server has no UI — accept immediately.
+                        accept_offer(
+                            transfer_id,
+                            file_size,
+                            &file_name,
+                            mode,
+                            &mut receiving,
+                            &outbound_tx,
+                            &shared_state,
+                        );
+                    } else {
+                        handle_offer_received(
+                            transfer_id,
+                            file_size,
+                            &file_name,
+                            mode,
+                            &outbound_tx,
+                            &shared_state,
+                        );
+                    }
                 }
                 FtInbound::AcceptReceived {
                     transfer_id,

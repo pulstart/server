@@ -2155,7 +2155,7 @@ async fn handle_client(
         file_detect_tx,
         Arc::clone(&suppressed_paths),
     );
-    let mut ft_manager = file_transfer::FileTransferManager::start_full(
+    let mut ft_manager = file_transfer::FileTransferManager::start_auto_accept(
         st_protocol::file_transfer::TransportMode::Direct,
         file_transfer::new_shared_state(),
         suppressed_paths,
@@ -2282,20 +2282,12 @@ async fn handle_client(
                             sub.video_bc.request_keyframe();
                         }
                         ControlMessage::ClipboardText(text) => {
-                            if state.input.controller_state_for(client_id)
-                                == ControllerState::OwnedByYou
-                            {
-                                clipboard_sync.set_remote_text(text);
-                            }
+                            clipboard_sync.set_remote_text(text);
                         }
                         ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
-                            if state.input.controller_state_for(client_id)
-                                == ControllerState::OwnedByYou
-                            {
-                                let _ = ft_manager.inbound_tx.try_send(
-                                    file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
-                                );
-                            }
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                            );
                         }
                         ControlMessage::FileAccept { transfer_id, accepted } => {
                             let _ = ft_manager.inbound_tx.try_send(
@@ -2884,7 +2876,7 @@ fn handle_punched_client(
         file_detect_tx,
         Arc::clone(&suppressed_paths),
     );
-    let mut ft_manager = file_transfer::FileTransferManager::start_full(
+    let mut ft_manager = file_transfer::FileTransferManager::start_auto_accept(
         st_protocol::file_transfer::TransportMode::Punched,
         file_transfer::new_shared_state(),
         suppressed_paths,
@@ -2958,20 +2950,12 @@ fn handle_punched_client(
                             sub.video_bc.request_keyframe();
                         }
                         ControlMessage::ClipboardText(text) => {
-                            if state.input.controller_state_for(client_id)
-                                == ControllerState::OwnedByYou
-                            {
-                                clipboard_sync.set_remote_text(text);
-                            }
+                            clipboard_sync.set_remote_text(text);
                         }
                         ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
-                            if state.input.controller_state_for(client_id)
-                                == ControllerState::OwnedByYou
-                            {
-                                let _ = ft_manager.inbound_tx.try_send(
-                                    file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
-                                );
-                            }
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                            );
                         }
                         ControlMessage::FileAccept { transfer_id, accepted } => {
                             let _ = ft_manager.inbound_tx.try_send(
