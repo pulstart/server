@@ -1,6 +1,6 @@
 /// Software encoding fallback (libx264 / libx265 / libsvtav1).
 ///
-/// Matches Sunshine's software encoder path. Used when no hardware encoder is available.
+/// Used when no hardware encoder is available.
 /// This is the last-resort fallback — works on any system with FFmpeg built with
 /// the corresponding codec libraries.
 use crate::capture::{CapturedFrame, FrameData};

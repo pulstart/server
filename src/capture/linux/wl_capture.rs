@@ -1,7 +1,6 @@
 /// Native wlr-screencopy-unstable-v1 screen capture for wlroots compositors.
 ///
 /// Replaces the `grim` subprocess approach with a direct Wayland protocol implementation,
-/// matching Sunshine's `wayland.cpp` + `wlgrab.cpp` pattern.
 ///
 /// Uses the `zwlr_screencopy_manager_v1` protocol to capture output frames into SHM buffers.
 /// The compositor renders the cursor into the captured frame (overlay_cursor=1), so no

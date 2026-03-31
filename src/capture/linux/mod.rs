@@ -1,7 +1,6 @@
 //! Linux capture dispatcher.
 //!
-//! Auto-detects the display server and selects the best capture backend,
-//! matching Sunshine's detection priority (misc.cpp:1044-1070):
+//! Auto-detects the display server and selects the best capture backend:
 //!
 //!   1. NvFBC (NVIDIA only, X11)
 //!   2. XDG Portal / PipeWire (preferred Wayland interactive path)
@@ -116,7 +115,7 @@ impl PlatformCapture {
         Self::auto_select()
     }
 
-    /// Sunshine-style auto-selection matching misc.cpp:1044-1070.
+    /// Auto-selection of best available capture backend.
     ///
     /// Priority:
     ///   1. NvFBC — best on NVIDIA + X11

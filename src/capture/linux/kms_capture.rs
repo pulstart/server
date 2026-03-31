@@ -149,7 +149,6 @@ fn read_cursor_position(
 }
 
 /// Capture cursor image from its DRM plane by mmap'ing the cursor framebuffer.
-/// Matches Sunshine's `update_cursor()` in kmsgrab.cpp.
 fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<CapturedCursor> {
     let plane = card.get_plane(cursor_handle).ok()?;
 
@@ -194,7 +193,7 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
         return None;
     }
 
-    // Read cursor pixels with DMA-BUF sync (matching Sunshine's approach)
+    // Read cursor pixels with DMA-BUF sync
     // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ = 1 | 4 = 5
     let sync_start: u64 = 5;
     let sync_end: u64 = 2 | 4; // DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ

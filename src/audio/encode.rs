@@ -1,6 +1,6 @@
 /// Opus audio encoding via FFmpeg's libopus encoder.
 ///
-/// Matches Sunshine's audio encoding pipeline: float32 input → Opus frames.
+/// Float32 input → Opus frames.
 /// Uses FFmpeg's libopus wrapper which supports multichannel (calls opus_multistream
 /// internally for >2 channels).
 use crate::audio::capture::AudioSamples;

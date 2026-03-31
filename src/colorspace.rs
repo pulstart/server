@@ -1,4 +1,4 @@
-/// Colorspace definitions matching Sunshine's `video_colorspace.cpp`.
+/// Colorspace definitions for encoder backends.
 ///
 /// Defines RGB-to-YUV conversion parameters for SDR and HDR.
 /// Used by encoder backends to set AVFrame colorspace metadata.

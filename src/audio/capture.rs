@@ -19,7 +19,7 @@ mod platform {
 
     /// Raw libpulse-simple FFI bindings.
     /// We use raw FFI to avoid pulling in the libpulse-binding crate dependency chain,
-    /// matching Sunshine's direct use of pa_simple.
+    /// using direct pa_simple FFI.
     #[allow(non_camel_case_types)]
     mod pulse_ffi {
         use std::ffi::c_void;

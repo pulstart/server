@@ -1,9 +1,9 @@
-/// Unified encoder configuration, matching Sunshine's `video::config_t`.
+/// Unified encoder configuration.
 ///
 /// Negotiated between client and server before the stream starts.
 /// All encoder backends read from this struct instead of using hardcoded values.
 ///
-/// Environment variable overrides (matching Sunshine's config approach):
+/// Environment variable overrides:
 ///   ST_CODEC=auto|h264|hevc|av1  — prefer a video codec (default: auto)
 ///   ST_HDR=1                     — enable HDR (10-bit BT.2020+PQ)
 ///   ST_CHROMA=auto|yuv420|yuv444 — chroma sampling preference (default: auto)
@@ -294,7 +294,7 @@ impl EncoderConfig {
         self.chroma == ChromaSampling::Yuv444
     }
 
-    /// Compute VBV buffer size in bits (Sunshine style: bitrate / fps for HW, larger for SW).
+    /// Compute VBV buffer size in bits (bitrate / fps for HW, larger for SW).
     ///
     /// `libsvtav1` derives a VBV duration from `rc_buffer_size` and rejects values below 20 ms.
     /// High-refresh software AV1 sessions can otherwise dip under that minimum.
@@ -377,7 +377,7 @@ impl EncoderConfig {
     }
 }
 
-/// Audio stream configuration, matching Sunshine's `opus_stream_config_t`.
+/// Audio stream configuration.
 #[derive(Debug, Clone)]
 pub struct AudioConfig {
     pub sample_rate: u32,

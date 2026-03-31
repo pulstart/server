@@ -1,6 +1,5 @@
 /// VAAPI hardware encoding (Intel/AMD GPUs).
 ///
-/// Matches Sunshine's VAAPI encoder path in `platform/linux/vaapi.cpp`.
 /// Supports H.264, HEVC, and AV1 codecs with configurable parameters.
 /// Handles both DMA-BUF (zero-copy GPU import) and RAM (software upload) frames.
 use crate::capture::{CapturedFrame, DmaBufPlane, FrameData};
@@ -203,7 +202,7 @@ impl VaapiEncoder {
             (*frames_ctx).sw_format = sw_format;
             (*frames_ctx).width = config.width as i32;
             (*frames_ctx).height = config.height as i32;
-            (*frames_ctx).initial_pool_size = 0; // Lazy allocation (matching Sunshine)
+            (*frames_ctx).initial_pool_size = 0; // Lazy allocation
         }
 
         let ret = unsafe { ffi::av_hwframe_ctx_init(frames_ref) };
@@ -227,7 +226,7 @@ impl VaapiEncoder {
             ));
         }
 
-        // Profile selection per codec (highest quality first, matching Sunshine)
+        // Profile selection per codec (highest quality first)
         let profiles = match config.codec {
             Codec::H264 => {
                 if config.is_yuv444() {
@@ -297,7 +296,7 @@ impl VaapiEncoder {
 
                     colorspace.apply_to_codec_ctx(ctx);
 
-                    // Rate control per vendor (matching Sunshine's vaapi.cpp)
+                    // Rate control per vendor
                     match gpu_vendor {
                         GpuVendor::Intel => {
                             // Intel: VBR — only cap the max rate, single-frame VBV
@@ -311,7 +310,6 @@ impl VaapiEncoder {
                     }
 
                     // Minimal encoder pipeline depth — only 1 frame in-flight
-                    // (matches Sunshine video.cpp: async_depth=1 for all VAAPI encoders)
                     let async_key = std::ffi::CString::new("async_depth").unwrap();
                     let one = std::ffi::CString::new("1").unwrap();
                     ffi::av_opt_set((*ctx).priv_data, async_key.as_ptr(), one.as_ptr(), 0);

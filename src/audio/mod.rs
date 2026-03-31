@@ -1,4 +1,4 @@
-/// Audio pipeline orchestration, matching Sunshine's `audio.cpp`.
+/// Audio pipeline orchestration.
 ///
 /// Architecture (shared pipeline):
 ///   Capture thread → sample queue → Encode thread → relay → Broadcaster

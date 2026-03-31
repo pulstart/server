@@ -108,6 +108,13 @@ fn frame_interval() -> Duration {
     Duration::from_secs_f64(1.0 / target_fps().max(1) as f64)
 }
 
+fn sleep_until(deadline: Instant) {
+    let now = Instant::now();
+    if deadline > now {
+        thread::sleep(deadline - now);
+    }
+}
+
 struct DxgiCapture {
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -184,10 +191,12 @@ fn run_dxgi_capture_loop(
     running: Arc<AtomicBool>,
 ) {
     let mut last_texture: Option<Weak<D3D11FrameTexture>> = None;
+    let mut next_capture_at = Instant::now();
 
     while running.load(Ordering::SeqCst) {
-        let frame_started = Instant::now();
         let target_interval = frame_interval();
+        sleep_until(next_capture_at);
+        next_capture_at = Instant::now() + target_interval;
 
         match session.try_acquire_texture() {
             Ok(Some(texture)) => last_texture = Some(Arc::downgrade(&texture)),
@@ -226,11 +235,6 @@ fn run_dxgi_capture_loop(
                 Err(TrySendError::Disconnected(_)) => break,
             }
         }
-
-        let elapsed = frame_started.elapsed();
-        if elapsed < target_interval {
-            thread::sleep(target_interval - elapsed);
-        }
     }
 }
 
@@ -241,8 +245,10 @@ fn run_gdi_capture_loop(
 ) {
     let mut target_interval = frame_interval();
     let mut next_metrics_check = Instant::now();
+    let mut next_capture_at = Instant::now();
 
     while running.load(Ordering::SeqCst) {
+        sleep_until(next_capture_at);
         let frame_started = Instant::now();
         if next_metrics_check <= frame_started {
             if let Err(err) = session.refresh_if_needed() {
@@ -253,6 +259,7 @@ fn run_gdi_capture_loop(
             target_interval = frame_interval();
             next_metrics_check = frame_started + Duration::from_secs(1);
         }
+        next_capture_at = frame_started + target_interval;
 
         match session.capture_frame() {
             Ok(frame) => match tx.try_send(frame) {
@@ -268,11 +275,6 @@ fn run_gdi_capture_loop(
                     thread::sleep(Duration::from_secs(1));
                 }
             }
-        }
-
-        let elapsed = frame_started.elapsed();
-        if elapsed < target_interval {
-            thread::sleep(target_interval - elapsed);
         }
     }
 }

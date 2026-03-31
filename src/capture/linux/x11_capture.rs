@@ -1,4 +1,4 @@
-/// X11 XShm screen capture, matching Sunshine's `x11grab.cpp`.
+/// X11 XShm screen capture.
 ///
 /// Uses the X11 SHM (shared memory) extension for fast CPU-accessible screen capture.
 /// Needed as a fallback when NvFBC is used for capture but software encoding is required,
@@ -428,7 +428,6 @@ impl CaptureBackend for X11Capture {
 }
 
 /// Capture cursor image via XFixes extension.
-/// Matches Sunshine's x11grab.cpp cursor capture path.
 ///
 /// XFixesCursorImage.pixels is an array of `unsigned long` (8 bytes on 64-bit),
 /// each containing one ARGB pixel. We compact them into ARGB8888 (4 bytes each).
@@ -551,7 +550,7 @@ pub fn composite_cursor(
     }
 }
 
-/// Composite cursor using pre-multiplied alpha (faster, matches Sunshine).
+/// Composite cursor using pre-multiplied alpha.
 /// Pre-multiplied: out = cursor_premul + frame * (1 - alpha)
 #[allow(dead_code)]
 pub fn composite_cursor_premultiplied(

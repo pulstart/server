@@ -170,22 +170,49 @@ pub fn prepare_and_spawn_update(release: &ReleaseInfo) -> Result<(), String> {
     let package_root = staging_root.join(package_root_relative);
     let install_target = current_install_target()?;
 
-    // Copy files BEFORE shutting down so the user can see the pkexec dialog
-    // through the active stream if elevated permissions are needed.
-    if let Err(direct_err) = sync_package_contents(&package_root, &install_target.install_root) {
-        eprintln!("[updater] {direct_err}");
-        eprintln!("[updater] Requesting elevated permissions...");
-        run_elevated_copy(&package_root, &install_target.install_root)?;
-    }
+    if cfg!(target_os = "windows") {
+        // On Windows the running executable is locked by the OS and cannot be
+        // overwritten in place.  Copy the current binary into the staging
+        // directory and spawn it from there with --apply-update so it can
+        // replace the install contents *after* this process has fully exited.
+        let helper_exe = staging_root.join("_st-update-helper.exe");
+        fs::copy(&install_target.relaunch_executable, &helper_exe).map_err(|err| {
+            format!("Failed to prepare update helper in staging directory: {err}")
+        })?;
+        let exec_dir = helper_exe
+            .parent()
+            .ok_or_else(|| "Staging helper does not have a parent directory.".to_string())?;
+        Command::new(&helper_exe)
+            .arg(APPLY_UPDATE_FLAG)
+            .arg(std::process::id().to_string())
+            .arg(&staging_root)
+            .arg(&package_root)
+            .arg(&install_target.install_root)
+            .arg(&install_target.relaunch_executable)
+            .current_dir(exec_dir)
+            .spawn()
+            .map_err(|err| format!("Failed to launch update helper: {err}"))?;
+    } else {
+        // On Unix we can overwrite running executables directly.  Copy files
+        // BEFORE shutting down so the user can see the pkexec dialog through
+        // the active stream if elevated permissions are needed.
+        if let Err(direct_err) =
+            sync_package_contents(&package_root, &install_target.install_root)
+        {
+            eprintln!("[updater] {direct_err}");
+            eprintln!("[updater] Requesting elevated permissions...");
+            run_elevated_copy(&package_root, &install_target.install_root)?;
+        }
 
-    // Spawn a lightweight helper that just waits for this process to exit
-    // and then relaunches the updated binary. No copy needed at this point.
-    spawn_relaunch_helper(
-        &install_target.relaunch_executable,
-        std::process::id(),
-        &staging_root,
-        &install_target.relaunch_executable,
-    )?;
+        // Spawn a lightweight helper that just waits for this process to exit
+        // and then relaunches the updated binary.  No copy needed at this point.
+        spawn_relaunch_helper(
+            &install_target.relaunch_executable,
+            std::process::id(),
+            &staging_root,
+            &install_target.relaunch_executable,
+        )?;
+    }
     Ok(())
 }
 

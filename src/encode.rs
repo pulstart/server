@@ -1,6 +1,6 @@
 /// NVENC hardware encoding (NVIDIA GPUs) via FFmpeg.
 ///
-/// Matches Sunshine's NVENC encoder path. Supports H.264, HEVC, and AV1.
+/// Supports H.264, HEVC, and AV1.
 /// Currently RAM-only (DMA-BUF support via CUDA interop planned).
 use crate::capture::{CapturedFrame, DmaBufPlane, FrameData};
 use crate::colorspace::Colorspace;
@@ -86,7 +86,7 @@ impl NvencEncoder {
                 (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             }
 
-            // Set profile based on codec (matching Sunshine)
+            // Set profile based on codec
             match config.codec {
                 Codec::H264 => {
                     (*ctx).profile = if config.is_yuv444() {
@@ -113,7 +113,7 @@ impl NvencEncoder {
             colorspace.apply_to_codec_ctx(ctx);
         }
 
-        // NVENC-specific options (matching Sunshine's video.cpp:540-610)
+        // NVENC-specific options
         unsafe {
             let spatial_aq_enabled = std::env::var("ST_NVENC_SPATIAL_AQ")
                 .map(|value| value != "0")
@@ -171,7 +171,7 @@ impl NvencEncoder {
                 0,
             );
 
-            // Disable lookahead — adds frames of latency (matches Sunshine)
+            // Disable lookahead — adds frames of latency
             let rc_lookahead = std::ffi::CString::new("rc-lookahead").unwrap();
             ffi::av_opt_set((*ctx).priv_data, rc_lookahead.as_ptr(), zero.as_ptr(), 0);
 

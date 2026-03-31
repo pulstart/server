@@ -645,9 +645,9 @@ fn save_restore_token(token: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Raw D-Bus portal interaction (matches Sunshine's portalgrab.cpp)
+// Raw D-Bus portal interaction
 //
-// Pattern per call (same as Sunshine's GDBus approach):
+// Pattern per call:
 //   1. Generate handle_token and predict the request object path
 //   2. Subscribe to Response signal on that path (BEFORE calling the method)
 //   3. Call the portal method (returns immediately with request handle)
@@ -657,7 +657,7 @@ fn save_restore_token(token: &str) {
 /// Result of the portal ScreenCast session.
 /// Keep the runtime, D-Bus connection, and session path alive for the full
 /// lifetime of the PipeWire node so we can explicitly close the portal session
-/// on teardown, mirroring Sunshine's cleanup path.
+/// on teardown.
 struct PortalSession {
     pw_fd: Option<OwnedFd>,
     node_id: u32,
@@ -1341,7 +1341,7 @@ fn request_remote_desktop_screencast(
 /// Properly handles restore_token (ashpd 0.13 has a bug where it's never deserialized).
 ///
 /// Returns a PortalSession that MUST be kept alive for the duration of the PipeWire stream.
-/// The session drop path explicitly closes the portal session, mirroring Sunshine.
+/// The session drop path explicitly closes the portal session.
 fn request_screencast() -> Result<PortalSession, String> {
     let restore_token = load_restore_token();
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
@@ -1362,7 +1362,7 @@ fn request_screencast() -> Result<PortalSession, String> {
             .trim_start_matches(':')
             .replace('.', "_");
 
-        // Counter for unique handle tokens (matches Sunshine's "Sunshine1", "Sunshine2", ...)
+        // Counter for unique handle tokens ("st1", "st2", ...)
         let mut token_counter: u32 = 0;
         let mut next_token = || -> String {
             token_counter += 1;
@@ -1382,7 +1382,7 @@ fn request_screencast() -> Result<PortalSession, String> {
             .map_err(|e| format!("portal proxy: {e}"))?;
 
         // ---- Helper: make a portal call with Response signal handling ----
-        // This closure implements the exact Sunshine pattern:
+        // This closure implements the portal call pattern:
         //   subscribe → call → wait for signal
 
         // ---- 1. CreateSession ----
