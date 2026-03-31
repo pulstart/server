@@ -20,6 +20,7 @@ use std::time::Instant;
 
 /// A file offered by the remote side, waiting for the local user to paste.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PendingOffer {
     pub transfer_id: u32,
     pub file_name: String,
@@ -29,6 +30,7 @@ pub struct PendingOffer {
 
 /// Status of a single transfer visible to the control loop / UI.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TransferEntry {
     pub direction: TransferDirection,
     pub file_name: String,
@@ -72,6 +74,7 @@ pub fn new_shared_state() -> SharedTransferState {
 
 /// Messages from the control loop into the file transfer manager.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum FtInbound {
     /// A remote peer offered a file.
     OfferReceived {
@@ -118,6 +121,7 @@ pub type FtOutbound = ControlMessage;
 // FileTransferManager
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub struct FileTransferManager {
     pub inbound_tx: Sender<FtInbound>,
     pub outbound_rx: Receiver<FtOutbound>,
@@ -127,14 +131,17 @@ pub struct FileTransferManager {
 }
 
 impl FileTransferManager {
+    #[allow(dead_code)]
     pub fn start(mode: TransportMode) -> Self {
         Self::start_with_state(mode, new_shared_state())
     }
 
+    #[allow(dead_code)]
     pub fn start_with_state(mode: TransportMode, shared_state: SharedTransferState) -> Self {
         Self::start_full(mode, shared_state, crate::clipboard::new_suppressed_paths())
     }
 
+    #[allow(dead_code)]
     pub fn start_full(
         mode: TransportMode,
         shared_state: SharedTransferState,
@@ -143,6 +150,7 @@ impl FileTransferManager {
         Self::start_configured(mode, shared_state, suppressed_paths, false)
     }
 
+    #[allow(dead_code)]
     pub fn start_auto_accept(
         mode: TransportMode,
         shared_state: SharedTransferState,
@@ -937,10 +945,73 @@ pub fn set_clipboard_file(path: &Path) {
 }
 
 #[cfg(target_os = "windows")]
-pub fn set_clipboard_file(_path: &Path) {
-    // Windows CF_HDROP clipboard placement would go here.
-    // For now, log that it's not yet implemented.
-    eprintln!("[file-transfer] Windows clipboard file placement not yet implemented");
+pub fn set_clipboard_file(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+
+    const CF_HDROP: u32 = 15;
+
+    // DROPFILES struct: 20 bytes header + null-terminated wide string list + double-null
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // DROPFILES { pFiles: u32, pt: POINT(0,0), fNC: BOOL(0), fWide: BOOL(1) }
+    let header_size = 20u32;
+    let data_size = header_size as usize + (wide_path.len() + 2) * 2; // path + null + final null
+
+    unsafe {
+        if OpenClipboard(HWND::default()).is_err() {
+            return;
+        }
+        let _ = EmptyClipboard();
+
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, data_size);
+        let hmem = match hmem {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = CloseClipboard();
+                return;
+            }
+        };
+
+        let ptr = GlobalLock(hmem);
+        if !ptr.is_null() {
+            let bytes = ptr as *mut u8;
+            // Write DROPFILES header
+            std::ptr::copy_nonoverlapping(
+                &header_size as *const u32 as *const u8,
+                bytes,
+                4,
+            );
+            // pt.x = 0, pt.y = 0 (bytes 4..12)
+            std::ptr::write_bytes(bytes.add(4), 0, 8);
+            // fNC = 0 (bytes 12..16)
+            std::ptr::write_bytes(bytes.add(12), 0, 4);
+            // fWide = 1 (bytes 16..20)
+            let fwide: u32 = 1;
+            std::ptr::copy_nonoverlapping(
+                &fwide as *const u32 as *const u8,
+                bytes.add(16),
+                4,
+            );
+            // Write file path as wide string
+            let wide_dest = bytes.add(header_size as usize) as *mut u16;
+            std::ptr::copy_nonoverlapping(wide_path.as_ptr(), wide_dest, wide_path.len());
+            // Null terminator for path
+            *wide_dest.add(wide_path.len()) = 0;
+            // Final null terminator for file list
+            *wide_dest.add(wide_path.len() + 1) = 0;
+
+            let _ = GlobalUnlock(hmem);
+        }
+
+        let _ = SetClipboardData(CF_HDROP, std::mem::transmute(hmem));
+        let _ = CloseClipboard();
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

@@ -49,6 +49,7 @@ pub struct ClipboardSync {
 }
 
 impl ClipboardSync {
+    #[allow(dead_code)]
     pub fn start<F>(
         label: &'static str,
         send_initial_snapshot_on_activate: bool,
@@ -327,9 +328,43 @@ end try"#;
 
 #[cfg(target_os = "windows")]
 fn detect_clipboard_files() -> Vec<PathBuf> {
-    // Windows CF_HDROP detection — not yet implemented.
-    // When implemented, use OpenClipboard + GetClipboardData(CF_HDROP) + DragQueryFileW.
-    Vec::new()
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows::Win32::System::Memory::GlobalLock;
+    use windows::Win32::System::Memory::GlobalUnlock;
+    use windows::Win32::UI::Shell::DragQueryFileW;
+
+    const CF_HDROP: u32 = 15;
+    let mut files = Vec::new();
+
+    unsafe {
+        if OpenClipboard(HWND::default()).is_err() {
+            return files;
+        }
+
+        let handle = GetClipboardData(CF_HDROP);
+        if let Ok(handle) = handle {
+            let ptr = GlobalLock(std::mem::transmute(handle));
+            if !ptr.is_null() {
+                let hdrop = windows::Win32::UI::Shell::HDROP(ptr as _);
+                let count = DragQueryFileW(hdrop, 0xFFFFFFFF, None);
+                for i in 0..count {
+                    let len = DragQueryFileW(hdrop, i, None) as usize;
+                    let mut buf = vec![0u16; len + 1];
+                    DragQueryFileW(hdrop, i, Some(&mut buf));
+                    let path = String::from_utf16_lossy(&buf[..len]);
+                    files.push(PathBuf::from(path));
+                }
+                let _ = GlobalUnlock(std::mem::transmute(handle));
+            }
+        }
+
+        let _ = CloseClipboard();
+    }
+
+    files
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -338,6 +373,7 @@ fn detect_clipboard_files() -> Vec<PathBuf> {
 }
 
 /// Parse `text/uri-list` content into local file paths.
+#[allow(dead_code)]
 fn parse_file_uris(text: &str) -> Vec<PathBuf> {
     text.lines()
         .filter(|line| !line.starts_with('#'))
@@ -353,6 +389,7 @@ fn parse_file_uris(text: &str) -> Vec<PathBuf> {
 }
 
 /// Simple percent-decoding for file URIs.
+#[allow(dead_code)]
 fn url_decode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.bytes();
@@ -370,6 +407,7 @@ fn url_decode(s: &str) -> String {
     result
 }
 
+#[allow(dead_code)]
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
