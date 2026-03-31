@@ -947,6 +947,7 @@ pub fn set_clipboard_file(path: &Path) {
 #[cfg(target_os = "windows")]
 pub fn set_clipboard_file(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
@@ -958,9 +959,8 @@ pub fn set_clipboard_file(path: &Path) {
 
     // DROPFILES struct: 20 bytes header + null-terminated wide string list + double-null
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
-    // DROPFILES { pFiles: u32, pt: POINT(0,0), fNC: BOOL(0), fWide: BOOL(1) }
     let header_size = 20u32;
-    let data_size = header_size as usize + (wide_path.len() + 2) * 2; // path + null + final null
+    let data_size = header_size as usize + (wide_path.len() + 2) * 2;
 
     unsafe {
         if OpenClipboard(None).is_err() {
@@ -980,35 +980,23 @@ pub fn set_clipboard_file(path: &Path) {
         let ptr = GlobalLock(hmem);
         if !ptr.is_null() {
             let bytes = ptr as *mut u8;
-            // Write DROPFILES header
-            std::ptr::copy_nonoverlapping(
-                &header_size as *const u32 as *const u8,
-                bytes,
-                4,
-            );
-            // pt.x = 0, pt.y = 0 (bytes 4..12)
-            std::ptr::write_bytes(bytes.add(4), 0, 8);
-            // fNC = 0 (bytes 12..16)
-            std::ptr::write_bytes(bytes.add(12), 0, 4);
-            // fWide = 1 (bytes 16..20)
+            // DROPFILES header: pFiles offset, POINT(0,0), fNC=0, fWide=1
+            std::ptr::copy_nonoverlapping(&header_size as *const u32 as *const u8, bytes, 4);
+            std::ptr::write_bytes(bytes.add(4), 0, 12); // pt + fNC
             let fwide: u32 = 1;
-            std::ptr::copy_nonoverlapping(
-                &fwide as *const u32 as *const u8,
-                bytes.add(16),
-                4,
-            );
-            // Write file path as wide string
+            std::ptr::copy_nonoverlapping(&fwide as *const u32 as *const u8, bytes.add(16), 4);
+            // File path as wide string + double null terminator
             let wide_dest = bytes.add(header_size as usize) as *mut u16;
             std::ptr::copy_nonoverlapping(wide_path.as_ptr(), wide_dest, wide_path.len());
-            // Null terminator for path
             *wide_dest.add(wide_path.len()) = 0;
-            // Final null terminator for file list
             *wide_dest.add(wide_path.len() + 1) = 0;
 
             let _ = GlobalUnlock(hmem);
         }
 
-        let _ = SetClipboardData(CF_HDROP, std::mem::transmute(hmem));
+        // HGLOBAL is a *mut c_void; HANDLE wraps isize — convert via raw pointer.
+        let handle = HANDLE(hmem.0 as *mut _ as isize);
+        let _ = SetClipboardData(CF_HDROP, Some(handle));
         let _ = CloseClipboard();
     }
 }
