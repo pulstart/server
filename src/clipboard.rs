@@ -173,6 +173,7 @@ fn run_clipboard_loop(
             }
         }
 
+        let mut applied_remote = false;
         if let Some(text) = pending_remote.clone() {
             match clipboard.as_mut().unwrap().set_text(text.clone()) {
                 Ok(()) => {
@@ -184,6 +185,7 @@ fn run_clipboard_loop(
                     }
                     last_synced_text = Some(text);
                     pending_remote = None;
+                    applied_remote = true;
                 }
                 Err(err) => {
                     if last_log.elapsed() >= CLIPBOARD_ERROR_LOG_INTERVAL {
@@ -198,7 +200,13 @@ fn run_clipboard_loop(
         }
 
         // Poll local clipboard for text changes and sync outbound.
-        // No control-ownership gate — clipboard sync is always active while connected.
+        // Skip this tick if we just applied remote text — reading the clipboard
+        // back immediately can race with the OS clipboard commit and return stale
+        // content, which would echo the old text back to the sender.
+        if applied_remote {
+            thread::sleep(CLIPBOARD_POLL_INTERVAL);
+            continue;
+        }
         match clipboard.as_mut().unwrap().get_text() {
             Ok(text) => {
                 let text = clamp_clipboard_text(&text);
