@@ -2,8 +2,9 @@ use st_protocol::{
     ControlMessage, ControllerState, CursorShape, CursorState, InputCapabilities, InputPacket,
     KeyboardKey, KEYBOARD_STATE_BYTES, MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2,
     MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
-    MOUSE_WHEEL_STEP_UNITS,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use st_protocol::MOUSE_WHEEL_STEP_UNITS;
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use crate::capture::linux::{active_remote_desktop_session, RemoteDesktopPortalSession};
@@ -52,6 +53,7 @@ use crate::capture::CapturedCursor;
 
 pub struct InputRuntime {
     next_client_id: AtomicU32,
+    active_controller_id: AtomicU32,
     inner: Mutex<InputRuntimeInner>,
 }
 
@@ -173,6 +175,7 @@ impl InputRuntime {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             next_client_id: AtomicU32::new(1),
+            active_controller_id: AtomicU32::new(0),
             inner: Mutex::new(InputRuntimeInner {
                 backend: InputBackend::Unavailable,
                 backend_label: "unavailable".to_string(),
@@ -227,6 +230,7 @@ impl InputRuntime {
         inner.controller_id = Some(client_id);
         inner.button_mask = 0;
         inner.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
+        self.set_active_controller(Some(client_id));
         ControllerState::OwnedByYou
     }
 
@@ -236,6 +240,7 @@ impl InputRuntime {
             inner.release_all_inputs();
             inner.controller_id = None;
         }
+        self.set_active_controller(inner.controller_id);
         match &inner.backend {
             InputBackend::Unavailable => ControllerState::Unavailable,
             #[cfg(target_os = "linux")]
@@ -253,7 +258,7 @@ impl InputRuntime {
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     pub fn control_active(&self) -> bool {
-        self.inner.lock().unwrap().controller_id.is_some()
+        self.active_controller_id.load(Ordering::Relaxed) != 0
     }
 
     pub fn refresh_backend(&self, capture_backend: &str, _stream_width: u32, _stream_height: u32) {
@@ -267,6 +272,7 @@ impl InputRuntime {
         inner.cursor_state = CursorState::default();
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+        self.set_active_controller(None);
 
         #[cfg(target_os = "linux")]
         {
@@ -361,11 +367,16 @@ impl InputRuntime {
         inner.cursor_state = CursorState::default();
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+        self.set_active_controller(None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     pub fn update_cursor(&self, cursor: Option<&CapturedCursor>) {
-        let mut inner = self.inner.lock().unwrap();
+        let Ok(mut inner) = self.inner.try_lock() else {
+            // Input injection can block on portal/X11/uinput calls. Dropping one
+            // cursor metadata update is preferable to stalling capture/encode.
+            return;
+        };
         if !inner.capabilities.separate_cursor {
             if inner.cursor_shape.is_some() || inner.cursor_state.visible {
                 inner.cursor_shape = None;
@@ -480,6 +491,11 @@ impl InputRuntime {
         }
     }
 
+    fn set_active_controller(&self, controller_id: Option<u32>) {
+        self.active_controller_id
+            .store(controller_id.unwrap_or(0), Ordering::Relaxed);
+    }
+
     pub fn cursor_messages(
         &self,
         _client_id: u32,
@@ -582,6 +598,7 @@ impl InputRuntime {
             return;
         }
         inner.activate_controller(client_id);
+        self.set_active_controller(Some(client_id));
 
         match packet {
             InputPacket::MouseAbsolute(packet) => {

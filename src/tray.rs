@@ -16,6 +16,8 @@ use ksni::menu::{
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::time::Instant;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder,
@@ -26,6 +28,34 @@ use tray_icon::{Icon as DesktopTrayIcon, TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+#[cfg(target_os = "windows")]
+use windows::core::{w, Error as WindowsError, PCWSTR};
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::{
+    GetStockObject, GetSysColorBrush, UpdateWindow, COLOR_3DFACE, DEFAULT_GUI_FONT,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    AdjustWindowRectEx, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_LEFT,
+    GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW,
+    GetWindowTextW, HMENU, IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, WNDCLASSW,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_SETFONT, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_EX_TOPMOST, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE, CW_USEDEFAULT, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WINDOW_EX_STYLE,
+    WINDOW_STYLE,
+};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const ALLOW_CONNECTIONS_ID: &str = "allow-connections";
@@ -47,6 +77,14 @@ const VIDEO_CODEC_PREFIX: &str = "video-codec:";
 const VIDEO_BITRATE_PREFIX: &str = "video-bitrate:";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const VIDEO_QUALITY_PREFIX: &str = "video-quality:";
+#[cfg(target_os = "windows")]
+const WINDOWS_TOKEN_DIALOG_OK_ID: usize = 1;
+#[cfg(target_os = "windows")]
+const WINDOWS_TOKEN_DIALOG_CANCEL_ID: usize = 2;
+#[cfg(target_os = "windows")]
+const WINDOWS_TOKEN_DIALOG_EDIT_ID: isize = 100;
+#[cfg(target_os = "windows")]
+static WINDOWS_TOKEN_DIALOG_CLASS: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub fn should_run_tray() -> bool {
     if std::env::var_os("ST_SERVER_NO_TRAY").is_some() {
@@ -1082,74 +1120,338 @@ fn show_macos_token_input_dialog(current: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
+struct WindowsTokenDialogState {
+    edit: HWND,
+    initial_text: Vec<u16>,
+    result: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
 fn show_windows_token_input_dialog(current: &str) -> Option<String> {
-    let escaped = current.replace('\'', "''");
-    let script = format!(
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-         Add-Type -AssemblyName System.Windows.Forms; \
-         Add-Type -AssemblyName System.Drawing; \
-         [System.Windows.Forms.Application]::EnableVisualStyles(); \
-         $form = New-Object System.Windows.Forms.Form; \
-         $form.Text = 'Set Server Token'; \
-         $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen; \
-         $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog; \
-         $form.ClientSize = New-Object System.Drawing.Size(420, 132); \
-         $form.MaximizeBox = $false; \
-         $form.MinimizeBox = $false; \
-         $form.ShowInTaskbar = $false; \
-         $form.TopMost = $true; \
-         $form.Font = New-Object System.Drawing.Font('Segoe UI', 9); \
-         $label = New-Object System.Windows.Forms.Label; \
-         $label.AutoSize = $true; \
-         $label.Location = New-Object System.Drawing.Point(12, 14); \
-         $label.Text = 'Enter new authentication token:'; \
-         $form.Controls.Add($label); \
-         $textBox = New-Object System.Windows.Forms.TextBox; \
-         $textBox.Location = New-Object System.Drawing.Point(12, 40); \
-         $textBox.Size = New-Object System.Drawing.Size(396, 24); \
-         $textBox.Text = '{escaped}'; \
-         $form.Controls.Add($textBox); \
-         $okButton = New-Object System.Windows.Forms.Button; \
-         $okButton.Text = 'OK'; \
-         $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK; \
-         $okButton.Location = New-Object System.Drawing.Point(252, 88); \
-         $okButton.Size = New-Object System.Drawing.Size(75, 26); \
-         $okButton.UseVisualStyleBackColor = $true; \
-         $form.Controls.Add($okButton); \
-         $cancelButton = New-Object System.Windows.Forms.Button; \
-         $cancelButton.Text = 'Cancel'; \
-         $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; \
-         $cancelButton.Location = New-Object System.Drawing.Point(333, 88); \
-         $cancelButton.Size = New-Object System.Drawing.Size(75, 26); \
-         $cancelButton.UseVisualStyleBackColor = $true; \
-         $form.Controls.Add($cancelButton); \
-         $form.AcceptButton = $okButton; \
-         $form.CancelButton = $cancelButton; \
-         $form.Add_Shown({ $form.Activate(); $textBox.SelectAll(); $textBox.Focus(); }); \
-         if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Write($textBox.Text) }}"
-    );
-    for program in ["powershell.exe", "powershell"] {
-        match std::process::Command::new(program)
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-STA", "-Command", &script])
-            .output()
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!(
-                    "[tray] Windows token dialog via {program} failed: {} {}",
-                    output.status,
-                    stderr.trim()
-                );
-            }
-            Err(err) => {
-                eprintln!("[tray] Failed to launch {program} for token dialog: {err}");
-            }
+    if let Err(err) = ensure_windows_token_dialog_class() {
+        eprintln!("[tray] Failed to register Windows token dialog class: {err}");
+        return None;
+    }
+    match run_windows_token_input_dialog(current) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("[tray] Windows token dialog failed: {err}");
+            None
         }
     }
-    None
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_token_dialog_class() -> Result<(), String> {
+    WINDOWS_TOKEN_DIALOG_CLASS
+        .get_or_init(register_windows_token_dialog_class)
+        .clone()
+}
+
+#[cfg(target_os = "windows")]
+fn register_windows_token_dialog_class() -> Result<(), String> {
+    let module = unsafe {
+        GetModuleHandleW(None).map_err(|err| format!("GetModuleHandleW failed: {err}"))?
+    };
+    let cursor = unsafe {
+        LoadCursorW(None, IDC_ARROW).map_err(|err| format!("LoadCursorW failed: {err}"))?
+    };
+    let window_class = WNDCLASSW {
+        hCursor: cursor,
+        hInstance: HINSTANCE(module.0),
+        lpszClassName: w!("StServerTokenDialog"),
+        lpfnWndProc: Some(windows_token_dialog_wndproc),
+        hbrBackground: unsafe { GetSysColorBrush(COLOR_3DFACE) },
+        ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&window_class) };
+    if atom == 0 {
+        return Err(format!("RegisterClassW failed: {}", WindowsError::from_win32()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_token_input_dialog(current: &str) -> Result<Option<String>, String> {
+    let module = unsafe {
+        GetModuleHandleW(None).map_err(|err| format!("GetModuleHandleW failed: {err}"))?
+    };
+    let hinstance = HINSTANCE(module.0);
+    let ex_style = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT | WS_EX_TOPMOST;
+    let style = WS_CAPTION | WS_SYSMENU;
+    let (width, height) = windows_token_dialog_outer_size(style, ex_style);
+    let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let x = ((screen_width - width).max(0)) / 2;
+    let y = ((screen_height - height).max(0)) / 2;
+    let title = wide_null("Set Server Token");
+    let state = Box::new(WindowsTokenDialogState {
+        edit: HWND::default(),
+        initial_text: wide_null(current),
+        result: None,
+    });
+    let state_ptr = Box::into_raw(state);
+    let hwnd = match unsafe {
+        CreateWindowExW(
+            ex_style,
+            w!("StServerTokenDialog"),
+            PCWSTR(title.as_ptr()),
+            style,
+            if x > 0 { x } else { CW_USEDEFAULT },
+            if y > 0 { y } else { CW_USEDEFAULT },
+            width,
+            height,
+            None,
+            None,
+            Some(hinstance),
+            Some(state_ptr.cast()),
+        )
+    } {
+        Ok(hwnd) => hwnd,
+        Err(err) => {
+            let _ = unsafe { Box::from_raw(state_ptr) };
+            return Err(format!("CreateWindowExW failed: {err}"));
+        }
+    };
+
+    unsafe {
+        apply_windows_token_dialog_corner_style(hwnd);
+        ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+    }
+
+    let mut msg = MSG::default();
+    loop {
+        let status = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        match status.0 {
+            -1 => {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                let mut state = unsafe { Box::from_raw(state_ptr) };
+                state.result = None;
+                return Err(format!("GetMessageW failed: {}", WindowsError::from_win32()));
+            }
+            0 => break,
+            _ => {}
+        }
+
+        if msg.message == WM_KEYDOWN {
+            if msg.wParam.0 as u16 == VK_RETURN.0 {
+                let edit = unsafe { (*state_ptr).edit };
+                if msg.hwnd == edit {
+                    unsafe {
+                        commit_windows_token_dialog(hwnd);
+                    }
+                    continue;
+                }
+            } else if msg.wParam.0 as u16 == VK_ESCAPE.0 {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                continue;
+            }
+        }
+
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    let mut state = unsafe { Box::from_raw(state_ptr) };
+    Ok(state.result.take())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_token_dialog_outer_size(style: WINDOW_STYLE, ex_style: WINDOW_EX_STYLE) -> (i32, i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 420,
+        bottom: 132,
+    };
+    let _ = unsafe { AdjustWindowRectEx(&mut rect, style, false, ex_style) };
+    (
+        (rect.right - rect.left).max(420),
+        (rect.bottom - rect.top).max(132),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn windows_token_dialog_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_NCCREATE => {
+            let create = &*(lparam.0 as *const CREATESTRUCTW);
+            if create.lpCreateParams.is_null() {
+                return LRESULT(0);
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+            LRESULT(1)
+        }
+        WM_CREATE => match create_windows_token_dialog_controls(hwnd) {
+            Ok(()) => LRESULT(0),
+            Err(err) => {
+                eprintln!("[tray] Failed to create Windows token dialog controls: {err}");
+                LRESULT(-1)
+            }
+        },
+        WM_COMMAND => {
+            let control_id = wparam.0 & 0xffff;
+            let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+            if control_id == WINDOWS_TOKEN_DIALOG_OK_ID && notification == BN_CLICKED {
+                commit_windows_token_dialog(hwnd);
+                return LRESULT(0);
+            }
+            if control_id == WINDOWS_TOKEN_DIALOG_CANCEL_ID && notification == BN_CLICKED {
+                let _ = DestroyWindow(hwnd);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn create_windows_token_dialog_controls(hwnd: HWND) -> Result<(), String> {
+    let Some(state) = windows_token_dialog_state_mut(hwnd) else {
+        return Err("dialog state missing".into());
+    };
+    let font = GetStockObject(DEFAULT_GUI_FONT);
+    let label_text = wide_null("Enter new authentication token:");
+    let ok_text = wide_null("OK");
+    let cancel_text = wide_null("Cancel");
+    let label = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("STATIC"),
+        PCWSTR(label_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        12,
+        14,
+        240,
+        20,
+        Some(hwnd),
+        None,
+        None,
+        None,
+    )
+    .map_err(|err| format!("CreateWindowExW label failed: {err}"))?;
+    let edit = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("EDIT"),
+        PCWSTR(state.initial_text.as_ptr()),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WS_BORDER
+            | WINDOW_STYLE((ES_LEFT | ES_AUTOHSCROLL) as u32),
+        12,
+        40,
+        396,
+        24,
+        Some(hwnd),
+        Some(HMENU(WINDOWS_TOKEN_DIALOG_EDIT_ID)),
+        None,
+        None,
+    )
+    .map_err(|err| format!("CreateWindowExW edit failed: {err}"))?;
+    let ok_button = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("BUTTON"),
+        PCWSTR(ok_text.as_ptr()),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+        252,
+        88,
+        75,
+        26,
+        Some(hwnd),
+        Some(HMENU(WINDOWS_TOKEN_DIALOG_OK_ID as isize)),
+        None,
+        None,
+    )
+    .map_err(|err| format!("CreateWindowExW OK button failed: {err}"))?;
+    let cancel_button = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("BUTTON"),
+        PCWSTR(cancel_text.as_ptr()),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        333,
+        88,
+        75,
+        26,
+        Some(hwnd),
+        Some(HMENU(WINDOWS_TOKEN_DIALOG_CANCEL_ID as isize)),
+        None,
+        None,
+    )
+    .map_err(|err| format!("CreateWindowExW Cancel button failed: {err}"))?;
+
+    for control in [label, edit, ok_button, cancel_button] {
+        SendMessageW(
+            control,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+    }
+    state.edit = edit;
+    let _ = SetFocus(Some(edit));
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn windows_token_dialog_state_mut(hwnd: HWND) -> Option<&'static mut WindowsTokenDialogState> {
+    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowsTokenDialogState;
+    state_ptr.as_mut()
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn commit_windows_token_dialog(hwnd: HWND) {
+    if let Some(state) = windows_token_dialog_state_mut(hwnd) {
+        let text_len = GetWindowTextLengthW(state.edit).max(0) as usize;
+        let mut text = vec![0u16; text_len + 1];
+        let written = GetWindowTextW(state.edit, &mut text).max(0) as usize;
+        text.truncate(written);
+        state.result = Some(String::from_utf16_lossy(&text).trim().to_string());
+    }
+    let _ = DestroyWindow(hwnd);
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn apply_windows_token_dialog_corner_style(hwnd: HWND) {
+    let preference = DWMWCP_ROUND;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE,
+        &preference as *const _ as _,
+        std::mem::size_of_val(&preference) as u32,
+    );
 }
 
 /// Flat 2D monitor icon with status dot.
