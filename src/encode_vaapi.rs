@@ -158,6 +158,12 @@ impl VaapiEncoder {
             std::ffi::CString::new(render_node.as_str()).map_err(|e| format!("CString: {e}"))?;
 
         let colorspace = Colorspace::for_dynamic_range(config.dynamic_range);
+        if config.is_yuv444() && config.is_hdr() {
+            return Err("VAAPI YUV444 HDR encoding is not implemented".into());
+        }
+        if config.is_yuv444() && config.codec == Codec::Av1 {
+            return Err("VAAPI AV1 YUV444 encoding is not implemented".into());
+        }
 
         // 1. Create VAAPI hardware device context
         let mut device_ctx_ptr: *mut ffi::AVBufferRef = ptr::null_mut();
@@ -180,7 +186,11 @@ impl VaapiEncoder {
         println!("[vaapi] Hardware device context created on {render_node}");
 
         // 2. Create hardware frames context
-        let sw_format = colorspace.sw_pixel_format();
+        let sw_format = if config.is_yuv444() {
+            ffi::AVPixelFormat::AV_PIX_FMT_YUV444P
+        } else {
+            colorspace.sw_pixel_format()
+        };
 
         let frames_ref = unsafe { ffi::av_hwframe_ctx_alloc(device_ctx.ptr) };
         if frames_ref.is_null() {
@@ -220,13 +230,19 @@ impl VaapiEncoder {
         // Profile selection per codec (highest quality first, matching Sunshine)
         let profiles = match config.codec {
             Codec::H264 => {
-                const HIGH: i32 = 100;
-                const MAIN: i32 = 77;
-                const CB: i32 = 66 | (1 << 9);
-                vec![("high", HIGH), ("main", MAIN), ("constrained_baseline", CB)]
+                if config.is_yuv444() {
+                    vec![("high444", ffi::FF_PROFILE_H264_HIGH_444_PREDICTIVE)]
+                } else {
+                    const HIGH: i32 = 100;
+                    const MAIN: i32 = 77;
+                    const CB: i32 = 66 | (1 << 9);
+                    vec![("high", HIGH), ("main", MAIN), ("constrained_baseline", CB)]
+                }
             }
             Codec::Hevc => {
-                if config.is_hdr() {
+                if config.is_yuv444() {
+                    vec![("rext", ffi::FF_PROFILE_HEVC_REXT)]
+                } else if config.is_hdr() {
                     vec![("main10", 2)]
                 } else {
                     vec![("main", 1), ("main10", 2)]
@@ -337,8 +353,10 @@ impl VaapiEncoder {
             ));
         }
 
-        // Build BGRA→NV12/P010 scaler for RAM frame fallback
-        let dst_pixel = if config.is_hdr() {
+        // Build BGRA→encoder software surface scaler for RAM frame fallback.
+        let dst_pixel = if config.is_yuv444() {
+            Pixel::YUV444P
+        } else if config.is_hdr() {
             Pixel::P010LE
         } else {
             Pixel::NV12

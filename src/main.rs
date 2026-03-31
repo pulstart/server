@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod adaptive_bitrate;
 mod api_client;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -36,7 +38,7 @@ use transport::{EncodedVideoFrame, UdpSender};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use st_protocol::{
     ClientDisplayInfo, ClockSyncPong, ControlMessage, InputSession, SessionDebugInfo, StreamConfig,
-    VideoCodec, VideoCodecSupport,
+    VideoChromaSampling, VideoCodec, VideoCodecSupport,
 };
 use std::net::SocketAddr;
 use std::sync::{
@@ -220,6 +222,38 @@ fn client_hardware_video_codecs(display: Option<ClientDisplayInfo>) -> VideoCode
         .unwrap_or_else(VideoCodecSupport::empty)
 }
 
+fn client_supported_yuv444_video_codecs(display: Option<ClientDisplayInfo>) -> VideoCodecSupport {
+    display
+        .map(|info| info.supported_yuv444_video_codecs)
+        .unwrap_or_else(VideoCodecSupport::empty)
+}
+
+fn client_hardware_yuv444_video_codecs(display: Option<ClientDisplayInfo>) -> VideoCodecSupport {
+    display
+        .map(|info| info.hardware_yuv444_video_codecs)
+        .unwrap_or_else(VideoCodecSupport::empty)
+}
+
+fn stream_chroma_name(chroma: VideoChromaSampling) -> &'static str {
+    match chroma {
+        VideoChromaSampling::Yuv420 => "yuv420",
+        VideoChromaSampling::Yuv444 => "yuv444",
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn encoder_chroma_name(chroma: encode_config::ChromaSampling) -> &'static str {
+    match chroma {
+        encode_config::ChromaSampling::Yuv420 => "yuv420",
+        encode_config::ChromaSampling::Yuv444 => "yuv444",
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn supports_yuv444_codec(codec: encode_config::Codec) -> bool {
+    matches!(codec, encode_config::Codec::H264 | encode_config::Codec::Hevc)
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn encoder_name(encoder: &EncoderKind) -> &'static str {
     match encoder {
@@ -270,9 +304,14 @@ fn encoder_backend_name(backend: EncoderBackend) -> &'static str {
 #[cfg(target_os = "linux")]
 fn codec_selection_score(
     codec: encode_config::Codec,
+    chroma: encode_config::ChromaSampling,
     backend: EncoderBackend,
     client_hardware_codecs: VideoCodecSupport,
-) -> (u8, u8, u8) {
+) -> (u8, u8, u8, u8) {
+    let hardware_yuv444_rank = u8::from(
+        chroma == encode_config::ChromaSampling::Yuv444
+            && matches!(backend, EncoderBackend::Vaapi | EncoderBackend::Nvenc),
+    );
     let backend_rank = match backend {
         EncoderBackend::Vaapi | EncoderBackend::Nvenc => 1,
         EncoderBackend::Software => 0,
@@ -283,7 +322,51 @@ fn codec_selection_score(
         encode_config::Codec::Hevc => 1,
         encode_config::Codec::Av1 => 2,
     };
-    (backend_rank, client_hw_rank, codec_rank)
+    (hardware_yuv444_rank, backend_rank, client_hw_rank, codec_rank)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_chroma_candidates(
+    codec: encode_config::Codec,
+    base_config: &EncoderConfig,
+    client_supported_yuv444_codecs: VideoCodecSupport,
+    client_hardware_yuv444_codecs: VideoCodecSupport,
+) -> Vec<encode_config::ChromaSampling> {
+    if let Some(chroma) = EncoderConfig::preferred_chroma_from_env() {
+        return vec![chroma];
+    }
+
+    if !base_config.is_hdr()
+        && supports_yuv444_codec(codec)
+        && client_supported_yuv444_codecs.supports(codec.to_stream_codec())
+        && client_hardware_yuv444_codecs.supports(codec.to_stream_codec())
+    {
+        vec![
+            encode_config::ChromaSampling::Yuv444,
+            encode_config::ChromaSampling::Yuv420,
+        ]
+    } else {
+        vec![encode_config::ChromaSampling::Yuv420]
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_selected_linux_encoder(
+    config: &EncoderConfig,
+    backend: EncoderBackend,
+    client_hardware_codecs: VideoCodecSupport,
+) {
+    println!(
+        "[encoder] Selected {} {} with {} backend (client hw decode: {})",
+        codec_name(config.stream_codec()),
+        encoder_chroma_name(config.chroma),
+        encoder_backend_name(backend),
+        if client_hardware_codecs.supports(config.stream_codec()) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -293,13 +376,17 @@ fn select_linux_encoder(
     framerate: u32,
     client_supported_codecs: VideoCodecSupport,
     client_hardware_codecs: VideoCodecSupport,
+    client_supported_yuv444_codecs: VideoCodecSupport,
+    client_hardware_yuv444_codecs: VideoCodecSupport,
     control: &ServerControl,
 ) -> Result<(EncoderConfig, EncoderKind), String> {
     let forced_codec = control.forced_codec();
     let forced_quality = control.forced_quality();
-    let prefer_first_success = forced_codec.is_some() || EncoderConfig::preferred_codec_from_env().is_some();
+    let prefer_first_success =
+        forced_codec.is_some() || EncoderConfig::preferred_codec_from_env().is_some();
     let mut failures = Vec::new();
-    let mut selected: Option<(EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8))> = None;
+    let mut selected: Option<(EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8, u8))> =
+        None;
 
     let codec_order = if let Some(codec) = forced_codec {
         encode_config::Codec::preferred_order(Some(codec))
@@ -315,51 +402,83 @@ fn select_linux_encoder(
             continue;
         }
 
-        let mut config = EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
+        let mut base_config =
+            EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
         if let Some(quality) = forced_quality {
-            config.quality = quality;
+            base_config.quality = quality;
         }
-        match create_linux_encoder(&config) {
-            Ok(encoder) => {
-                let backend = encoder_backend(&encoder);
-                if prefer_first_success {
-                    println!(
-                        "[encoder] Selected {} with {} backend (client hw decode: {})",
-                        codec_name(config.stream_codec()),
-                        encoder_backend_name(backend),
-                        if client_hardware_codecs.supports(config.stream_codec()) {
-                            "yes"
-                        } else {
-                            "no"
-                        }
-                    );
-                    return Ok((config, encoder));
-                }
 
-                let score = codec_selection_score(codec, backend, client_hardware_codecs);
-                let replace = selected
-                    .as_ref()
-                    .map(|(_, _, _, best_score)| score > *best_score)
-                    .unwrap_or(true);
-                if replace {
-                    selected = Some((config, encoder, backend, score));
+        let mut best_for_codec: Option<(
+            EncoderConfig,
+            EncoderKind,
+            EncoderBackend,
+            (u8, u8, u8, u8),
+        )> = None;
+
+        for chroma in linux_chroma_candidates(
+            codec,
+            &base_config,
+            client_supported_yuv444_codecs,
+            client_hardware_yuv444_codecs,
+        ) {
+            if chroma == encode_config::ChromaSampling::Yuv444 {
+                if !supports_yuv444_codec(codec) {
+                    failures.push(format!(
+                        "{} yuv444 skipped: codec profile is not implemented",
+                        codec_name(codec.to_stream_codec())
+                    ));
+                    continue;
+                }
+                if !client_supported_yuv444_codecs.supports(codec.to_stream_codec()) {
+                    failures.push(format!(
+                        "{} yuv444 skipped: client does not support it",
+                        codec_name(codec.to_stream_codec())
+                    ));
+                    continue;
                 }
             }
-            Err(err) => failures.push(format!("{} failed: {err}", codec_name(codec.to_stream_codec()))),
+
+            let config = base_config.with_chroma_sampling(chroma);
+            match create_linux_encoder(&config) {
+                Ok(encoder) => {
+                    let backend = encoder_backend(&encoder);
+                    let score =
+                        codec_selection_score(codec, config.chroma, backend, client_hardware_codecs);
+                    let replace = best_for_codec
+                        .as_ref()
+                        .map(|(_, _, _, best_score)| score > *best_score)
+                        .unwrap_or(true);
+                    if replace {
+                        best_for_codec = Some((config, encoder, backend, score));
+                    }
+                }
+                Err(err) => failures.push(format!(
+                    "{} {} failed: {err}",
+                    codec_name(codec.to_stream_codec()),
+                    encoder_chroma_name(chroma)
+                )),
+            }
+        }
+
+        if let Some(candidate) = best_for_codec {
+            if prefer_first_success {
+                let (config, encoder, backend, _) = candidate;
+                log_selected_linux_encoder(&config, backend, client_hardware_codecs);
+                return Ok((config, encoder));
+            }
+
+            let replace = selected
+                .as_ref()
+                .map(|(_, _, _, best_score)| candidate.3 > *best_score)
+                .unwrap_or(true);
+            if replace {
+                selected = Some(candidate);
+            }
         }
     }
 
     if let Some((config, encoder, backend, _)) = selected {
-        println!(
-            "[encoder] Selected {} with {} backend (client hw decode: {})",
-            codec_name(config.stream_codec()),
-            encoder_backend_name(backend),
-            if client_hardware_codecs.supports(config.stream_codec()) {
-                "yes"
-            } else {
-                "no"
-            }
-        );
+        log_selected_linux_encoder(&config, backend, client_hardware_codecs);
         Ok((config, encoder))
     } else {
         Err(format!(
@@ -374,6 +493,7 @@ fn select_windows_encoder(
     first_frame: &capture::CapturedFrame,
     framerate: u32,
     client_supported_codecs: VideoCodecSupport,
+    client_supported_yuv444_codecs: VideoCodecSupport,
     control: &ServerControl,
 ) -> Result<(EncoderConfig, EncoderKind), String> {
     let width = first_frame.width;
@@ -416,6 +536,17 @@ fn select_windows_encoder(
             EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
         if let Some(quality) = forced_quality {
             config.quality = quality;
+        }
+        if config.is_yuv444() {
+            if !supports_yuv444_codec(codec)
+                || !client_supported_yuv444_codecs.supports(codec.to_stream_codec())
+            {
+                failures.push(format!(
+                    "{} yuv444 skipped: client does not support it",
+                    codec_name(codec.to_stream_codec())
+                ));
+                continue;
+            }
         }
 
         if let Some(texture) = hardware_capture {
@@ -466,6 +597,7 @@ fn select_macos_encoder(
     height: u32,
     framerate: u32,
     client_supported_codecs: VideoCodecSupport,
+    client_supported_yuv444_codecs: VideoCodecSupport,
     control: &ServerControl,
 ) -> Result<(EncoderConfig, encode_vt::VTEncoder), String> {
     let forced_codec = control.forced_codec();
@@ -497,6 +629,13 @@ fn select_macos_encoder(
             EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
         if let Some(quality) = forced_quality {
             config.quality = quality;
+        }
+        if config.is_yuv444() {
+            failures.push(format!(
+                "{} yuv444 unavailable: macOS VideoToolbox encode is currently YUV420 only",
+                codec_name(codec.to_stream_codec())
+            ));
+            continue;
         }
         if config.is_hdr() {
             eprintln!("[encoder] macOS VideoToolbox HDR encode is not implemented; forcing SDR");
@@ -605,6 +744,8 @@ impl SharedPipeline {
         client_requested_fps: Option<u32>,
         client_supported_codecs: VideoCodecSupport,
         client_hardware_codecs: VideoCodecSupport,
+        client_supported_yuv444_codecs: VideoCodecSupport,
+        client_hardware_yuv444_codecs: VideoCodecSupport,
         input: Arc<InputRuntime>,
         control: Arc<ServerControl>,
     ) -> Result<(Self, ClientSubscription), String> {
@@ -629,6 +770,8 @@ impl SharedPipeline {
                 client_requested_fps,
                 client_supported_codecs,
                 client_hardware_codecs,
+                client_supported_yuv444_codecs,
+                client_hardware_yuv444_codecs,
                 input,
                 control,
                 vbc,
@@ -717,6 +860,8 @@ fn run_shared_pipeline(
     client_requested_fps: Option<u32>,
     client_supported_codecs: VideoCodecSupport,
     client_hardware_codecs: VideoCodecSupport,
+    client_supported_yuv444_codecs: VideoCodecSupport,
+    client_hardware_yuv444_codecs: VideoCodecSupport,
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
@@ -727,6 +872,8 @@ fn run_shared_pipeline(
     let trace = trace_enabled();
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let _ = client_hardware_codecs;
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let _ = client_hardware_yuv444_codecs;
 
     let negotiated_fps = EncoderConfig::resolve_target_fps(client_requested_fps);
     capture::set_target_fps(negotiated_fps);
@@ -781,6 +928,8 @@ fn run_shared_pipeline(
         negotiated_fps,
         client_supported_codecs,
         client_hardware_codecs,
+        client_supported_yuv444_codecs,
+        client_hardware_yuv444_codecs,
         &control,
     ) {
         Ok(selected) => selected,
@@ -797,6 +946,7 @@ fn run_shared_pipeline(
         &first_frame,
         negotiated_fps,
         client_supported_codecs,
+        client_supported_yuv444_codecs,
         &control,
     ) {
         Ok(selected) => selected,
@@ -814,6 +964,7 @@ fn run_shared_pipeline(
         first_frame.height,
         negotiated_fps,
         client_supported_codecs,
+        client_supported_yuv444_codecs,
         &control,
     ) {
         Ok(selected) => selected,
@@ -865,7 +1016,11 @@ fn run_shared_pipeline(
         stream_config.height,
     );
     let session_debug = SessionDebugInfo {
-        encoder_name: encoder_name(&encoder).to_string(),
+        encoder_name: format!(
+            "{}-{}",
+            encoder_name(&encoder),
+            encoder_chroma_name(config.chroma)
+        ),
         capture_backend: capture_backend_name,
         input_backend: input.backend_label(),
         target_bitrate_kbps: config.bitrate_kbps,
@@ -873,8 +1028,12 @@ fn run_shared_pipeline(
     };
 
     println!(
-        "Shared pipeline started: {}x{} (video: {:?} {:?})",
-        first_frame.width, first_frame.height, config.codec, config.dynamic_range,
+        "Shared pipeline started: {}x{} (video: {:?} {:?} {:?})",
+        first_frame.width,
+        first_frame.height,
+        config.codec,
+        config.dynamic_range,
+        config.chroma,
     );
 
     // Tell the control plane we started OK
@@ -1675,6 +1834,9 @@ async fn handle_client(
     let client_requested_fps = client_display_fps_hint(startup_prefs.display);
     let client_supported_codecs = client_supported_video_codecs(startup_prefs.display);
     let client_hardware_codecs = client_hardware_video_codecs(startup_prefs.display);
+    let client_supported_yuv444_codecs = client_supported_yuv444_video_codecs(startup_prefs.display);
+    let client_hardware_yuv444_codecs =
+        client_hardware_yuv444_video_codecs(startup_prefs.display);
     if let Some(display) = startup_prefs.display {
         println!(
             "[client {addr}] display refresh hint: {:.3} Hz, media udp port: {}",
@@ -1682,9 +1844,11 @@ async fn handle_client(
             client_media_port(Some(display))
         );
         println!(
-            "[client {addr}] video decode support: supported={} hardware={}",
+            "[client {addr}] video decode support: supported={} hardware={} yuv444={} yuv444-hw={}",
             codec_support_summary(display.supported_video_codecs),
-            codec_support_summary(display.hardware_video_codecs)
+            codec_support_summary(display.hardware_video_codecs),
+            codec_support_summary(display.supported_yuv444_video_codecs),
+            codec_support_summary(display.hardware_yuv444_video_codecs),
         );
     }
 
@@ -1693,6 +1857,8 @@ async fn handle_client(
     let requested_fps_for_setup = client_requested_fps;
     let supported_codecs_for_setup = client_supported_codecs;
     let hardware_codecs_for_setup = client_hardware_codecs;
+    let supported_yuv444_codecs_for_setup = client_supported_yuv444_codecs;
+    let hardware_yuv444_codecs_for_setup = client_hardware_yuv444_codecs;
     let setup = tokio::task::spawn_blocking(
         move || -> Result<
             (
@@ -1727,6 +1893,8 @@ async fn handle_client(
                     requested_fps_for_setup,
                     supported_codecs_for_setup,
                     hardware_codecs_for_setup,
+                    supported_yuv444_codecs_for_setup,
+                    hardware_yuv444_codecs_for_setup,
                     Arc::clone(&state2.input),
                     Arc::clone(&state2.control),
                 )?;
@@ -1740,6 +1908,15 @@ async fn handle_client(
             if !supported_codecs_for_setup.supports(p.stream_config.codec) {
                 return Err(format!(
                     "Active stream codec '{}' is not supported by this client",
+                    codec_name(p.stream_config.codec)
+                ));
+            }
+            if p.stream_config.chroma == VideoChromaSampling::Yuv444
+                && !supported_yuv444_codecs_for_setup.supports(p.stream_config.codec)
+            {
+                return Err(format!(
+                    "Active stream chroma '{}' is not supported by this client for codec '{}'",
+                    stream_chroma_name(p.stream_config.chroma),
                     codec_name(p.stream_config.codec)
                 ));
             }
@@ -2376,6 +2553,8 @@ fn handle_punched_client(
 
     let client_supported_codecs = _client_display.supported_video_codecs;
     let client_hardware_codecs = _client_display.hardware_video_codecs;
+    let client_supported_yuv444_codecs = _client_display.supported_yuv444_video_codecs;
+    let client_hardware_yuv444_codecs = _client_display.hardware_yuv444_video_codecs;
     let client_requested_fps = if _client_display.max_refresh_millihz > 0 {
         Some(_client_display.max_refresh_millihz / 1000)
     } else {
@@ -2400,6 +2579,8 @@ fn handle_punched_client(
                 client_requested_fps,
                 client_supported_codecs,
                 client_hardware_codecs,
+                client_supported_yuv444_codecs,
+                client_hardware_yuv444_codecs,
                 Arc::clone(&state2.input),
                 Arc::clone(&state2.control),
             ) {
@@ -2417,6 +2598,14 @@ fn handle_punched_client(
             if !client_supported_codecs.supports(p.stream_config.codec) {
                 Err(format!(
                     "Active stream codec '{}' not supported by punched client",
+                    codec_name(p.stream_config.codec)
+                ))
+            } else if p.stream_config.chroma == VideoChromaSampling::Yuv444
+                && !client_supported_yuv444_codecs.supports(p.stream_config.codec)
+            {
+                Err(format!(
+                    "Active stream chroma '{}' not supported by punched client for codec '{}'",
+                    stream_chroma_name(p.stream_config.chroma),
                     codec_name(p.stream_config.codec)
                 ))
             } else {

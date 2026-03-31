@@ -51,7 +51,17 @@ impl NvencEncoder {
         }
 
         let colorspace = Colorspace::for_dynamic_range(config.dynamic_range);
-        let sw_pix_fmt = colorspace.sw_pixel_format();
+        if config.is_yuv444() && config.is_hdr() {
+            return Err("NVENC YUV444 HDR encoding is not implemented".into());
+        }
+        if config.is_yuv444() && config.codec == Codec::Av1 {
+            return Err("NVENC AV1 YUV444 encoding is not implemented".into());
+        }
+        let sw_pix_fmt = if config.is_yuv444() {
+            ffi::AVPixelFormat::AV_PIX_FMT_YUV444P
+        } else {
+            colorspace.sw_pixel_format()
+        };
 
         unsafe {
             (*ctx).width = config.width as i32;
@@ -79,10 +89,20 @@ impl NvencEncoder {
             // Set profile based on codec (matching Sunshine)
             match config.codec {
                 Codec::H264 => {
-                    (*ctx).profile = 100; // High (enables CABAC + 8x8 transforms)
+                    (*ctx).profile = if config.is_yuv444() {
+                        ffi::FF_PROFILE_H264_HIGH_444_PREDICTIVE
+                    } else {
+                        100 // High (enables CABAC + 8x8 transforms)
+                    };
                 }
                 Codec::Hevc => {
-                    (*ctx).profile = if config.is_hdr() { 2 } else { 1 }; // Main10 / Main
+                    (*ctx).profile = if config.is_yuv444() {
+                        ffi::FF_PROFILE_HEVC_REXT
+                    } else if config.is_hdr() {
+                        2 // Main10
+                    } else {
+                        1 // Main
+                    };
                 }
                 Codec::Av1 => {
                     (*ctx).profile = 0; // Main
@@ -184,8 +204,10 @@ impl NvencEncoder {
             config.width, config.height, config.bitrate_kbps, config.framerate
         );
 
-        // BGRA → NV12/P010 scaler
-        let dst_pixel = if config.is_hdr() {
+        // BGRA → encoder software surface scaler
+        let dst_pixel = if config.is_yuv444() {
+            Pixel::YUV444P
+        } else if config.is_hdr() {
             Pixel::P010LE
         } else {
             Pixel::NV12

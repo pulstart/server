@@ -6,14 +6,14 @@
 /// Environment variable overrides (matching Sunshine's config approach):
 ///   ST_CODEC=auto|h264|hevc|av1  — prefer a video codec (default: auto)
 ///   ST_HDR=1                     — enable HDR (10-bit BT.2020+PQ)
-///   ST_CHROMA=yuv444             — use YUV 4:4:4 chroma sampling
+///   ST_CHROMA=auto|yuv420|yuv444 — chroma sampling preference (default: auto)
 ///   ST_BITRATE=50000             — starting video bitrate in Kbps
 ///   ST_MIN_BITRATE=5000          — adaptive bitrate floor in Kbps
 ///   ST_MAX_BITRATE=100000        — adaptive bitrate ceiling in Kbps
 ///   ST_FPS=60                    — max/forced framerate (caps client request)
 ///   ST_GOP=120                   — max frames between keyframes (0 = infinite GOP)
 ///   ST_AUDIO=stereo|high_stereo|surround51|high_surround51|surround71|high_surround71
-use st_protocol::{StreamConfig, VideoCodec};
+use st_protocol::{StreamConfig, VideoChromaSampling, VideoCodec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityPreset {
@@ -178,11 +178,7 @@ impl EncoderConfig {
             DynamicRange::Sdr
         };
 
-        let chroma = if std::env::var("ST_CHROMA").unwrap_or_default() == "yuv444" {
-            ChromaSampling::Yuv444
-        } else {
-            ChromaSampling::Yuv420
-        };
+        let chroma = Self::preferred_chroma_from_env().unwrap_or(ChromaSampling::Yuv420);
 
         let max_bitrate_kbps = std::env::var("ST_MAX_BITRATE")
             .ok()
@@ -232,6 +228,20 @@ impl EncoderConfig {
         Codec::preferred_order(Self::preferred_codec_from_env())
     }
 
+    pub fn preferred_chroma_from_env() -> Option<ChromaSampling> {
+        match std::env::var("ST_CHROMA")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "yuv444" => Some(ChromaSampling::Yuv444),
+            "yuv420" => Some(ChromaSampling::Yuv420),
+            "auto" | "" => None,
+            _ => None,
+        }
+    }
+
     pub fn fps_cap_from_env() -> Option<u32> {
         std::env::var("ST_FPS")
             .ok()
@@ -264,6 +274,12 @@ impl EncoderConfig {
     pub fn with_bitrate_kbps(&self, bitrate_kbps: u32) -> Self {
         let mut next = self.clone();
         next.bitrate_kbps = bitrate_kbps.clamp(self.min_bitrate_kbps, self.max_bitrate_kbps);
+        next
+    }
+
+    pub fn with_chroma_sampling(&self, chroma: ChromaSampling) -> Self {
+        let mut next = self.clone();
+        next.chroma = chroma;
         next
     }
 
@@ -349,6 +365,10 @@ impl EncoderConfig {
             audio_sample_rate: audio.sample_rate,
             audio_channels: audio.channels.min(u8::MAX as u32) as u8,
             hdr: self.is_hdr(),
+            chroma: match self.chroma {
+                ChromaSampling::Yuv420 => VideoChromaSampling::Yuv420,
+                ChromaSampling::Yuv444 => VideoChromaSampling::Yuv444,
+            },
         }
     }
 }

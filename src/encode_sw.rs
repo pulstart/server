@@ -59,7 +59,16 @@ impl SoftwareEncoder {
 
         let colorspace = Colorspace::for_dynamic_range(config.dynamic_range);
 
-        let sw_pix_fmt = if config.is_hdr() {
+        if config.is_yuv444() && config.is_hdr() {
+            return Err("Software YUV444 HDR encoding is not implemented".into());
+        }
+        if config.is_yuv444() && config.codec == Codec::Av1 {
+            return Err("Software AV1 YUV444 encoding is not implemented".into());
+        }
+
+        let sw_pix_fmt = if config.is_yuv444() {
+            ffi::AVPixelFormat::AV_PIX_FMT_YUV444P
+        } else if config.is_hdr() {
             ffi::AVPixelFormat::AV_PIX_FMT_YUV420P10LE
         } else {
             ffi::AVPixelFormat::AV_PIX_FMT_YUV420P
@@ -96,13 +105,15 @@ impl SoftwareEncoder {
             match config.codec {
                 Codec::H264 => {
                     (*ctx).profile = if config.is_yuv444() {
-                        244 // High 4:4:4 Predictive
+                        ffi::FF_PROFILE_H264_HIGH_444_PREDICTIVE
                     } else {
                         100 // High
                     };
                 }
                 Codec::Hevc => {
-                    (*ctx).profile = if config.is_hdr() {
+                    (*ctx).profile = if config.is_yuv444() {
+                        ffi::FF_PROFILE_HEVC_REXT
+                    } else if config.is_hdr() {
                         2 // Main 10
                     } else {
                         1 // Main
@@ -186,7 +197,9 @@ impl SoftwareEncoder {
         );
 
         // Build BGRA→YUV scaler
-        let dst_pixel = if config.is_hdr() {
+        let dst_pixel = if config.is_yuv444() {
+            Pixel::YUV444P
+        } else if config.is_hdr() {
             Pixel::YUV420P10LE
         } else {
             Pixel::YUV420P
