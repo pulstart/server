@@ -223,7 +223,7 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
     }
 
     Some(CapturedCursor {
-        pixels,
+        pixels: pixels.into(),
         x,
         y,
         hotspot_x: 0,
@@ -291,7 +291,11 @@ fn capture_frame(
     let cursor = cursor_handle.and_then(|h| capture_cursor(card, h));
 
     Ok(CapturedFrame {
-        data: FrameData::DmaBuf { planes, drm_format },
+        data: FrameData::DmaBuf {
+            planes,
+            drm_format,
+            _lease: None,
+        },
         width,
         height,
         cursor,

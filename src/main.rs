@@ -1238,7 +1238,24 @@ fn encode_and_broadcast(
                 #[cfg(target_os = "windows")]
                 capture::FrameData::D3D11Texture { .. } => frame,
                 #[cfg(target_os = "linux")]
-                capture::FrameData::DmaBuf { .. } => frame,
+                capture::FrameData::DmaBuf { .. } => match capture::try_clone_frame_to_ram_bgra(frame) {
+                    Ok(Some(mut composited)) => {
+                        capture::composite_cursor(&mut composited, frame.width, frame.height, cursor);
+                        frame_with_cursor = capture::CapturedFrame {
+                            data: capture::FrameData::Ram(composited),
+                            width: frame.width,
+                            height: frame.height,
+                            #[cfg(any(target_os = "linux", target_os = "windows"))]
+                            cursor: None,
+                        };
+                        &frame_with_cursor
+                    }
+                    Ok(None) => frame,
+                    Err(err) => {
+                        eprintln!("[capture] DMA-BUF cursor readback failed: {err}");
+                        frame
+                    }
+                },
             }
         } else {
             frame

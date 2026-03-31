@@ -427,6 +427,10 @@ impl InputRuntime {
             .as_ref()
             .map(|shape| {
                 shape.serial != next_shape.serial
+                    || shape.width != next_shape.width
+                    || shape.height != next_shape.height
+                    || shape.hotspot_x != next_shape.hotspot_x
+                    || shape.hotspot_y != next_shape.hotspot_y
                     || shape.rgba.as_slice() != next_shape.rgba.as_slice()
             })
             .unwrap_or(true)

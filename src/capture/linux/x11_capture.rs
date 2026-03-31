@@ -464,7 +464,7 @@ fn capture_xfixes_cursor(display: *mut x11_ffi::Display) -> Option<CapturedCurso
     unsafe { x11_ffi::XFree(cursor_image as *mut _) };
 
     Some(CapturedCursor {
-        pixels,
+        pixels: pixels.into(),
         x,
         y,
         hotspot_x: ci.xhot,

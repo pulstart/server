@@ -134,6 +134,7 @@ pub struct VaapiEncoder {
     height: u32,
     bgra_frame: Option<VideoFrame>,
     nv12_frame: Option<VideoFrame>,
+    dmabuf_import_failed: bool,
 }
 
 // SAFETY: The FFmpeg contexts are only accessed from the pipeline thread.
@@ -375,14 +376,30 @@ impl VaapiEncoder {
             height: config.height,
             bgra_frame,
             nv12_frame,
+            dmabuf_import_failed: false,
         })
     }
 
     /// Encode a captured frame (DMA-BUF or RAM), returning encoded NAL unit buffers.
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
         match &frame.data {
-            FrameData::DmaBuf { planes, drm_format } => {
-                self.encode_dmabuf(planes, *drm_format, frame.width, frame.height)
+            FrameData::DmaBuf {
+                planes,
+                drm_format,
+                ..
+            } => {
+                if !self.dmabuf_import_failed {
+                    match self.encode_dmabuf(planes, *drm_format, frame.width, frame.height) {
+                        Ok(nals) => return Ok(nals),
+                        Err(err) => {
+                            self.dmabuf_import_failed = true;
+                            eprintln!(
+                                "[vaapi] DMA-BUF import failed, falling back to RAM uploads for this session: {err}"
+                            );
+                        }
+                    }
+                }
+                self.encode_dmabuf_via_ram(planes, *drm_format, frame.width, frame.height)
             }
             FrameData::Ram(data) => self.encode_ram(data),
         }
@@ -468,6 +485,17 @@ impl VaapiEncoder {
         }
     }
 
+    fn encode_dmabuf_via_ram(
+        &mut self,
+        planes: &[DmaBufPlane],
+        drm_format: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<EncodedUnit>, String> {
+        self.fill_bgra_from_dmabuf(planes, drm_format, width, height)?;
+        self.encode_prepared_bgra()
+    }
+
     /// Encode a RAM (BGRA) frame by uploading to VAAPI via software conversion.
     fn encode_ram(&mut self, bgra_data: &[u8]) -> Result<Vec<EncodedUnit>, String> {
         let bgra_frame = self
@@ -495,6 +523,83 @@ impl VaapiEncoder {
             }
         }
 
+        self.encode_prepared_bgra()
+    }
+
+    fn fill_bgra_from_dmabuf(
+        &mut self,
+        planes: &[DmaBufPlane],
+        _drm_format: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        if planes.is_empty() {
+            return Err("DMA-BUF has no planes".into());
+        }
+
+        let plane = &planes[0];
+        let pitch = plane.pitch as usize;
+        let row_bytes = width as usize * 4;
+        let total_size = plane.offset as usize + pitch * height as usize;
+
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total_size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                plane.fd.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(format!(
+                "mmap DMA-BUF failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let sync_start: u64 = 5; // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+        let sync_end: u64 = 2 | 4; // DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
+        nix::ioctl_write_ptr_bad!(dma_buf_sync, 0x4008_6200u64, u64);
+        unsafe {
+            let _ = dma_buf_sync(plane.fd.as_raw_fd(), &sync_start);
+        }
+
+        let src = unsafe { (mapped as *const u8).add(plane.offset as usize) };
+        let bgra_frame = self
+            .bgra_frame
+            .as_mut()
+            .ok_or("BGRA frame not initialized")?;
+        let dst_stride = bgra_frame.stride(0);
+
+        if pitch == dst_stride {
+            let total = dst_stride * height as usize;
+            let src_slice = unsafe { std::slice::from_raw_parts(src, total) };
+            bgra_frame.data_mut(0)[..total].copy_from_slice(src_slice);
+        } else {
+            for row in 0..height as usize {
+                let src_row =
+                    unsafe { std::slice::from_raw_parts(src.add(row * pitch), row_bytes) };
+                let dst_start = row * dst_stride;
+                bgra_frame.data_mut(0)[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(src_row);
+            }
+        }
+
+        unsafe {
+            let _ = dma_buf_sync(plane.fd.as_raw_fd(), &sync_end);
+            libc::munmap(mapped, total_size);
+        }
+
+        Ok(())
+    }
+
+    fn encode_prepared_bgra(&mut self) -> Result<Vec<EncodedUnit>, String> {
+        let bgra_frame = self
+            .bgra_frame
+            .as_ref()
+            .ok_or("BGRA frame not initialized")?;
         let scaler = self
             .scaler
             .as_mut()

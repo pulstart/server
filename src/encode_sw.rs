@@ -234,7 +234,11 @@ impl SoftwareEncoder {
                 self.fill_bgra_from_d3d11(texture, *array_index, frame.width, frame.height)?;
             }
             #[cfg(target_os = "linux")]
-            FrameData::DmaBuf { planes, drm_format } => {
+            FrameData::DmaBuf {
+                planes,
+                drm_format,
+                ..
+            } => {
                 self.fill_bgra_from_dmabuf(planes, *drm_format, frame.width, frame.height)?;
             }
         }

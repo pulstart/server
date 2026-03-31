@@ -1,9 +1,10 @@
 use crossbeam_channel::Sender;
 
-#[cfg(target_os = "linux")]
-use std::os::fd::OwnedFd;
-#[cfg(target_os = "windows")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::{
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(target_os = "windows")]
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -19,6 +20,34 @@ pub struct DmaBufPlane {
     pub modifier: u64,
 }
 
+#[cfg(target_os = "linux")]
+pub trait FrameLeaseOps: Send {
+    fn release(&mut self);
+}
+
+#[cfg(target_os = "linux")]
+pub struct FrameLease {
+    inner: Option<Box<dyn FrameLeaseOps>>,
+}
+
+#[cfg(target_os = "linux")]
+impl FrameLease {
+    pub fn new(inner: impl FrameLeaseOps + 'static) -> Self {
+        Self {
+            inner: Some(Box::new(inner)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FrameLease {
+    fn drop(&mut self) {
+        if let Some(mut inner) = self.inner.take() {
+            inner.release();
+        }
+    }
+}
+
 /// Frame payload: either CPU-accessible bytes or GPU DMA-BUF planes.
 pub enum FrameData {
     Ram(Vec<u8>),
@@ -26,6 +55,7 @@ pub enum FrameData {
     DmaBuf {
         planes: Vec<DmaBufPlane>,
         drm_format: u32,
+        _lease: Option<FrameLease>,
     },
     #[cfg(target_os = "windows")]
     D3D11Texture {
@@ -48,7 +78,7 @@ pub struct D3D11FrameTexture {
 #[derive(Clone)]
 pub struct CapturedCursor {
     /// ARGB8888 pixel data (pre-multiplied alpha), row-major.
-    pub pixels: Vec<u8>,
+    pub pixels: Arc<[u8]>,
     /// Position relative to the captured output's top-left corner.
     pub x: i32,
     pub y: i32,
@@ -82,6 +112,101 @@ pub struct CapturedFrame {
 // On Linux, OwnedFd is Send and Vec<u8> is Send. On Windows, Ram frames are Vec<u8>
 // and D3D11 frame textures are carried behind Arc-wrapped COM handles.
 unsafe impl Send for CapturedFrame {}
+
+#[cfg(target_os = "linux")]
+fn readback_dmabuf_bgrx_plane(
+    fd: BorrowedFd<'_>,
+    offset: u32,
+    stride: u32,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
+    let stride = stride as usize;
+    let row_bytes = width as usize * 4;
+    if stride < row_bytes {
+        return Err(format!(
+            "DMA-BUF stride {stride} is smaller than row size {row_bytes}"
+        ));
+    }
+
+    let mapped_size = offset as usize + stride * height as usize;
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mapped_size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        return Err(format!(
+            "DMA-BUF mmap failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let sync_start: u64 = 5; // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+    let sync_end: u64 = 2 | 4; // DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
+    nix::ioctl_write_ptr_bad!(dma_buf_sync, 0x4008_6200u64, u64);
+    unsafe {
+        let _ = dma_buf_sync(fd.as_raw_fd(), &sync_start);
+    }
+
+    let src = unsafe { (mapped as *const u8).add(offset as usize) };
+    let mut out = vec![0u8; row_bytes * height as usize];
+    if stride == row_bytes {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out.len());
+        }
+    } else {
+        for row in 0..height as usize {
+            let src_row = unsafe { src.add(row * stride) };
+            let dst_row = row * row_bytes;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_row, out[dst_row..].as_mut_ptr(), row_bytes);
+            }
+        }
+    }
+
+    unsafe {
+        let _ = dma_buf_sync(fd.as_raw_fd(), &sync_end);
+        libc::munmap(mapped, mapped_size);
+    }
+
+    Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+pub fn try_clone_frame_to_ram_bgra(frame: &CapturedFrame) -> Result<Option<Vec<u8>>, String> {
+    const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
+    const DRM_FORMAT_ARGB8888: u32 = 0x34325241;
+
+    match &frame.data {
+        FrameData::Ram(data) => Ok(Some(data.clone())),
+        FrameData::DmaBuf {
+            planes,
+            drm_format,
+            ..
+        } => {
+            if !matches!(*drm_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888) {
+                return Ok(None);
+            }
+            let plane = planes
+                .first()
+                .ok_or_else(|| "DMA-BUF frame has no planes".to_string())?;
+            readback_dmabuf_bgrx_plane(
+                plane.fd.as_fd(),
+                plane.offset,
+                plane.pitch,
+                frame.width,
+                frame.height,
+            )
+            .map(Some)
+        }
+    }
+}
 
 /// Composite cursor onto a BGRA frame in-place (software alpha blending).
 ///

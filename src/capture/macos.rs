@@ -211,7 +211,7 @@ fn hidden_cursor_state(
     serial: u64,
 ) -> CapturedCursor {
     CapturedCursor {
-        pixels: Vec::new(),
+        pixels: Vec::new().into(),
         x: (location.x - display_frame.x - hotspot.0 as f64).round() as i32,
         y: (location.y - display_frame.y - hotspot.1 as f64).round() as i32,
         hotspot_x: hotspot.0,
@@ -299,7 +299,7 @@ fn load_cursor_shape(cursor: &NSCursor) -> Result<CapturedCursor, String> {
     );
 
     Ok(CapturedCursor {
-        pixels,
+        pixels: pixels.into(),
         x: 0,
         y: 0,
         hotspot_x: clamp_hotspot(hotspot.x, width as u32),

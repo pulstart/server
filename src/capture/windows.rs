@@ -482,7 +482,7 @@ impl CursorCapture {
 
             if info.flags != CURSOR_SHOWING || serial == 0 {
                 return Some(CapturedCursor {
-                    pixels: Vec::new(),
+                    pixels: Vec::new().into(),
                     x: info.ptScreenPos.x - self.origin_x - cached_hotspot.0 as i32,
                     y: info.ptScreenPos.y - self.origin_y - cached_hotspot.1 as i32,
                     hotspot_x: cached_hotspot.0,
@@ -582,7 +582,7 @@ impl CursorCapture {
                     let _ = DeleteObject(bitmap.into());
 
                     Ok(CapturedCursor {
-                        pixels,
+                        pixels: pixels.into(),
                         x: 0,
                         y: 0,
                         hotspot_x: icon_info.xHotspot,
