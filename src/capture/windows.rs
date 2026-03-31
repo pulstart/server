@@ -805,7 +805,15 @@ fn select_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC), St
         };
         adapter_index += 1;
 
+        let (adapter_name, vendor_id) = unsafe { adapter.GetDesc() }
+            .map(|d| {
+                let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                (String::from_utf16_lossy(&d.Description[..end]), d.VendorId)
+            })
+            .unwrap_or_default();
+
         let mut output_index = 0;
+        let mut adapter_has_output = false;
         loop {
             let output = match unsafe { adapter.EnumOutputs(output_index) } {
                 Ok(output) => output,
@@ -826,7 +834,11 @@ fn select_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC), St
                 continue;
             }
 
+            adapter_has_output = true;
             if rect_contains_point(&desc.DesktopCoordinates, 0, 0) {
+                println!(
+                    "[capture] Selected adapter: {adapter_name} (vendor: 0x{vendor_id:04x}) — primary display output"
+                );
                 return Ok((adapter, output1, desc));
             }
 
@@ -834,8 +846,18 @@ fn select_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC), St
                 fallback = Some((adapter.clone(), output1, desc));
             }
         }
+        if !adapter_has_output {
+            println!("[capture] Adapter {adapter_name} (vendor: 0x{vendor_id:04x}) — no display output");
+        }
     }
 
+    if let Some((ref adapter, _, _)) = fallback {
+        if let Ok(d) = unsafe { adapter.GetDesc() } {
+            let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+            let name = String::from_utf16_lossy(&d.Description[..end]);
+            println!("[capture] Selected adapter: {name} — fallback (no primary at 0,0)");
+        }
+    }
     fallback.ok_or_else(|| "No attached desktop output found for DXGI duplication".into())
 }
 

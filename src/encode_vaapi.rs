@@ -38,46 +38,84 @@ impl Drop for HwBufRef {
     }
 }
 
-/// Find the first available DRM render node (/dev/dri/renderD128..135).
-fn find_render_node() -> Result<String, String> {
-    for i in 128..136 {
-        let path = format!("/dev/dri/renderD{i}");
-        if std::path::Path::new(&path).exists() {
-            return Ok(path);
-        }
+/// Helper struct for probing DRM render nodes.
+struct RenderNodeProbe(std::fs::File);
+
+impl std::os::fd::AsFd for RenderNodeProbe {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
     }
-    Err("No DRM render node found (/dev/dri/renderD128..135)".into())
+}
+impl std::os::fd::AsRawFd for RenderNodeProbe {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+impl drm::Device for RenderNodeProbe {}
+
+/// Get the DRM driver name for a render node (e.g. "amdgpu", "i915", "nvidia").
+fn render_node_driver(path: &str) -> Option<String> {
+    use drm::Device as _;
+    use std::fs::OpenOptions;
+    let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
+    let node = RenderNodeProbe(file);
+    let driver = node.get_driver().ok()?;
+    Some(driver.name().to_string_lossy().to_lowercase())
 }
 
-/// Check if the render node belongs to an NVIDIA GPU.
-/// nvidia-vaapi-driver is decode-only — VAAPI encode will never work on NVIDIA.
-fn is_nvidia_render_node(path: &str) -> bool {
-    use drm::Device as BasicDevice;
-    use std::fs::OpenOptions;
-
-    struct RenderNode(std::fs::File);
-    impl std::os::fd::AsFd for RenderNode {
-        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-            self.0.as_fd()
-        }
-    }
-    impl std::os::fd::AsRawFd for RenderNode {
-        fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-            self.0.as_raw_fd()
-        }
-    }
-    impl BasicDevice for RenderNode {}
-
-    if let Ok(file) = OpenOptions::new().read(true).write(true).open(path) {
-        let node = RenderNode(file);
-        if let Ok(driver) = node.get_driver() {
-            let name = driver.name().to_string_lossy();
-            if name.contains("nvidia") {
-                return true;
+/// Find the best DRM render node for VAAPI encoding.
+///
+/// On hybrid GPU laptops (AMD iGPU + NVIDIA dGPU), the NVIDIA render node
+/// might be enumerated first. nvidia-vaapi-driver is decode-only, so VAAPI
+/// encode will never work on NVIDIA. We must skip NVIDIA nodes and find the
+/// AMD/Intel render node.
+///
+/// If a `hint` path is provided (e.g. from the capture backend's card), it
+/// is tried first — this ensures the encoder opens on the same GPU that
+/// produced the captured DMA-BUF frames.
+fn find_vaapi_render_node(hint: Option<&str>) -> Result<String, String> {
+    // If the caller knows which GPU the frames come from, try that first.
+    if let Some(path) = hint {
+        if std::path::Path::new(path).exists() {
+            if let Some(driver) = render_node_driver(path) {
+                if !driver.contains("nvidia") {
+                    println!("[vaapi] Using hinted render node {path} (driver: {driver})");
+                    return Ok(path.to_string());
+                }
+                println!("[vaapi] Hinted render node {path} is NVIDIA, skipping");
             }
         }
     }
-    false
+
+    let mut fallback = None;
+    for i in 128..136 {
+        let path = format!("/dev/dri/renderD{i}");
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        match render_node_driver(&path) {
+            Some(driver) if driver.contains("nvidia") => {
+                println!("[vaapi] Skipping {path} (nvidia — VAAPI encode not supported)");
+                continue;
+            }
+            Some(driver) => {
+                println!("[vaapi] Found VAAPI-capable render node {path} (driver: {driver})");
+                return Ok(path);
+            }
+            None => {
+                // Can't identify driver — keep as last resort
+                if fallback.is_none() {
+                    fallback = Some(path);
+                }
+            }
+        }
+    }
+
+    if let Some(path) = fallback {
+        println!("[vaapi] Using unidentified render node {path} as fallback");
+        return Ok(path);
+    }
+    Err("No non-NVIDIA DRM render node found (/dev/dri/renderD128..135)".into())
 }
 
 /// Detect GPU vendor from DRM driver name for rate-control tuning.
@@ -89,35 +127,11 @@ enum GpuVendor {
 }
 
 fn detect_gpu_vendor(path: &str) -> GpuVendor {
-    use drm::Device as BasicDevice;
-    use std::fs::OpenOptions;
-
-    struct RenderNode(std::fs::File);
-    impl std::os::fd::AsFd for RenderNode {
-        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-            self.0.as_fd()
-        }
+    match render_node_driver(path) {
+        Some(name) if name.contains("i915") || name.contains("xe") => GpuVendor::Intel,
+        Some(name) if name.contains("amdgpu") || name.contains("radeon") => GpuVendor::Amd,
+        _ => GpuVendor::Other,
     }
-    impl std::os::fd::AsRawFd for RenderNode {
-        fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-            self.0.as_raw_fd()
-        }
-    }
-    impl BasicDevice for RenderNode {}
-
-    if let Ok(file) = OpenOptions::new().read(true).write(true).open(path) {
-        let node = RenderNode(file);
-        if let Ok(driver) = node.get_driver() {
-            let name = driver.name().to_string_lossy().to_lowercase();
-            if name.contains("i915") || name.contains("xe") {
-                return GpuVendor::Intel;
-            }
-            if name.contains("amdgpu") || name.contains("radeon") {
-                return GpuVendor::Amd;
-            }
-        }
-    }
-    GpuVendor::Other
 }
 
 pub struct VaapiEncoder {
@@ -133,22 +147,29 @@ pub struct VaapiEncoder {
     height: u32,
     bgra_frame: Option<VideoFrame>,
     nv12_frame: Option<VideoFrame>,
-    dmabuf_import_failed: bool,
+    /// Number of consecutive DMA-BUF import failures. After 3 consecutive
+    /// failures the encoder falls back to CPU readback for the session.
+    dmabuf_fail_count: u32,
+    dmabuf_logged_success: bool,
 }
 
 // SAFETY: The FFmpeg contexts are only accessed from the pipeline thread.
 unsafe impl Send for VaapiEncoder {}
 
 impl VaapiEncoder {
-    pub fn with_config(config: &EncoderConfig) -> Result<Self, String> {
+    /// Create a VAAPI encoder.
+    ///
+    /// `render_node_hint` — optional path to the render node corresponding to
+    /// the capture GPU (e.g. from KMS `drmGetRenderDeviceNameFromFd`). When
+    /// provided, the encoder will prefer that node so DMA-BUF import stays on
+    /// the same GPU as capture (zero-copy path).
+    pub fn with_config(
+        config: &EncoderConfig,
+        render_node_hint: Option<&str>,
+    ) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
 
-        let render_node = find_render_node()?;
-
-        // nvidia-vaapi-driver is decode-only; skip straight to NVENC.
-        if is_nvidia_render_node(&render_node) {
-            return Err("NVIDIA GPU detected — VAAPI encode not supported (use NVENC)".into());
-        }
+        let render_node = find_vaapi_render_node(render_node_hint)?;
 
         let gpu_vendor = detect_gpu_vendor(&render_node);
         println!("[vaapi] GPU vendor: {gpu_vendor:?}");
@@ -392,7 +413,8 @@ impl VaapiEncoder {
             height: config.height,
             bgra_frame,
             nv12_frame,
-            dmabuf_import_failed: false,
+            dmabuf_fail_count: 0,
+            dmabuf_logged_success: false,
         })
     }
 
@@ -404,14 +426,30 @@ impl VaapiEncoder {
                 drm_format,
                 ..
             } => {
-                if !self.dmabuf_import_failed {
+                // Try zero-copy DMA-BUF import unless we've hit 3+ consecutive failures
+                if self.dmabuf_fail_count < 3 {
                     match self.encode_dmabuf(planes, *drm_format, frame.width, frame.height) {
-                        Ok(nals) => return Ok(nals),
+                        Ok(nals) => {
+                            if !self.dmabuf_logged_success {
+                                self.dmabuf_logged_success = true;
+                                println!("[vaapi] DMA-BUF zero-copy import OK — GPU-only encode path active");
+                            }
+                            self.dmabuf_fail_count = 0;
+                            return Ok(nals);
+                        }
                         Err(err) => {
-                            self.dmabuf_import_failed = true;
-                            eprintln!(
-                                "[vaapi] DMA-BUF import failed, falling back to RAM uploads for this session: {err}"
-                            );
+                            self.dmabuf_fail_count += 1;
+                            if self.dmabuf_fail_count >= 3 {
+                                eprintln!(
+                                    "[vaapi] DMA-BUF import failed {0} times, falling back to CPU readback: {err}",
+                                    self.dmabuf_fail_count
+                                );
+                            } else {
+                                eprintln!(
+                                    "[vaapi] DMA-BUF import attempt failed ({0}/3 before fallback): {err}",
+                                    self.dmabuf_fail_count
+                                );
+                            }
                         }
                     }
                 }

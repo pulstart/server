@@ -200,7 +200,7 @@ impl NvencEncoder {
         }
 
         println!(
-            "[nvenc] {codec_name} encoder opened ({}x{}, {}kbps, {}fps)",
+            "[nvenc] {codec_name} encoder opened ({}x{}, {}kbps, {}fps) — NOTE: DMA-BUF frames use CPU readback (mmap + swscale)",
             config.width, config.height, config.bitrate_kbps, config.framerate
         );
 

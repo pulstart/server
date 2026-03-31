@@ -171,6 +171,80 @@ impl PlatformCapture {
             Backend::PipeWire(_) => "pipewire",
         }
     }
+
+    /// Returns the render node of the GPU we're capturing from, if known.
+    ///
+    /// Used to hint the encoder to open on the same GPU so DMA-BUF import
+    /// works zero-copy.
+    /// - KMS: directly knows its card's render node.
+    /// - PipeWire/Wayland/X11: probes DRM cards to find the one driving the
+    ///   display (has active connectors+CRTCs), and returns its render node.
+    pub fn capture_render_node(&self) -> Option<&str> {
+        match &self.backend {
+            Backend::Kms(b) => b.render_node(),
+            _ => None,
+        }
+    }
+}
+
+/// Probe DRM cards to find the render node of the GPU driving the display.
+///
+/// This is useful for PipeWire/Wayland capture where we don't directly open
+/// a DRM card but the buffers come from the display GPU.
+pub fn probe_display_gpu_render_node() -> Option<String> {
+    use drm::control::Device as ControlDevice;
+    use drm::Device as BasicDevice;
+    use std::fs::OpenOptions;
+
+    struct ProbeCard(std::fs::File);
+    impl std::os::fd::AsFd for ProbeCard {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+    }
+    impl std::os::fd::AsRawFd for ProbeCard {
+        fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+            self.0.as_raw_fd()
+        }
+    }
+    impl BasicDevice for ProbeCard {}
+    impl ControlDevice for ProbeCard {}
+
+    for i in 0..8 {
+        let path = format!("/dev/dri/card{i}");
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let card = ProbeCard(file);
+        if card.get_driver().is_err() {
+            continue;
+        }
+
+        // Check if this card has active connectors (display attached)
+        let resources = match card.resource_handles() {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let has_active_connector = resources.connectors().iter().any(|&conn| {
+            card.get_connector(conn, false)
+                .map(|c| c.state() == drm::control::connector::State::Connected)
+                .unwrap_or(false)
+        });
+        if !has_active_connector {
+            continue;
+        }
+
+        // This card drives a display — get its render node
+        if let Ok(node) = drm::node::DrmNode::from_file(&card) {
+            if let Some(render_path) = node.dev_path_with_type(drm::node::NodeType::Render) {
+                let render = render_path.to_string_lossy().to_string();
+                println!("[capture] Display GPU render node: {render} (from {path})");
+                return Some(render);
+            }
+        }
+    }
+    None
 }
 
 impl CaptureBackend for PlatformCapture {

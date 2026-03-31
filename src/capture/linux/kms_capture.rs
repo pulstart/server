@@ -33,28 +33,100 @@ impl ControlDevice for Card {}
 
 impl Card {
     /// Try to open a DRM card device, iterating card0..card7.
-    fn open() -> Result<Self, String> {
+    ///
+    /// On hybrid GPU laptops (AMD iGPU + NVIDIA dGPU), the first card may not
+    /// be the one driving the display. We try all cards and prefer the one that
+    /// has active primary planes with framebuffers — that's where the display
+    /// compositor is rendering.
+    fn open() -> Result<(Self, Option<String>), String> {
+        let mut fallback: Option<(Self, String, Option<String>)> = None;
+
         for i in 0..8 {
             let path = format!("/dev/dri/card{i}");
-            match OpenOptions::new().read(true).write(true).open(&path) {
-                Ok(file) => {
-                    let card = Card(file);
-                    // Verify we can use modesetting on this device
-                    if card.get_driver().is_ok() {
-                        println!("[kms] Opened {path}");
-                        return Ok(card);
-                    }
-                }
+            let file = match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(f) => f,
                 Err(_) => continue,
+            };
+
+            let card = Card(file);
+            if card.get_driver().is_err() {
+                continue;
+            }
+
+            let render_node = Self::render_node_for(&card);
+            let driver_name = card
+                .get_driver()
+                .map(|d| d.name().to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // Enable universal planes temporarily to check for active displays
+            let has_display = if card
+                .set_client_capability(drm::ClientCapability::UniversalPlanes, true)
+                .is_ok()
+            {
+                Self::has_active_display(&card)
+            } else {
+                false
+            };
+
+            if has_display {
+                println!(
+                    "[kms] Opened {path} (driver: {driver_name}, render: {})",
+                    render_node.as_deref().unwrap_or("none")
+                );
+                return Ok((card, render_node));
+            }
+
+            // Keep as fallback if no card has an active display
+            if fallback.is_none() {
+                fallback = Some((card, path, render_node));
             }
         }
+
+        if let Some((card, path, render_node)) = fallback {
+            let driver_name = card
+                .get_driver()
+                .map(|d| d.name().to_string_lossy().to_string())
+                .unwrap_or_default();
+            println!(
+                "[kms] Opened {path} as fallback (driver: {driver_name}, no active display found on other cards)"
+            );
+            return Ok((card, render_node));
+        }
+
         Err("No usable DRM card found (/dev/dri/card0..7)".into())
+    }
+
+    /// Get the render node path for this card (e.g. /dev/dri/renderD128).
+    fn render_node_for(card: &Card) -> Option<String> {
+        let node = drm::node::DrmNode::from_file(card).ok()?;
+        let render_path = node.dev_path_with_type(drm::node::NodeType::Render)?;
+        Some(render_path.to_string_lossy().to_string())
+    }
+
+    /// Check if this card has any active primary plane with a framebuffer.
+    fn has_active_display(card: &Card) -> bool {
+        let planes = match card.plane_handles() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        for &handle in planes.iter() {
+            if let Ok(plane) = card.get_plane(handle) {
+                if plane.framebuffer().is_some() && !is_cursor_plane(card, handle) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
 pub struct KmsCapture {
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+    /// Render node for the card we're capturing from (e.g. /dev/dri/renderD128).
+    /// Used to hint the encoder to open on the same GPU for zero-copy DMA-BUF.
+    render_node: Option<String>,
 }
 
 impl KmsCapture {
@@ -62,7 +134,13 @@ impl KmsCapture {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             handle: None,
+            render_node: None,
         }
+    }
+
+    /// Returns the render node path of the GPU we're capturing from.
+    pub fn render_node(&self) -> Option<&str> {
+        self.render_node.as_deref()
     }
 }
 
@@ -308,7 +386,8 @@ impl CaptureBackend for KmsCapture {
         }
 
         // Open and validate the card before spawning the thread
-        let card = Card::open()?;
+        let (card, capture_render_node) = Card::open()?;
+        self.render_node = capture_render_node;
 
         // Enable universal planes so we can see overlay/cursor/primary planes
         card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)

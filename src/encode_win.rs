@@ -15,12 +15,19 @@ use std::ffi::{c_void, CString};
 use std::mem::ManuallyDrop;
 use std::ptr;
 use windows::core::Interface;
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{HMODULE, RECT};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11Multithread, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
-    ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
+    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
     ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
-    D3D11_TEX2D_ARRAY_VPOV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+    D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_READ, D3D11_MAP_WRITE_DISCARD,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_SDK_VERSION, D3D11_TEX2D_ARRAY_VPOV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_USAGE_DYNAMIC,
     D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
@@ -28,7 +35,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
     D3D11_VPOV_DIMENSION_TEXTURE2DARRAY,
 };
-use windows::Win32::Graphics::Dxgi::{Common::DXGI_RATIONAL, IDXGIAdapter, IDXGIDevice};
+use windows::Win32::Graphics::Dxgi::{
+    Common::DXGI_RATIONAL, CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND,
+    IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1,
+};
 
 struct HwBufRef {
     ptr: *mut ffi::AVBufferRef,
@@ -101,6 +111,19 @@ impl WindowsEncoderBackend {
     }
 }
 
+/// Cross-adapter staging state: holds resources needed to copy frames from
+/// the capture GPU to the encoder GPU via CPU memory.
+struct CrossAdapterStaging {
+    /// Staging texture on the CAPTURE device (GPU→CPU read).
+    staging_texture: ID3D11Texture2D,
+    /// Device context of the CAPTURE device (for CopyResource + Map).
+    capture_context: ID3D11DeviceContext,
+    /// Upload texture on the ENCODER device (CPU→GPU write).
+    upload_texture: ID3D11Texture2D,
+    /// Device context of the ENCODER device (for Map).
+    encoder_context: ID3D11DeviceContext,
+}
+
 pub struct WindowsHwEncoder {
     backend: WindowsEncoderBackend,
     codec_ctx: *mut ffi::AVCodecContext,
@@ -115,6 +138,8 @@ pub struct WindowsHwEncoder {
     force_keyframe_next: bool,
     width: u32,
     height: u32,
+    /// Present when encoder is on a different GPU than capture.
+    cross_adapter: Option<CrossAdapterStaging>,
 }
 
 unsafe impl Send for WindowsHwEncoder {}
@@ -258,6 +283,7 @@ impl WindowsHwEncoder {
             force_keyframe_next: false,
             width: config.width,
             height: config.height,
+            cross_adapter: None,
         })
     }
 
@@ -266,12 +292,80 @@ impl WindowsHwEncoder {
             FrameData::D3D11Texture {
                 texture,
                 array_index,
-            } => self.encode_texture(&texture.texture, *array_index),
+            } => {
+                if let Some(staging) = &self.cross_adapter {
+                    // Cross-adapter path: capture GPU → staging → encoder GPU
+                    let local_texture =
+                        Self::stage_cross_adapter(&texture.texture, *array_index, staging)?;
+                    self.encode_texture(&local_texture, 0)
+                } else {
+                    self.encode_texture(&texture.texture, *array_index)
+                }
+            }
             FrameData::Ram(_) => Err("Windows hardware encoder requires D3D11 capture frames".into()),
             #[cfg(target_os = "linux")]
             FrameData::DmaBuf { .. } => {
                 Err("Windows hardware encoder does not support DMA-BUF input".into())
             }
+        }
+    }
+
+    /// Copy a texture from the capture GPU to the encoder GPU via CPU staging.
+    fn stage_cross_adapter(
+        source: &ID3D11Texture2D,
+        source_index: u32,
+        staging: &CrossAdapterStaging,
+    ) -> Result<ID3D11Texture2D, String> {
+        unsafe {
+            use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
+
+            // 1. Copy source texture to staging texture (both on capture GPU)
+            let src_sub = if source_index > 0 {
+                windows::Win32::Graphics::Direct3D11::D3D11CalcSubresource(0, source_index, 1)
+            } else {
+                0
+            };
+            staging.capture_context.CopySubresourceRegion(
+                &staging.staging_texture,
+                0,
+                0, 0, 0,
+                source,
+                src_sub,
+                None,
+            );
+
+            // 2. Map staging texture for CPU read
+            let mut mapped_src = D3D11_MAPPED_SUBRESOURCE::default();
+            staging
+                .capture_context
+                .Map(&staging.staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped_src))
+                .map_err(|err| format!("Map staging texture failed: {err}"))?;
+
+            // 3. Update encoder-side upload texture via UpdateSubresource
+            let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
+            staging.upload_texture.GetDesc(&mut tex_desc);
+            let row_pitch = tex_desc.Width * 4; // BGRA = 4 bytes per pixel
+
+            let box_region = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: tex_desc.Width,
+                bottom: tex_desc.Height,
+                back: 1,
+            };
+            staging.encoder_context.UpdateSubresource(
+                &staging.upload_texture,
+                0,
+                Some(&box_region),
+                mapped_src.pData,
+                mapped_src.RowPitch,
+                0,
+            );
+
+            staging.capture_context.Unmap(&staging.staging_texture, 0);
+
+            Ok(staging.upload_texture.clone())
         }
     }
 
@@ -460,6 +554,12 @@ impl Drop for WindowsHwEncoder {
     }
 }
 
+/// Returns the preferred encoder backend order for the capture GPU.
+///
+/// On hybrid GPU laptops, the display may be on an Intel/AMD iGPU while an
+/// NVIDIA dGPU is also present. We order the vendor-native backend first but
+/// always include all backends so that cross-vendor encoders (if FFmpeg
+/// supports them on this device) get a chance.
 pub fn preferred_backend_order(
     capture_texture: &D3D11FrameTexture,
 ) -> Result<Vec<WindowsEncoderBackend>, String> {
@@ -483,19 +583,321 @@ pub fn preferred_backend_order(
             .map_err(|err| format!("IDXGIAdapter::GetDesc failed: {err}"))?
     };
 
+    let adapter_name = String::from_utf16_lossy(
+        &desc.Description[..desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len())],
+    );
+    let vendor_label = match desc.VendorId {
+        0x10de => "NVIDIA",
+        0x1002 | 0x1022 => "AMD",
+        0x8086 => "Intel",
+        0x5143 | 0x4D4F4351 => "Qualcomm",
+        _ => "Unknown",
+    };
+    println!("[encoder] Capture adapter: {adapter_name} (vendor: {vendor_label}, id: 0x{:04x})", desc.VendorId);
+
+    use WindowsEncoderBackend::*;
+    // Vendor-native first, then all others as fallbacks
     let order = match desc.VendorId {
-        0x10de => vec![WindowsEncoderBackend::Nvenc],
-        0x1002 | 0x1022 => vec![WindowsEncoderBackend::Amf],
-        0x8086 => vec![WindowsEncoderBackend::MediaFoundation],
-        0x5143 | 0x4D4F4351 => vec![WindowsEncoderBackend::MediaFoundation],
-        _ => vec![
-            WindowsEncoderBackend::Nvenc,
-            WindowsEncoderBackend::Amf,
-            WindowsEncoderBackend::MediaFoundation,
-        ],
+        0x10de => vec![Nvenc, Amf, MediaFoundation],
+        0x1002 | 0x1022 => vec![Amf, Nvenc, MediaFoundation],
+        0x8086 => vec![MediaFoundation, Nvenc, Amf],
+        0x5143 | 0x4D4F4351 => vec![MediaFoundation, Nvenc, Amf],
+        _ => vec![Nvenc, Amf, MediaFoundation],
     };
 
     Ok(order)
+}
+
+/// An encoder backend available on a different adapter than the capture GPU.
+pub struct CrossAdapterBackend {
+    pub backend: WindowsEncoderBackend,
+    pub adapter: IDXGIAdapter1,
+    pub adapter_name: String,
+}
+
+/// Enumerate encoder backends available on adapters OTHER than the capture GPU.
+///
+/// On hybrid GPU laptops, the capture may be on an Intel/AMD iGPU while an
+/// NVIDIA dGPU has NVENC. This function finds those alternate adapters.
+pub fn cross_adapter_backends(
+    capture_texture: &D3D11FrameTexture,
+) -> Vec<CrossAdapterBackend> {
+    let capture_device = match unsafe { capture_texture.texture.GetDevice() } {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let capture_dxgi = match capture_device.cast::<IDXGIDevice>() {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let capture_adapter: IDXGIAdapter = match unsafe { capture_dxgi.GetAdapter() } {
+        Ok(a) => a,
+        Err(_) => return Vec::new(),
+    };
+    let capture_desc = match unsafe { capture_adapter.GetDesc() } {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let capture_luid = capture_desc.AdapterLuid;
+
+    let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+    let mut i = 0u32;
+    loop {
+        let adapter = match unsafe { factory.EnumAdapters1(i) } {
+            Ok(a) => a,
+            Err(err) if err.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(_) => break,
+        };
+        i += 1;
+
+        let desc = match unsafe { adapter.GetDesc() } {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        // Skip the capture adapter itself
+        if desc.AdapterLuid.LowPart == capture_luid.LowPart
+            && desc.AdapterLuid.HighPart == capture_luid.HighPart
+        {
+            continue;
+        }
+        // Skip software adapters
+        if desc.VendorId == 0x1414 {
+            continue;
+        }
+
+        let name = String::from_utf16_lossy(
+            &desc.Description[..desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len())],
+        );
+
+        let backends: Vec<WindowsEncoderBackend> = match desc.VendorId {
+            0x10de => vec![WindowsEncoderBackend::Nvenc],
+            0x1002 | 0x1022 => vec![WindowsEncoderBackend::Amf],
+            0x8086 => vec![WindowsEncoderBackend::MediaFoundation],
+            _ => continue,
+        };
+
+        for backend in backends {
+            println!(
+                "[encoder] Cross-adapter candidate: {name} (vendor: 0x{:04x}) — {}",
+                desc.VendorId,
+                backend.label()
+            );
+            results.push(CrossAdapterBackend {
+                backend,
+                adapter: adapter.clone(),
+                adapter_name: name.clone(),
+            });
+        }
+    }
+    results
+}
+
+impl WindowsHwEncoder {
+    /// Create a hardware encoder on a DIFFERENT adapter than the capture device.
+    ///
+    /// Frames are staged through CPU memory: capture GPU → staging (CPU read) →
+    /// encoder GPU upload texture → video processor → encode.
+    /// This is slower than same-adapter encode but much faster than full
+    /// software encoding, and enables NVENC on hybrid GPU laptops where the
+    /// display is on an Intel/AMD iGPU.
+    pub fn with_config_cross_adapter(
+        config: &EncoderConfig,
+        capture_texture: &D3D11FrameTexture,
+        target_adapter: &IDXGIAdapter1,
+        backend: WindowsEncoderBackend,
+        adapter_name: &str,
+    ) -> Result<Self, String> {
+        if config.is_yuv444() {
+            return Err("Windows hardware encoding currently supports YUV420 only".into());
+        }
+        if config.is_hdr() && backend == WindowsEncoderBackend::MediaFoundation {
+            return Err("Media Foundation hardware encode is currently SDR-only".into());
+        }
+
+        ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
+
+        // Create a new D3D11 device on the target (encoder) adapter
+        let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+        let mut enc_device = None;
+        let mut enc_context = None;
+        unsafe {
+            D3D11CreateDevice(
+                target_adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                Some(&feature_levels),
+                D3D11_SDK_VERSION,
+                Some(&mut enc_device),
+                None,
+                Some(&mut enc_context),
+            )
+            .map_err(|err| format!("D3D11CreateDevice on {adapter_name} failed: {err}"))?;
+        }
+
+        let device = enc_device.ok_or("D3D11CreateDevice returned null device")?;
+        let _enc_ctx = enc_context.ok_or("D3D11CreateDevice returned null context")?;
+
+        if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
+            unsafe {
+                let _ = multithread.SetMultithreadProtected(true);
+            }
+        }
+        let device_context = unsafe {
+            device
+                .GetImmediateContext()
+                .map_err(|err| format!("GetImmediateContext failed: {err}"))?
+        };
+        let video_device = device
+            .cast::<ID3D11VideoDevice>()
+            .map_err(|err| format!("ID3D11VideoDevice cast failed: {err}"))?;
+        let video_context = device_context
+            .cast::<ID3D11VideoContext>()
+            .map_err(|err| format!("ID3D11VideoContext cast failed: {err}"))?;
+
+        let colorspace = Colorspace::for_dynamic_range(config.dynamic_range);
+        let device_ctx = create_hw_device_ctx(&device)?;
+        let frames_ctx = create_hw_frames_ctx(&device_ctx, config)?;
+        let (processor_enum, processor) =
+            create_video_processor(&video_device, &video_context, config)?;
+
+        // Set up cross-adapter staging: capture GPU → CPU → encoder GPU
+        let capture_device: ID3D11Device = unsafe {
+            capture_texture.texture.GetDevice()
+                .map_err(|err| format!("GetDevice (capture) failed: {err}"))?
+        };
+        let capture_context = unsafe {
+            capture_device.GetImmediateContext()
+                .map_err(|err| format!("GetImmediateContext (capture) failed: {err}"))?
+        };
+
+        let bgra_format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+        let sample_desc = windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+        let zero_misc = windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(0);
+        let zero_bind = windows::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(0);
+
+        // Staging texture on capture device (GPU → CPU read)
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: config.width, Height: config.height,
+            MipLevels: 1, ArraySize: 1,
+            Format: bgra_format, SampleDesc: sample_desc,
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: zero_bind,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ,
+            MiscFlags: zero_misc,
+        };
+        let staging_texture = unsafe {
+            let mut tex = None;
+            capture_device.CreateTexture2D(&staging_desc, None, Some(&mut tex))
+                .map_err(|err| format!("CreateTexture2D (staging) failed: {err}"))?;
+            tex.ok_or("staging texture is null")?
+        };
+
+        // Upload texture on encoder device (CPU → GPU write)
+        let upload_desc = D3D11_TEXTURE2D_DESC {
+            Width: config.width, Height: config.height,
+            MipLevels: 1, ArraySize: 1,
+            Format: bgra_format, SampleDesc: sample_desc,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET,
+            CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_FLAG(0),
+            MiscFlags: zero_misc,
+        };
+        let upload_texture = unsafe {
+            let mut tex = None;
+            device.CreateTexture2D(&upload_desc, None, Some(&mut tex))
+                .map_err(|err| format!("CreateTexture2D (upload) failed: {err}"))?;
+            tex.ok_or("upload texture is null")?
+        };
+
+        let codec_name = backend.codec_name(config);
+        let codec_name_c = CString::new(codec_name).unwrap();
+        let codec = unsafe { ffi::avcodec_find_encoder_by_name(codec_name_c.as_ptr()) };
+        if codec.is_null() {
+            return Err(format!("{codec_name} encoder not found"));
+        }
+
+        let ctx = unsafe { ffi::avcodec_alloc_context3(codec) };
+        if ctx.is_null() {
+            return Err("avcodec_alloc_context3 returned null".into());
+        }
+
+        unsafe {
+            (*ctx).width = config.width as i32;
+            (*ctx).height = config.height as i32;
+            (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
+            (*ctx).time_base = ffi::AVRational {
+                num: 1,
+                den: config.framerate as i32,
+            };
+            (*ctx).framerate = ffi::AVRational {
+                num: config.framerate as i32,
+                den: 1,
+            };
+            (*ctx).gop_size = config.gop_size as i32;
+            (*ctx).max_b_frames = config.max_b_frames as i32;
+            (*ctx).bit_rate = config.bitrate_bps();
+            (*ctx).rc_min_rate = config.bitrate_bps();
+            (*ctx).rc_max_rate = config.bitrate_bps();
+            (*ctx).rc_buffer_size = config.vbv_buffer_size(false);
+            (*ctx).hw_device_ctx = ffi::av_buffer_ref(device_ctx.ptr);
+            (*ctx).hw_frames_ctx = ffi::av_buffer_ref(frames_ctx.ptr);
+            if config.low_delay {
+                (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            }
+            (*ctx).flags |= ffi::AV_CODEC_FLAG_CLOSED_GOP as i32;
+
+            match config.codec {
+                Codec::H264 => { (*ctx).profile = 100; }
+                Codec::Hevc => { (*ctx).profile = if config.is_hdr() { 2 } else { 1 }; }
+                Codec::Av1 => { (*ctx).profile = 0; }
+            }
+
+            colorspace.apply_to_codec_ctx(ctx);
+            apply_backend_options(ctx, backend, config)?;
+
+            let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+            if ret < 0 {
+                ffi::avcodec_free_context(&mut { ctx });
+                return Err(format!(
+                    "avcodec_open2 failed for {codec_name}: {}",
+                    ffmpeg_err(ret)
+                ));
+            }
+        }
+
+        println!(
+            "[encoder] Cross-adapter {codec_name} encoder opened on {adapter_name} ({}x{}, {}kbps, {}fps) — staging via CPU",
+            config.width, config.height, config.bitrate_kbps, config.framerate
+        );
+
+        Ok(Self {
+            backend,
+            codec_ctx: ctx,
+            _device_ctx: device_ctx,
+            _frames_ctx: frames_ctx,
+            video_device,
+            video_context,
+            processor_enum,
+            processor,
+            colorspace,
+            frame_index: 0,
+            force_keyframe_next: false,
+            width: config.width,
+            height: config.height,
+            cross_adapter: Some(CrossAdapterStaging {
+                staging_texture,
+                capture_context,
+                upload_texture,
+                encoder_context: device_context,
+            }),
+        })
+    }
 }
 
 fn create_hw_device_ctx(device: &ID3D11Device) -> Result<HwBufRef, String> {

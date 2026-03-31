@@ -8,6 +8,7 @@ mod broadcast;
 mod capture;
 mod clipboard;
 mod colorspace;
+mod file_transfer;
 #[cfg(target_os = "linux")]
 mod encode;
 mod encode_config;
@@ -113,7 +114,15 @@ enum EncoderBackend {
 
 #[cfg(target_os = "linux")]
 fn create_linux_encoder(config: &EncoderConfig) -> Result<EncoderKind, String> {
-    match encode_vaapi::VaapiEncoder::with_config(config) {
+    create_linux_encoder_with_hint(config, None)
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_encoder_with_hint(
+    config: &EncoderConfig,
+    render_node_hint: Option<&str>,
+) -> Result<EncoderKind, String> {
+    match encode_vaapi::VaapiEncoder::with_config(config, render_node_hint) {
         Ok(e) => {
             println!("[encoder] Using VAAPI ({:?})", config.codec);
             Ok(EncoderKind::Vaapi(e))
@@ -149,7 +158,7 @@ fn create_encoder_for_backend(
 ) -> Result<EncoderKind, String> {
     match backend {
         #[cfg(target_os = "linux")]
-        EncoderBackend::Vaapi => encode_vaapi::VaapiEncoder::with_config(config)
+        EncoderBackend::Vaapi => encode_vaapi::VaapiEncoder::with_config(config, None)
             .map(EncoderKind::Vaapi)
             .map_err(|err| format!("VAAPI reconfigure failed: {err}")),
         #[cfg(target_os = "linux")]
@@ -379,6 +388,7 @@ fn select_linux_encoder(
     client_supported_yuv444_codecs: VideoCodecSupport,
     client_hardware_yuv444_codecs: VideoCodecSupport,
     control: &ServerControl,
+    capture_render_node: Option<&str>,
 ) -> Result<(EncoderConfig, EncoderKind), String> {
     let forced_codec = control.forced_codec();
     let forced_quality = control.forced_quality();
@@ -439,7 +449,7 @@ fn select_linux_encoder(
             }
 
             let config = base_config.with_chroma_sampling(chroma);
-            match create_linux_encoder(&config) {
+            match create_linux_encoder_with_hint(&config, capture_render_node) {
                 Ok(encoder) => {
                     let backend = encoder_backend(&encoder);
                     let score =
@@ -522,6 +532,13 @@ fn select_windows_encoder(
     } else {
         Vec::new()
     };
+    // Enumerate encoder backends on OTHER adapters (e.g. NVENC on dGPU when
+    // capture is on iGPU). Only used when same-adapter backends all fail.
+    let cross_adapter_backends = if let Some(texture) = hardware_capture {
+        encode_win::cross_adapter_backends(texture)
+    } else {
+        Vec::new()
+    };
 
     for codec in codec_order {
         if !client_supported_codecs.supports(codec.to_stream_codec()) {
@@ -565,6 +582,35 @@ fn select_windows_encoder(
                         "{} {} encode unavailable: {err}",
                         codec_name(codec.to_stream_codec()),
                         backend.label()
+                    )),
+                }
+            }
+        }
+
+        // Try hardware encoding on OTHER adapters (cross-adapter staging)
+        if let Some(texture) = hardware_capture {
+            for cab in &cross_adapter_backends {
+                match encode_win::WindowsHwEncoder::with_config_cross_adapter(
+                    &config,
+                    texture,
+                    &cab.adapter,
+                    cab.backend,
+                    &cab.adapter_name,
+                ) {
+                    Ok(encoder) => {
+                        println!(
+                            "[encoder] Selected {} with {} on {} (cross-adapter)",
+                            codec_name(config.stream_codec()),
+                            cab.backend.label(),
+                            cab.adapter_name
+                        );
+                        return Ok((config, EncoderKind::Hardware(encoder)));
+                    }
+                    Err(err) => failures.push(format!(
+                        "{} {} cross-adapter ({}) unavailable: {err}",
+                        codec_name(codec.to_stream_codec()),
+                        cab.backend.label(),
+                        cab.adapter_name
                     )),
                 }
             }
@@ -922,6 +968,15 @@ fn run_shared_pipeline(
     let audio_config = encode_config::AudioConfig::from_env();
 
     #[cfg(target_os = "linux")]
+    let capture_render_hint = capture_backend
+        .capture_render_node()
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // PipeWire/Wayland capture doesn't directly know its GPU.
+            // Probe DRM cards to find the display GPU's render node.
+            capture::linux::probe_display_gpu_render_node()
+        });
+    #[cfg(target_os = "linux")]
     let (config, mut encoder) = match select_linux_encoder(
         first_frame.width,
         first_frame.height,
@@ -931,6 +986,7 @@ fn run_shared_pipeline(
         client_supported_yuv444_codecs,
         client_hardware_yuv444_codecs,
         &control,
+        capture_render_hint.as_deref(),
     ) {
         Ok(selected) => selected,
         Err(msg) => {
@@ -1373,13 +1429,20 @@ fn encode_and_broadcast(
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     input.update_cursor(frame.cursor.as_ref());
 
-    // Composite cursor onto RAM frames before encoding when no controller owns input.
-    // During active control, the cursor is sent separately to the client and kept
-    // out of the encoded frame.
+    // Composite cursor onto RAM frames before encoding when no controller owns input
+    // AND the cursor is NOT already being sent separately to clients.
+    //
+    // When separate_cursor is true (PipeWire, KMS, X11), cursor data is sent via
+    // CursorShape/CursorState over TCP and the client renders it as an overlay.
+    // Compositing into the video frame would be redundant and — for DMA-BUF frames —
+    // catastrophically expensive: it forces a full GPU→CPU readback that breaks the
+    // zero-copy encode path.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let separate_cursor = input.capabilities().separate_cursor;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let frame_with_cursor;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let frame_ref = if !input.control_active() {
+    let frame_ref = if !input.control_active() && !separate_cursor {
         if let Some(cursor) = &frame.cursor {
             match &frame.data {
                 capture::FrameData::Ram(data) => {
@@ -2078,7 +2141,10 @@ async fn handle_client(
 
     println!("[pipeline] Client {addr} subscribed (transport started)");
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
-    let mut clipboard_sync = clipboard::ClipboardSync::start(
+    let (file_detect_tx, file_detect_rx) =
+        crossbeam_channel::bounded::<std::path::PathBuf>(8);
+    let suppressed_paths = clipboard::new_suppressed_paths();
+    let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "server",
         true,
         {
@@ -2086,6 +2152,13 @@ async fn handle_client(
             move || input.controller_state_for(client_id) == ControllerState::OwnedByYou
         },
         clipboard_control_tx,
+        file_detect_tx,
+        Arc::clone(&suppressed_paths),
+    );
+    let mut ft_manager = file_transfer::FileTransferManager::start_full(
+        st_protocol::file_transfer::TransportMode::Direct,
+        file_transfer::new_shared_state(),
+        suppressed_paths,
     );
 
     // Hold TCP open — read control messages from client
@@ -2116,6 +2189,21 @@ async fn handle_client(
             }
         }
         if clipboard_write_failed {
+            break;
+        }
+        while let Ok(path) = file_detect_rx.try_recv() {
+            let _ = ft_manager.inbound_tx.try_send(
+                file_transfer::FtInbound::SendFile { path },
+            );
+        }
+        let mut ft_write_failed = false;
+        while let Ok(message) = ft_manager.outbound_rx.try_recv() {
+            if stream.write_all(&message.serialize()).await.is_err() {
+                ft_write_failed = true;
+                break;
+            }
+        }
+        if ft_write_failed {
             break;
         }
         let mut cursor_write_failed = false;
@@ -2200,6 +2288,40 @@ async fn handle_client(
                                 clipboard_sync.set_remote_text(text);
                             }
                         }
+                        ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
+                            if state.input.controller_state_for(client_id)
+                                == ControllerState::OwnedByYou
+                            {
+                                let _ = ft_manager.inbound_tx.try_send(
+                                    file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                                );
+                            }
+                        }
+                        ControlMessage::FileAccept { transfer_id, accepted } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::AcceptReceived { transfer_id, accepted },
+                            );
+                        }
+                        ControlMessage::FileChunk { transfer_id, chunk_index, data } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::ChunkReceived { transfer_id, chunk_index, data },
+                            );
+                        }
+                        ControlMessage::FileComplete { transfer_id, total_chunks, sha256 } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::CompleteReceived { transfer_id, total_chunks, sha256 },
+                            );
+                        }
+                        ControlMessage::FileCancel { transfer_id } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::CancelReceived { transfer_id },
+                            );
+                        }
+                        ControlMessage::FileProgress { transfer_id, chunks_received } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::ProgressReceived { transfer_id, chunks_received },
+                            );
+                        }
                         ControlMessage::ClientDisplayInfo(_)
                         | ControlMessage::ClientReadyForMedia
                         | ControlMessage::InputSession(_)
@@ -2219,6 +2341,7 @@ async fn handle_client(
 
     println!("Client {addr} disconnected.");
     clipboard_sync.stop();
+    ft_manager.stop();
     transport_running.store(false, Ordering::SeqCst);
     rate_control.unregister_client(sub.vid_sub_id);
     let _ = state.input.release_control(client_id);
@@ -2346,7 +2469,7 @@ fn probe_backends() {
         config.codec, config.dynamic_range, config.bitrate_kbps, config.framerate
     );
 
-    match encode_vaapi::VaapiEncoder::with_config(&config) {
+    match encode_vaapi::VaapiEncoder::with_config(&config, None) {
         Ok(_) => println!("[probe] Encoder: VAAPI"),
         Err(e) => {
             println!("[probe] Encoder: VAAPI unavailable ({e})");
@@ -2747,7 +2870,10 @@ fn handle_punched_client(
     let _ = punched.send_control(&ControlMessage::StreamStarted.serialize());
     println!("[punched] Client {peer} subscribed (transport started)");
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
-    let mut clipboard_sync = clipboard::ClipboardSync::start(
+    let (file_detect_tx, file_detect_rx) =
+        crossbeam_channel::bounded::<std::path::PathBuf>(8);
+    let suppressed_paths = clipboard::new_suppressed_paths();
+    let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "server-punched",
         true,
         {
@@ -2755,6 +2881,13 @@ fn handle_punched_client(
             move || input.controller_state_for(client_id) == ControllerState::OwnedByYou
         },
         clipboard_control_tx,
+        file_detect_tx,
+        Arc::clone(&suppressed_paths),
+    );
+    let mut ft_manager = file_transfer::FileTransferManager::start_full(
+        st_protocol::file_transfer::TransportMode::Punched,
+        file_transfer::new_shared_state(),
+        suppressed_paths,
     );
 
     // --- Control loop: read from punched socket ---
@@ -2776,6 +2909,14 @@ fn handle_punched_client(
             last_controller_state = controller_state;
         }
         while let Ok(message) = clipboard_control_rx.try_recv() {
+            let _ = punched.send_control(&message.serialize());
+        }
+        while let Ok(path) = file_detect_rx.try_recv() {
+            let _ = ft_manager.inbound_tx.try_send(
+                file_transfer::FtInbound::SendFile { path },
+            );
+        }
+        while let Ok(message) = ft_manager.outbound_rx.try_recv() {
             let _ = punched.send_control(&message.serialize());
         }
 
@@ -2823,6 +2964,40 @@ fn handle_punched_client(
                                 clipboard_sync.set_remote_text(text);
                             }
                         }
+                        ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
+                            if state.input.controller_state_for(client_id)
+                                == ControllerState::OwnedByYou
+                            {
+                                let _ = ft_manager.inbound_tx.try_send(
+                                    file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                                );
+                            }
+                        }
+                        ControlMessage::FileAccept { transfer_id, accepted } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::AcceptReceived { transfer_id, accepted },
+                            );
+                        }
+                        ControlMessage::FileChunk { transfer_id, chunk_index, data } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::ChunkReceived { transfer_id, chunk_index, data },
+                            );
+                        }
+                        ControlMessage::FileComplete { transfer_id, total_chunks, sha256 } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::CompleteReceived { transfer_id, total_chunks, sha256 },
+                            );
+                        }
+                        ControlMessage::FileCancel { transfer_id } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::CancelReceived { transfer_id },
+                            );
+                        }
+                        ControlMessage::FileProgress { transfer_id, chunks_received } => {
+                            let _ = ft_manager.inbound_tx.try_send(
+                                file_transfer::FtInbound::ProgressReceived { transfer_id, chunks_received },
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -2845,6 +3020,7 @@ fn handle_punched_client(
 
     // Cleanup.
     clipboard_sync.stop();
+    ft_manager.stop();
     transport_running.store(false, Ordering::SeqCst);
     let _ = transport_handle.join();
     rate_control.unregister_client(sub.vid_sub_id);
