@@ -2080,7 +2080,7 @@ async fn handle_client(
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
     let mut clipboard_sync = clipboard::ClipboardSync::start(
         "server",
-        false,
+        true,
         {
             let input = Arc::clone(&state.input);
             move || input.controller_state_for(client_id) == ControllerState::OwnedByYou
@@ -2749,7 +2749,7 @@ fn handle_punched_client(
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
     let mut clipboard_sync = clipboard::ClipboardSync::start(
         "server-punched",
-        false,
+        true,
         {
             let input = Arc::clone(&state.input);
             move || input.controller_state_for(client_id) == ControllerState::OwnedByYou

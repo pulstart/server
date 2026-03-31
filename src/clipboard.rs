@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLIPBOARD_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const CLIPBOARD_SEND_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CLIPBOARD_TEXT_BYTES: usize = u16::MAX as usize;
+const REMOTE_CHANNEL_BOUND: usize = 8;
 
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
@@ -43,7 +45,7 @@ impl ClipboardSync {
     where
         F: Fn() -> bool + Send + 'static,
     {
-        let (remote_tx, remote_rx) = crossbeam_channel::unbounded::<String>();
+        let (remote_tx, remote_rx) = crossbeam_channel::bounded::<String>(REMOTE_CHANNEL_BOUND);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         let thread = thread::spawn(move || {
@@ -64,7 +66,7 @@ impl ClipboardSync {
     }
 
     pub fn set_remote_text(&self, text: String) {
-        let _ = self.remote_tx.send(text);
+        let _ = self.remote_tx.try_send(text);
     }
 
     pub fn stop(&mut self) {
@@ -95,6 +97,7 @@ fn run_clipboard_loop<F>(
     let mut last_log = Instant::now() - CLIPBOARD_ERROR_LOG_INTERVAL;
     let mut pending_remote: Option<String> = None;
     let mut last_synced_text: Option<String> = None;
+    let mut last_sent = Instant::now() - CLIPBOARD_SEND_MIN_INTERVAL;
     let mut was_active = false;
 
     while !stop.load(Ordering::Relaxed) {
@@ -147,7 +150,8 @@ fn run_clipboard_loop<F>(
                 Ok(text) => {
                     let text = clamp_clipboard_text(&text);
                     let changed = last_synced_text.as_deref() != Some(text.as_str());
-                    if send_snapshot || changed {
+                    let rate_ok = last_sent.elapsed() >= CLIPBOARD_SEND_MIN_INTERVAL;
+                    if send_snapshot || (changed && rate_ok) {
                         if outbound_tx
                             .send(ControlMessage::ClipboardText(text.clone()))
                             .is_err()
@@ -161,6 +165,7 @@ fn run_clipboard_loop<F>(
                             );
                         }
                         last_synced_text = Some(text);
+                        last_sent = Instant::now();
                     }
                 }
                 Err(_) => {}
