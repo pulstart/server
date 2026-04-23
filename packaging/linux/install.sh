@@ -1,54 +1,50 @@
 #!/usr/bin/env bash
-# st-server Linux system-service installer.
+# st-server Linux installer (user-session mode).
 #
-# Downloads the latest published release from https://github.com/pulstart/server
-# and wires it up as a systemd system service that starts at boot (so the
-# server is reachable from the SDDM/GDM greeter before anyone logs in) and
-# keeps streaming after a user logs into their desktop.
+# Installs st-server into the invoking user's home as a systemd user service
+# that starts on desktop login. Because it runs under the user's session bus,
+# it reaches PipeWire, PulseAudio, xdg-desktop-portal, and the compositor
+# natively — no cross-user permission juggling.
 #
 # One-liner:
-#     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | sudo bash
+#     curl -fsSL https://raw.githubusercontent.com/zhey/st/main/packaging/linux/install.sh | bash
+#
+# The only step that needs root is the /dev/uinput udev rule (input
+# injection). The script re-execs itself via sudo for that bit only.
 #
 # Uninstall:
-#     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | sudo bash -s -- --uninstall
-#     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | sudo bash -s -- --uninstall --purge
-#
-# --uninstall removes the service, unit file, udev rule, autostart entry,
-# binary symlink, and the install prefix. State (tokens, portal tokens) at
-# /var/lib/st-server is kept by default so a reinstall is silent. Add
-# --purge to also delete the state dir, sysusers entry, and `st` user/group.
+#     curl -fsSL https://raw.githubusercontent.com/zhey/st/main/packaging/linux/install.sh | bash -s -- --uninstall
 #
 # Environment knobs:
-#     ST_SERVER_VERSION=v0.4.6     Pin a specific release (default: latest).
-#     ST_SERVER_PREFIX=/opt/st-server   Where to unpack the tarball.
-#     ST_SERVER_TOKEN=hexstring    Pre-seed the trust token.
-#     ST_SERVER_NO_ENABLE=1        Install but do not `systemctl enable --now`.
+#     ST_SERVER_VERSION=v0.4.6    Pin a specific release (default: latest).
+#     ST_SERVER_PREFIX=$HOME/...  Override the user install prefix.
+#     ST_SERVER_NO_ENABLE=1       Install but do not `systemctl --user enable --now`.
 
 set -euo pipefail
 
-REPO="pulstart/server"
-PREFIX="${ST_SERVER_PREFIX:-/opt/st-server}"
-STATE_DIR="/var/lib/st-server"
-SERVICE_PATH="/etc/systemd/system/st-server.service"
-SYSUSERS_PATH="/usr/lib/sysusers.d/st-server.conf"
+REPO="zhey/st"
+PREFIX="${ST_SERVER_PREFIX:-${HOME}/.local/share/st-server}"
+BIN_DIR="${HOME}/.local/bin"
+SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+DESKTOP_DIR="${HOME}/.local/share/applications"
+ICON_DIR="${HOME}/.local/share/icons/hicolor/256x256/apps"
 UDEV_PATH="/etc/udev/rules.d/99-st-server.rules"
-BIN_SYMLINK="/usr/local/bin/st-server"
-AUTOSTART_PATH="/etc/xdg/autostart/st-server-tray.desktop"
+MODULES_LOAD_PATH="/etc/modules-load.d/st-server.conf"
 
 log()  { printf '\033[1;34m[st-install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[st-install]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[st-install]\033[0m %s\n' "$*" >&2; exit 1; }
 
-require_root() {
-    if [[ "$(id -u)" -ne 0 ]]; then
-        die "This installer must run as root. Re-run with:
-    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/packaging/linux/install.sh | sudo bash"
+require_user() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        die "Do not run this installer as root. Run it as your normal desktop user; \
+it will call sudo itself for the single udev rule step that needs it."
     fi
 }
 
 require_cmds() {
     local missing=()
-    for cmd in curl tar systemctl udevadm install chmod chown; do
+    for cmd in curl tar systemctl install chmod; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if (( ${#missing[@]} > 0 )); then
@@ -64,9 +60,7 @@ detect_platform() {
     arch="$(uname -m)"
     case "$arch" in
         x86_64|amd64) echo "linux-x64" ;;
-        aarch64|arm64)
-            die "Architecture $arch is not published in the current release pipeline (only linux-x64 is built). Build from source."
-            ;;
+        aarch64|arm64) die "Architecture $arch is not published (only linux-x64 is built). Build from source." ;;
         *) die "Unsupported architecture: $arch" ;;
     esac
 }
@@ -107,32 +101,73 @@ download_and_extract() {
         rm -rf "$tmp"
         die "Unexpected archive layout: $extracted missing"
     fi
-    # Flatten: move contents of the versioned dir into $target_dir.
     ( shopt -s dotglob; mv "$extracted"/* "$target_dir"/ )
     rm -rf "$tmp"
 
     [[ -x "$target_dir/st-server" ]] || die "Launcher $target_dir/st-server is missing or not executable"
 }
 
-write_sysusers() {
-    log "Writing $SYSUSERS_PATH"
-    install -Dm0644 /dev/stdin "$SYSUSERS_PATH" <<EOF
-# Created by packaging/linux/install.sh.
-# Creates the unprivileged system user that runs st-server.service.
-u st - "st-server system user" ${STATE_DIR}
-EOF
-    systemd-sysusers
+write_bin_symlink() {
+    mkdir -p "$BIN_DIR"
+    log "Linking ${BIN_DIR}/st-server -> ${PREFIX}/st-server"
+    ln -sf "$PREFIX/st-server" "$BIN_DIR/st-server"
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *) warn "$BIN_DIR is not on your PATH. Add it to ~/.profile or ~/.bashrc so 'st-server' resolves in your shell." ;;
+    esac
 }
 
-write_udev() {
-    log "Writing $UDEV_PATH"
-    # Intentionally minimal: only /dev/uinput needs a custom rule because
-    # no distro ships one. Writing MODE/GROUP on DRM or evdev nodes here
-    # would reset udev permissions and wipe logind's per-session uaccess
-    # ACL — the logged-in user would lose GPU access until re-login, and
-    # Mesa would silently fall back to llvmpipe. The `st` service user
-    # already gets DRM + evdev access via SupplementaryGroups on the unit.
-    install -Dm0644 /dev/stdin "$UDEV_PATH" <<'EOF'
+write_user_service() {
+    mkdir -p "$SYSTEMD_USER_DIR"
+    local unit_path="${SYSTEMD_USER_DIR}/st-server.service"
+    log "Writing $unit_path"
+    install -Dm0644 /dev/stdin "$unit_path" <<EOF
+[Unit]
+Description=st low-latency game-streaming server
+Documentation=https://github.com/${REPO}
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=${PREFIX}/st-server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+}
+
+write_desktop_entry() {
+    mkdir -p "$DESKTOP_DIR"
+    local dst="${DESKTOP_DIR}/st-server.desktop"
+    log "Writing $dst"
+    install -Dm0644 /dev/stdin "$dst" <<EOF
+[Desktop Entry]
+Type=Application
+Name=st Server
+GenericName=Low-Latency Game Streaming Server
+Comment=Streams this desktop to st clients over the network
+Exec=${BIN_DIR}/st-server
+Icon=st-server
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupWMClass=st-server
+StartupNotify=false
+NoDisplay=true
+EOF
+}
+
+# Install the uinput udev rule. This is the only step that needs root.
+# We re-exec ourselves via sudo with a narrow command so the user sees
+# exactly what's being elevated.
+ensure_udev_rule() {
+    if [[ -f "$UDEV_PATH" ]] && grep -q "uinput" "$UDEV_PATH"; then
+        log "Udev rule $UDEV_PATH already present — skipping sudo step."
+    else
+        log "Installing udev rule for /dev/uinput (needs sudo)"
+        sudo install -Dm0644 /dev/stdin "$UDEV_PATH" <<'EOF'
 # Created by packaging/linux/install.sh.
 # Grants /dev/uinput the group access needed for input injection.
 # DRM and evdev nodes are deliberately left to the distro defaults so
@@ -140,253 +175,84 @@ write_udev() {
 
 KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
 EOF
-    udevadm control --reload
-    udevadm trigger --subsystem-match=drm --subsystem-match=input || true
-    # uinput is a module; make sure the kernel module is loaded so /dev/uinput
-    # exists at service start even on systems that otherwise auto-load on use.
-    modprobe uinput 2>/dev/null || true
-    echo "uinput" > /etc/modules-load.d/st-server.conf
-}
-
-write_service() {
-    local launcher="$PREFIX/st-server"
-    log "Writing $SERVICE_PATH (ExecStart=$launcher)"
-    local extra_env=""
-    if [[ -n "${ST_SERVER_TOKEN:-}" ]]; then
-        extra_env=$'Environment=ST_TOKEN='"${ST_SERVER_TOKEN}"
-    fi
-    install -Dm0644 /dev/stdin "$SERVICE_PATH" <<EOF
-[Unit]
-Description=st low-latency game-streaming server (system instance)
-Documentation=https://github.com/${REPO}
-After=network-online.target systemd-user-sessions.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=st
-Group=st
-SupplementaryGroups=video render input
-ExecStart=${launcher}
-Restart=on-failure
-RestartSec=2
-
-Environment=ST_STATE_DIR=${STATE_DIR}
-# KMS capture works before anyone logs in (no portal consent dialog needed)
-# and transparently follows the handover from the greeter into a user session.
-Environment=ST_CAPTURE=kms
-${extra_env}
-
-StateDirectory=st-server
-StateDirectoryMode=0750
-RuntimeDirectory=st-server
-RuntimeDirectoryMode=0750
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=${STATE_DIR}
-# Device access is gated by Unix group membership, not a cgroup whitelist.
-# SupplementaryGroups=video render input + the udev rules we ship cover
-# Intel (i915), AMD (amdgpu), and NVIDIA (char-major 195) transparently.
-# Do NOT re-introduce DeviceAllow= here; it flips the cgroup device
-# controller to whitelist mode and silently breaks at least one vendor.
-RestrictSUIDSGID=true
-LockPersonality=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-write_bin_symlink() {
-    log "Linking $BIN_SYMLINK -> $PREFIX/st-server"
-    ln -sf "$PREFIX/st-server" "$BIN_SYMLINK"
-}
-
-ensure_state_dir() {
-    install -d -o st -g st -m 0750 "$STATE_DIR"
-}
-
-# On first install, carry the invoking user's existing user-mode config
-# (token, codec/bitrate/quality, peer id) into the system-service state dir
-# so users don't have to re-pair clients or re-configure the server. Only
-# runs if the system state file does not already exist — subsequent
-# installs leave the system config alone.
-maybe_migrate_user_state() {
-    local target="${SUDO_USER:-}"
-    [[ -n "$target" && "$target" != "root" ]] || return
-    local home
-    home="$(getent passwd "$target" | cut -d: -f6 || true)"
-    [[ -n "$home" && -d "$home" ]] || return
-
-    local src="${home}/.local/state/st/st-server-config.json"
-    local dst="${STATE_DIR}/st-server-config.json"
-
-    if [[ -f "$dst" ]]; then
-        log "System config $dst already exists — skipping user-mode migration."
-        return
-    fi
-    if [[ ! -f "$src" ]]; then
-        log "No prior user-mode config at $src — nothing to migrate."
-        return
+        sudo udevadm control --reload
+        sudo udevadm trigger --subsystem-match=input || true
+        sudo modprobe uinput 2>/dev/null || true
+        echo "uinput" | sudo tee "$MODULES_LOAD_PATH" >/dev/null
     fi
 
-    log "Migrating user-mode config $src -> $dst"
-    install -o st -g st -m 0640 "$src" "$dst"
-    log "Old token, codec/bitrate/quality, and peer id carried over. Clients do not need to re-pair."
-}
-
-write_autostart_entry() {
-    log "Writing $AUTOSTART_PATH (user-session tray companion)"
-    # systemd-cat pipes stdout+stderr into the user journal under the tag
-    # "st-server-tray", so `journalctl --user -t st-server-tray` works.
-    install -Dm0644 /dev/stdin "$AUTOSTART_PATH" <<EOF
-[Desktop Entry]
-Type=Application
-Name=st Server Tray
-Comment=Status tray icon + controls for the st-server system service
-Exec=systemd-cat -t st-server-tray ${PREFIX}/st-server --tray
-Icon=st-server
-Terminal=false
-Categories=Network;RemoteAccess;
-X-GNOME-Autostart-enabled=true
-StartupNotify=false
-NoDisplay=true
-EOF
-}
-
-# Add the invoking user to the `st` group so the tray companion can read
-# the config file (mode 0640 st:st). Skipped if the installer is not being
-# run via sudo (no SUDO_USER set).
-maybe_add_user_to_group() {
-    local target="${SUDO_USER:-}"
-    if [[ -z "$target" ]] || [[ "$target" == "root" ]]; then
-        warn "Not running via sudo (SUDO_USER is empty) — skipping 'usermod -aG st'."
-        warn "The tray companion will not be able to read the token until you run:"
-        warn "    sudo usermod -aG st <your-user>"
-        return
+    # Make sure the running user is in the `input` group so the uaccess tag
+    # applies. (Desktop logind usually grants uaccess to the local user, but
+    # this guarantees it for remote/systemd-run sessions too.)
+    if id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
+        log "User '$USER' already in group 'input'."
+    else
+        log "Adding user '$USER' to group 'input' (log out + back in for it to take effect)."
+        sudo usermod -aG input "$USER"
     fi
-    if id -nG "$target" | tr ' ' '\n' | grep -qx st; then
-        log "User '$target' already in group 'st'."
-        return
-    fi
-    log "Adding user '$target' to group 'st' (log out + back in for it to take effect)."
-    usermod -aG st "$target"
-}
-
-# Kick the tray companion in the current user's session so the icon
-# appears without waiting for a re-login. The new process inherits
-# supplementary groups freshly from /etc/group, so it picks up the `st`
-# group even though the user's running shell does not.
-maybe_launch_tray_now() {
-    local target="${SUDO_USER:-}"
-    if [[ -z "$target" ]] || [[ "$target" == "root" ]]; then
-        log "Skipping tray auto-launch (no SUDO_USER). It will start on next login via the autostart entry."
-        return
-    fi
-    local uid bus
-    uid="$(id -u "$target")"
-    bus="/run/user/${uid}/bus"
-    if [[ ! -S "$bus" ]]; then
-        warn "No user D-Bus session at $bus; tray will appear on next desktop login."
-        return
-    fi
-
-    # Don't stack multiple tray instances.
-    pkill -u "$target" -f "${PREFIX}/st-server --tray" 2>/dev/null || true
-
-    log "Launching tray companion for '$target' in the current session"
-    # systemd-cat puts stdout/stderr into the user journal under tag
-    # "st-server-tray"; view later with `journalctl --user -t st-server-tray -f`.
-    runuser -u "$target" -- env \
-        XDG_RUNTIME_DIR="/run/user/${uid}" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}" \
-        systemd-cat -t st-server-tray "${PREFIX}/st-server" --tray </dev/null &
-    disown || true
 }
 
 maybe_enable_service() {
-    systemctl daemon-reload
+    systemctl --user daemon-reload
     if [[ -n "${ST_SERVER_NO_ENABLE:-}" ]]; then
         log "ST_SERVER_NO_ENABLE is set — not enabling or starting the service."
-        log "Enable manually later with: systemctl enable --now st-server"
+        log "Enable manually with: systemctl --user enable --now st-server"
         return
     fi
-    log "Enabling and starting st-server.service"
-    # Stop any prior instance cleanly so we swap the binary, not run two.
-    systemctl stop st-server.service 2>/dev/null || true
-    systemctl enable --now st-server.service
+    log "Enabling and starting st-server user service"
+    systemctl --user stop st-server.service 2>/dev/null || true
+    systemctl --user enable --now st-server.service
 }
 
 print_token_hint() {
-    local cfg="${STATE_DIR}/st-server-config.json"
+    local cfg="${HOME}/.local/state/st/st-server-config.json"
     cat <<EOF
 
 -------------------------------------------------------------------
-st-server is installed and running as a system service.
+st-server is installed and running in your user session.
 
-  Status:      systemctl status st-server
-  Server logs: journalctl -u st-server -f
-  Tray logs:   journalctl --user -t st-server-tray -f
-  Binary:      ${PREFIX}/st-server
-  State:       ${STATE_DIR}
-  Unit:        ${SERVICE_PATH}
+  Status:   systemctl --user status st-server
+  Logs:     journalctl --user -u st-server -f
+  Binary:   ${PREFIX}/st-server
+  State:    ${HOME}/.local/state/st/
+  Unit:     ${SYSTEMD_USER_DIR}/st-server.service
 
 First-connect token (keep it secret — anyone with it can control this
 machine):
 
-  sudo cat ${cfg}
+  cat ${cfg}
 
-Override the token in advance by setting ST_SERVER_TOKEN=<hex> before
-running this installer, or by editing the unit with:
+Or click the tray icon on this machine to copy the token.
 
-  sudo systemctl edit st-server
+Override the token by setting ST_TOKEN=<hex> in the unit:
 
-and adding:
+  systemctl --user edit st-server
+  (add: [Service] Environment=ST_TOKEN=<your-token>)
 
-  [Service]
-  Environment=ST_TOKEN=<your-token>
 -------------------------------------------------------------------
 EOF
 }
 
 uninstall() {
-    local purge="${1:-0}"
+    log "Stopping and disabling st-server user service"
+    systemctl --user disable --now st-server.service 2>/dev/null || true
 
-    log "Stopping any running tray companions"
-    pkill -f "${PREFIX}/st-server --tray" 2>/dev/null || true
-
-    log "Stopping and disabling st-server.service"
-    systemctl disable --now st-server.service 2>/dev/null || true
-
-    log "Removing service unit, udev rule, autostart entry, binary symlink"
-    rm -f "$SERVICE_PATH" "$UDEV_PATH" "$AUTOSTART_PATH" "$BIN_SYMLINK"
-    # /etc/modules-load.d drop-in written during install.
-    rm -f /etc/modules-load.d/st-server.conf
-
-    systemctl daemon-reload
-    udevadm control --reload 2>/dev/null || true
+    log "Removing user unit, desktop entry, binary symlink"
+    rm -f "${SYSTEMD_USER_DIR}/st-server.service"
+    rm -f "${DESKTOP_DIR}/st-server.desktop"
+    rm -f "${BIN_DIR}/st-server"
 
     if [[ -d "$PREFIX" ]]; then
         log "Removing install prefix $PREFIX"
         rm -rf "$PREFIX"
     fi
 
-    if [[ "$purge" == "1" ]]; then
-        log "Purging state dir $STATE_DIR"
-        rm -rf "$STATE_DIR"
-        log "Removing sysusers entry $SYSUSERS_PATH"
-        rm -f "$SYSUSERS_PATH"
-        if id st >/dev/null 2>&1; then
-            log "Removing 'st' user and group"
-            userdel st 2>/dev/null || true
-            groupdel st 2>/dev/null || true
-        fi
-    else
-        log "State dir $STATE_DIR kept (token + portal tokens preserved)."
-        log "Run with --purge to remove it and the 'st' user/group as well."
+    systemctl --user daemon-reload 2>/dev/null || true
+
+    if [[ -f "$UDEV_PATH" ]] || [[ -f "$MODULES_LOAD_PATH" ]]; then
+        log "Removing udev rule and modules-load drop-in (needs sudo)"
+        sudo rm -f "$UDEV_PATH" "$MODULES_LOAD_PATH"
+        sudo udevadm control --reload 2>/dev/null || true
     fi
 
     cat <<EOF
@@ -394,30 +260,32 @@ uninstall() {
 -------------------------------------------------------------------
 st-server is uninstalled.
 
-  Reinstall anytime with:
-    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/packaging/linux/install.sh | sudo bash
+State at ${HOME}/.local/state/st/ is kept so tokens and peer id
+survive a reinstall. Remove it by hand if you want a clean slate:
+
+  rm -rf ${HOME}/.local/state/st
+
+Reinstall anytime with:
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/packaging/linux/install.sh | bash
 -------------------------------------------------------------------
 EOF
 }
 
 main() {
-    require_root
+    require_user
     require_cmds
 
     local mode="install"
-    local purge="0"
     for arg in "$@"; do
         case "$arg" in
             --uninstall) mode="uninstall" ;;
-            --purge)     purge="1" ;;
             -h|--help)
                 cat <<EOF
-Usage: install.sh [--uninstall [--purge]]
+Usage: install.sh [--uninstall]
 
-  (no args)        Install the latest published release as a system service.
-  --uninstall      Remove the service and binary. State dir is preserved.
-  --uninstall --purge
-                   Remove everything including /var/lib/st-server and the st user.
+  (no args)     Install the latest release as a user systemd service.
+  --uninstall   Remove the service, binary, desktop entry, and udev rule.
+                State at ~/.local/state/st/ is preserved.
 EOF
                 return 0
                 ;;
@@ -426,7 +294,7 @@ EOF
     done
 
     if [[ "$mode" == "uninstall" ]]; then
-        uninstall "$purge"
+        uninstall
         return
     fi
 
@@ -436,16 +304,11 @@ EOF
     log "Installing st-server ${version} (${platform}) into ${PREFIX}"
 
     download_and_extract "$version" "$platform" "$PREFIX"
-    write_sysusers
-    ensure_state_dir
-    maybe_migrate_user_state
-    write_udev
-    write_service
+    ensure_udev_rule
     write_bin_symlink
-    write_autostart_entry
-    maybe_add_user_to_group
+    write_user_service
+    write_desktop_entry
     maybe_enable_service
-    maybe_launch_tray_now
     print_token_hint
 }
 

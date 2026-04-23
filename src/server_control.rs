@@ -53,13 +53,6 @@ impl PersistedSettings {
 }
 
 fn config_path() -> Option<PathBuf> {
-    // ST_STATE_DIR lets a system service (e.g. /var/lib/st-server) override the
-    // per-user XDG path. Must be an absolute directory path.
-    if let Some(state_dir) = std::env::var_os("ST_STATE_DIR") {
-        let dir = PathBuf::from(state_dir);
-        let _ = std::fs::create_dir_all(&dir);
-        return Some(dir.join(CONFIG_FILENAME));
-    }
     // Prefer XDG state directory for stable persistence across rebuilds.
     if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME") {
         let dir = PathBuf::from(state_dir).join("st");
@@ -101,11 +94,7 @@ fn resolve_peer_id(saved: &mut PersistedSettings) -> String {
     }
     let id = generate_token(); // reuse the same hex generator
     saved.peer_id = Some(id.clone());
-    if let Some(path) = config_path() {
-        if let Ok(json) = serde_json::to_string_pretty(saved) {
-            let _ = std::fs::write(&path, json);
-        }
-    }
+    persist_settings(saved);
     id
 }
 
@@ -114,6 +103,10 @@ fn resolve_token(saved: &mut PersistedSettings) -> String {
     if let Ok(env_token) = std::env::var("ST_TOKEN") {
         let t = env_token.trim().to_string();
         if !t.is_empty() {
+            if saved.token.as_deref() != Some(t.as_str()) {
+                saved.token = Some(t.clone());
+                persist_settings(saved);
+            }
             return t;
         }
     }
@@ -125,26 +118,24 @@ fn resolve_token(saved: &mut PersistedSettings) -> String {
     }
     let t = generate_token();
     saved.token = Some(t.clone());
-    // Persist immediately so the token is stable across restarts
+    persist_settings(saved);
+    t
+}
+
+fn persist_settings(saved: &PersistedSettings) {
     match config_path() {
         Some(path) => match serde_json::to_string_pretty(saved) {
             Ok(json) => {
                 if let Err(err) = std::fs::write(&path, &json) {
                     eprintln!("[config] Failed to persist token to {}: {err}", path.display());
                 } else {
-                    // In system-service mode (ST_STATE_DIR set) the user-session
-                    // tray companion runs as a different user and needs to read
-                    // the token. We rely on the file being group-owned by `st`
-                    // and the companion's user being in that group.
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let mode = if std::env::var_os("ST_STATE_DIR").is_some() {
-                            0o640
-                        } else {
-                            0o600
-                        };
-                        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+                        let _ = std::fs::set_permissions(
+                            &path,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
                     }
                     eprintln!("[config] Token persisted to {}", path.display());
                 }
@@ -153,7 +144,6 @@ fn resolve_token(saved: &mut PersistedSettings) -> String {
         },
         None => eprintln!("[config] Warning: cannot determine config path, token will not persist across restarts"),
     }
-    t
 }
 
 #[derive(Clone, Debug)]

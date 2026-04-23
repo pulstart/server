@@ -1018,7 +1018,7 @@ fn connected_since_label(client: &ConnectedClientSnapshot) -> String {
     }
 }
 
-pub(crate) fn copy_to_clipboard(text: &str) {
+fn copy_to_clipboard(text: &str) {
     #[cfg(target_os = "windows")]
     const ATTEMPTS: usize = 8;
     #[cfg(not(target_os = "windows"))]
@@ -1501,7 +1501,7 @@ unsafe fn apply_windows_token_dialog_corner_style(hwnd: HWND) {
 
 /// Flat 2D monitor icon with status dot.
 /// `connected`: green dot when true, dim gray dot when false.
-pub(crate) fn server_icon_rgba(connected: bool) -> (Vec<u8>, u32, u32) {
+fn server_icon_rgba(connected: bool) -> (Vec<u8>, u32, u32) {
     let width = 32u32;
     let height = 32u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];

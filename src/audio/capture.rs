@@ -79,7 +79,6 @@ mod platform {
 
     impl PaSimple {
         fn new(
-            server: Option<&str>,
             device: Option<&str>,
             channels: u8,
             sample_rate: u32,
@@ -90,12 +89,6 @@ mod platform {
 
             let dev_c = device.map(|d| std::ffi::CString::new(d).unwrap());
             let dev_ptr = dev_c
-                .as_ref()
-                .map(|c| c.as_ptr())
-                .unwrap_or(std::ptr::null());
-
-            let server_c = server.map(|s| std::ffi::CString::new(s).unwrap());
-            let server_ptr = server_c
                 .as_ref()
                 .map(|c| c.as_ptr())
                 .unwrap_or(std::ptr::null());
@@ -118,7 +111,7 @@ mod platform {
             let mut error: std::os::raw::c_int = 0;
             let ptr = unsafe {
                 pulse_ffi::pa_simple_new(
-                    server_ptr,
+                    std::ptr::null(),
                     app_name.as_ptr(),
                     pulse_ffi::PA_STREAM_RECORD,
                     dev_ptr,
@@ -190,7 +183,6 @@ mod platform {
             &mut self,
             config: AudioConfig,
             device: Option<String>,
-            server: Option<String>,
             tx: Sender<AudioSamples>,
         ) -> Result<(), String> {
             if self.running.load(Ordering::SeqCst) {
@@ -202,7 +194,6 @@ mod platform {
             let samples_per_frame = config.total_samples_per_frame();
             let fragment_size = (samples_per_frame * std::mem::size_of::<f32>()) as u32;
             let pa = PaSimple::new(
-                server.as_deref(),
                 device.as_deref(),
                 channels,
                 sample_rate,
@@ -212,7 +203,6 @@ mod platform {
             self.running.store(true, Ordering::SeqCst);
             let running = Arc::clone(&self.running);
             let device_clone = device.map(|d| d.to_string());
-            let server_clone = server.map(|s| s.to_string());
             let handle = thread::spawn(move || {
                 println!(
                     "[audio] Capture thread started ({channels}ch, {sample_rate}Hz, frame={samples_per_frame} samples)"
@@ -246,7 +236,6 @@ mod platform {
                                 break;
                             }
                             match PaSimple::new(
-                                server_clone.as_deref(),
                                 device_clone.as_deref(),
                                 channels,
                                 sample_rate,
@@ -325,7 +314,6 @@ mod platform {
             &mut self,
             config: AudioConfig,
             _device: Option<String>,
-            _server: Option<String>,
             tx: Sender<AudioSamples>,
         ) -> Result<(), String> {
             if self.stream.is_some() {
@@ -724,7 +712,6 @@ mod platform {
             &mut self,
             config: AudioConfig,
             _device: Option<String>,
-            _server: Option<String>,
             tx: Sender<AudioSamples>,
         ) -> Result<(), String> {
             if self.running.load(Ordering::SeqCst) {

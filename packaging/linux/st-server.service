@@ -1,47 +1,20 @@
 [Unit]
-Description=st low-latency game-streaming server (system instance)
+Description=st low-latency game-streaming server
 Documentation=https://github.com/zhey/st
-After=network-online.target systemd-user-sessions.service
-Wants=network-online.target
+# graphical-session.target is started by the desktop environment once the
+# session bus is up. Running under it means PipeWire, PulseAudio, and
+# xdg-desktop-portal are all reachable by this unit natively.
+After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
-User=st
-Group=st
-SupplementaryGroups=video render input
-ExecStart=/usr/bin/st-server
+ExecStart=%h/.local/bin/st-server
 Restart=on-failure
 RestartSec=2
 
-# System-wide state lives outside any user's $XDG_STATE_HOME.
-Environment=ST_STATE_DIR=/var/lib/st-server
-# Capture the login screen and all user sessions via KMS/DRM — no portal,
-# so no consent dialog is possible (this is the only Linux path that works
-# before anyone logs in). The input backend auto-selects to uinput when the
-# capture backend is kms, so /dev/uinput access is all we need.
-Environment=ST_CAPTURE=kms
-
-StateDirectory=st-server
-StateDirectoryMode=0750
-RuntimeDirectory=st-server
-RuntimeDirectoryMode=0750
-
-# Hardening — keep the service small but not locked out of the hardware
-# it actually needs (DRM nodes, uinput, evdev).
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=/var/lib/st-server
-# Device access is gated by Unix group membership, not a cgroup whitelist.
-# The `st` user has SupplementaryGroups=video render input (above) and the
-# shipped udev rules chmod /dev/uinput, /dev/dri/card*, /dev/dri/renderD*,
-# and /dev/input/event* to group-writable. That covers Intel (i915),
-# AMD (amdgpu), and NVIDIA (char-major 195) transparently. Adding a
-# DeviceAllow= line anywhere here would flip the cgroup to whitelist mode
-# and silently break GPU access on at least one vendor.
-RestrictSUIDSGID=true
-LockPersonality=true
+# Set ST_CAPTURE=kms|pipewire|x11 by hand (via `systemctl --user edit
+# st-server`) only if you need to force a specific backend for debugging.
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical-session.target

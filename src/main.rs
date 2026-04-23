@@ -8,8 +8,6 @@ mod broadcast;
 mod capture;
 mod clipboard;
 mod colorspace;
-#[cfg(unix)]
-mod control_socket;
 mod file_transfer;
 #[cfg(target_os = "linux")]
 mod encode;
@@ -28,14 +26,9 @@ mod input;
 #[cfg(target_os = "linux")]
 mod linux_uring;
 mod server_control;
-mod session_bridge;
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod tray;
-#[cfg(target_os = "linux")]
-mod tray_companion;
-#[cfg(target_os = "linux")]
-mod tray_portal;
 mod updater;
 
 use adaptive_bitrate::{AdaptiveBitrateState, ClientRateController};
@@ -1056,10 +1049,9 @@ fn run_shared_pipeline(
     };
 
     // Start audio pipeline — encode + relay run persistently; capture is
-    // attached on-demand. In user-mode we auto-detect against whatever PA
-    // daemon is visible to this process; in system-service mode we wait
-    // for the tray companion to push a SessionContext over the control
-    // socket (so PA connects as the logged-in user, not as `st`).
+    // attached on-demand against whatever PulseAudio / PipeWire daemon is
+    // visible to this process. Works because st-server runs in the user's
+    // session and inherits XDG_RUNTIME_DIR / PULSE_SERVER naturally.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let audio_pipeline_shared = {
         let mut ap = audio::AudioPipeline::new();
@@ -1067,25 +1059,8 @@ fn run_shared_pipeline(
             Ok(()) => println!("[pipeline] Audio pipeline started"),
             Err(e) => eprintln!("[pipeline] Audio pipeline failed (video-only): {e}"),
         }
-        let wrapped = Arc::new(std::sync::Mutex::new(ap));
-
-        if std::env::var_os("ST_STATE_DIR").is_some() {
-            // System-service path: follow the tray.
-            let bridge = session_bridge::global();
-            let ap_cb = Arc::clone(&wrapped);
-            bridge.subscribe(move |ctx| {
-                if let Ok(mut guard) = ap_cb.lock() {
-                    guard.apply_context(ctx);
-                }
-            });
-        } else {
-            // User-mode path: the ambient PA/PW session is ours, just use it.
-            if let Ok(mut guard) = wrapped.lock() {
-                guard.apply_auto_detect();
-            }
-        }
-
-        wrapped
+        ap.apply_auto_detect();
+        Arc::new(std::sync::Mutex::new(ap))
     };
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let audio_pipeline = Arc::clone(&audio_pipeline_shared);
@@ -3266,18 +3241,6 @@ fn join_server_thread(handle: std::thread::JoinHandle<Result<(), String>>) -> ! 
 }
 
 fn main() {
-    // `--tray` short-circuits the whole server: runs only the user-session
-    // tray companion and exits. Used by the XDG autostart entry on systems
-    // where st-server itself runs as a system service.
-    #[cfg(target_os = "linux")]
-    if std::env::args().any(|a| a == "--tray") {
-        if let Err(err) = tray_companion::run() {
-            eprintln!("[tray-companion] {err}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
     match updater::maybe_run_apply_update_from_args() {
         Ok(true) => return,
         Ok(false) => {}
@@ -3292,15 +3255,6 @@ fn main() {
 
     let listen_port = configured_listen_port();
     let control = ServerControl::new();
-
-    // System-service deployments (ST_STATE_DIR set) expose a local IPC
-    // socket so the user-session tray companion can query live state and
-    // push config changes without shelling out. User-mode runs keep the
-    // in-process tray and don't need the socket.
-    #[cfg(unix)]
-    if std::env::var_os("ST_STATE_DIR").is_some() {
-        let _ = control_socket::spawn(Arc::clone(&control));
-    }
 
     let tunnel_state = Some(Arc::new(api_client::ApiTunnelState::new()));
     let state = build_server_state(Arc::clone(&control), listen_port, tunnel_state.clone());

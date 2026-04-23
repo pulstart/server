@@ -5,16 +5,14 @@
 ///
 /// Transport is per-client (managed by main.rs).
 ///
-/// Capture is restartable at runtime: when the user-session tray companion
-/// pushes a new `SessionContext` over the control socket, we tear down the
-/// current capture thread and start a new one against the user's PulseAudio
-/// daemon. Encode + relay stay up across reconfigurations.
+/// Capture runs against whatever PulseAudio / PipeWire daemon is visible in
+/// this process's env. Because the server runs as a user systemd unit, that
+/// is always the user's own session.
 pub mod capture;
 pub mod encode;
 
 use crate::broadcast::Broadcaster;
 use crate::encode_config::AudioConfig;
-use crate::session_bridge::{AudioEndpoint, SessionContext};
 use crossbeam_channel::{unbounded, Sender};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -31,7 +29,7 @@ pub struct AudioPipeline {
     relay_handle: Option<thread::JoinHandle<()>>,
     sample_tx: Option<Sender<capture::AudioSamples>>,
     config: Option<AudioConfig>,
-    current_endpoint: Option<AudioEndpoint>,
+    capture_active: bool,
 }
 
 impl AudioPipeline {
@@ -43,16 +41,12 @@ impl AudioPipeline {
             relay_handle: None,
             sample_tx: None,
             config: None,
-            current_endpoint: None,
+            capture_active: false,
         }
     }
 
     /// Start the shared encode + relay threads. Does NOT start capture —
-    /// on Linux the capture thread is started once a `SessionContext`
-    /// arrives from the tray (so PulseAudio connects as the logged-in
-    /// user). On macOS / Windows / user-mode Linux, call
-    /// [`apply_endpoint(None)`] right after and the default auto-detect
-    /// path fires.
+    /// capture must be attached via [`apply_auto_detect`].
     pub fn start(
         &mut self,
         config: AudioConfig,
@@ -126,58 +120,7 @@ impl AudioPipeline {
         Ok(())
     }
 
-    /// Swap the capture endpoint at runtime. `None` tears down capture
-    /// (silence to clients); `Some` restarts against the given
-    /// PulseAudio/PipeWire server. Returns `Ok(())` even if the new
-    /// connection fails — the pipeline stays alive video-only and the
-    /// next reconfigure can try again.
-    pub fn apply_endpoint(&mut self, endpoint: Option<AudioEndpoint>) {
-        // Stop whatever's running. Safe to call even if idle.
-        self.capture.stop();
-        self.capture = capture::AudioCapture::new();
-
-        let Some(endpoint) = endpoint else {
-            println!("[audio] No session endpoint — capture idle (silent stream)");
-            self.current_endpoint = None;
-            return;
-        };
-
-        let Some(config) = self.config.clone() else {
-            eprintln!("[audio] apply_endpoint called before start()");
-            return;
-        };
-        let Some(sample_tx) = self.sample_tx.as_ref().map(Sender::clone) else {
-            eprintln!("[audio] apply_endpoint called without active sample_tx");
-            return;
-        };
-
-        println!(
-            "[audio] Starting capture against {} (source: {})",
-            endpoint.server,
-            endpoint.monitor_source.as_deref().unwrap_or("default"),
-        );
-        if let Err(err) = self.capture.start(
-            config,
-            endpoint.monitor_source.clone(),
-            Some(endpoint.server.clone()),
-            sample_tx,
-        ) {
-            eprintln!("[audio] Capture start failed: {err}");
-            return;
-        }
-        self.current_endpoint = Some(endpoint);
-    }
-
-    /// Apply the audio piece of a full session context. Convenience for
-    /// hooking up to `SessionBridge::subscribe`.
-    pub fn apply_context(&mut self, ctx: Option<&SessionContext>) {
-        let endpoint = ctx.and_then(|c| c.audio.clone());
-        self.apply_endpoint(endpoint);
-    }
-
-    /// User-mode fallback: rely on the ambient PulseAudio / PipeWire
-    /// daemon discoverable in the current process's env (what the server
-    /// used to do unconditionally). No-op if called before `start()`.
+    /// Attach capture against the ambient PulseAudio / PipeWire daemon.
     pub fn apply_auto_detect(&mut self) {
         let Some(config) = self.config.clone() else {
             eprintln!("[audio] apply_auto_detect called before start()");
@@ -195,17 +138,12 @@ impl AudioPipeline {
             "[audio] Auto-detect using source: {}",
             monitor_source.as_deref().unwrap_or("default")
         );
-        if let Err(err) = self.capture.start(config, monitor_source, None, sample_tx) {
+        if let Err(err) = self.capture.start(config, monitor_source, sample_tx) {
             eprintln!("[audio] Capture start failed: {err}");
+            self.capture_active = false;
             return;
         }
-        // Synthetic endpoint to flag "capture is live" — details don't matter.
-        self.current_endpoint = Some(AudioEndpoint {
-            kind: crate::session_bridge::AudioKind::Pulse,
-            server: "auto".into(),
-            monitor_source: None,
-            cookie_hex: None,
-        });
+        self.capture_active = true;
     }
 
     pub fn stop(&mut self) {
@@ -222,9 +160,9 @@ impl AudioPipeline {
     }
 
     /// Whether audio is currently being captured. `false` means the stream
-    /// is silent (no session bridged, or the last connect attempt failed).
-    #[allow(dead_code)] // surfaced to clients via the control socket later
+    /// is silent (last connect attempt failed).
+    #[allow(dead_code)]
     pub fn has_active_capture(&self) -> bool {
-        self.current_endpoint.is_some()
+        self.capture_active
     }
 }

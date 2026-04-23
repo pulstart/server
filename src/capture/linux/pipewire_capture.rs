@@ -685,10 +685,6 @@ impl PipeWireCapture {
 // ---------------------------------------------------------------------------
 
 fn token_path() -> PathBuf {
-    // ST_STATE_DIR wins (system-service deployments override per-user paths).
-    if let Ok(dir) = std::env::var("ST_STATE_DIR") {
-        return PathBuf::from(dir).join("portal_token");
-    }
     let state_dir = std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
