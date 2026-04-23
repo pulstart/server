@@ -20,6 +20,18 @@ Useful env overrides (set before the pipe):
 - `ST_SERVER_PREFIX=/opt/st-server` — change the install prefix.
 - `ST_SERVER_NO_ENABLE=1` — install but do not `systemctl enable --now`.
 
+Uninstall:
+
+```sh
+# Remove the service + binary. Keep the state dir (/var/lib/st-server) so
+# the trust token survives a reinstall.
+curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | sudo bash -s -- --uninstall
+
+# Full wipe — also deletes /var/lib/st-server, the `st` user, and the
+# sysusers entry. Anyone you shared the old token with loses access.
+curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | sudo bash -s -- --uninstall --purge
+```
+
 After install:
 
 ```sh

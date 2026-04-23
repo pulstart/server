@@ -9,6 +9,15 @@
 # One-liner:
 #     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | sudo bash
 #
+# Uninstall:
+#     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | sudo bash -s -- --uninstall
+#     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | sudo bash -s -- --uninstall --purge
+#
+# --uninstall removes the service, unit file, udev rule, autostart entry,
+# binary symlink, and the install prefix. State (tokens, portal tokens) at
+# /var/lib/st-server is kept by default so a reinstall is silent. Add
+# --purge to also delete the state dir, sysusers entry, and `st` user/group.
+#
 # Environment knobs:
 #     ST_SERVER_VERSION=v0.4.6     Pin a specific release (default: latest).
 #     ST_SERVER_PREFIX=/opt/st-server   Where to unpack the tarball.
@@ -274,9 +283,80 @@ and adding:
 EOF
 }
 
+uninstall() {
+    local purge="${1:-0}"
+
+    log "Stopping and disabling st-server.service"
+    systemctl disable --now st-server.service 2>/dev/null || true
+
+    log "Removing service unit, udev rule, autostart entry, binary symlink"
+    rm -f "$SERVICE_PATH" "$UDEV_PATH" "$AUTOSTART_PATH" "$BIN_SYMLINK"
+    # /etc/modules-load.d drop-in written during install.
+    rm -f /etc/modules-load.d/st-server.conf
+
+    systemctl daemon-reload
+    udevadm control --reload 2>/dev/null || true
+
+    if [[ -d "$PREFIX" ]]; then
+        log "Removing install prefix $PREFIX"
+        rm -rf "$PREFIX"
+    fi
+
+    if [[ "$purge" == "1" ]]; then
+        log "Purging state dir $STATE_DIR"
+        rm -rf "$STATE_DIR"
+        log "Removing sysusers entry $SYSUSERS_PATH"
+        rm -f "$SYSUSERS_PATH"
+        if id st >/dev/null 2>&1; then
+            log "Removing 'st' user and group"
+            userdel st 2>/dev/null || true
+            groupdel st 2>/dev/null || true
+        fi
+    else
+        log "State dir $STATE_DIR kept (token + portal tokens preserved)."
+        log "Run with --purge to remove it and the 'st' user/group as well."
+    fi
+
+    cat <<EOF
+
+-------------------------------------------------------------------
+st-server is uninstalled.
+
+  Reinstall anytime with:
+    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/packaging/linux/install.sh | sudo bash
+-------------------------------------------------------------------
+EOF
+}
+
 main() {
     require_root
     require_cmds
+
+    local mode="install"
+    local purge="0"
+    for arg in "$@"; do
+        case "$arg" in
+            --uninstall) mode="uninstall" ;;
+            --purge)     purge="1" ;;
+            -h|--help)
+                cat <<EOF
+Usage: install.sh [--uninstall [--purge]]
+
+  (no args)        Install the latest published release as a system service.
+  --uninstall      Remove the service and binary. State dir is preserved.
+  --uninstall --purge
+                   Remove everything including /var/lib/st-server and the st user.
+EOF
+                return 0
+                ;;
+            *) die "Unknown argument: $arg (try --help)" ;;
+        esac
+    done
+
+    if [[ "$mode" == "uninstall" ]]; then
+        uninstall "$purge"
+        return
+    fi
 
     local platform version
     platform="$(detect_platform)"
