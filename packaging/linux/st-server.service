@@ -1,0 +1,43 @@
+[Unit]
+Description=st low-latency game-streaming server (system instance)
+Documentation=https://github.com/zhey/st
+After=network-online.target systemd-user-sessions.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=st
+Group=st
+SupplementaryGroups=video render input
+ExecStart=/usr/bin/st-server
+Restart=on-failure
+RestartSec=2
+
+# System-wide state lives outside any user's $XDG_STATE_HOME.
+Environment=ST_STATE_DIR=/var/lib/st-server
+# Capture the login screen and all user sessions via KMS/DRM — no portal,
+# so no consent dialog is possible (this is the only Linux path that works
+# before anyone logs in). The input backend auto-selects to uinput when the
+# capture backend is kms, so /dev/uinput access is all we need.
+Environment=ST_CAPTURE=kms
+
+StateDirectory=st-server
+StateDirectoryMode=0750
+RuntimeDirectory=st-server
+RuntimeDirectoryMode=0750
+
+# Hardening — keep the service small but not locked out of the hardware
+# it actually needs (DRM nodes, uinput, evdev).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/st-server
+DeviceAllow=/dev/uinput rw
+DeviceAllow=char-drm rw
+DeviceAllow=char-input rw
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

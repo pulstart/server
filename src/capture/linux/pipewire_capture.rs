@@ -226,6 +226,42 @@ fn u64_to_spa_long_bits(value: u64) -> i64 {
     i64::from_ne_bytes(value.to_ne_bytes())
 }
 
+/// DRM fourcc that corresponds to a `VideoFormat`. Duplicates the mapping in
+/// `video_format_to_drm_fourcc` for use at format-building time (before
+/// negotiation completes).
+fn drm_format_for(format: VideoFormat) -> u32 {
+    match format {
+        VideoFormat::BGRx => drm_fourcc::DrmFourcc::Xrgb8888 as u32,
+        VideoFormat::BGRA => drm_fourcc::DrmFourcc::Argb8888 as u32,
+        _ => 0,
+    }
+}
+
+/// Modifier list to advertise to PipeWire for a given DRM format.
+///
+/// Default is LINEAR-only — the safe path that every importer (VAAPI, NVENC,
+/// EGL, software copy) accepts. Tiled modifiers exposed by the display GPU
+/// can cause striping/corruption if the consumer cannot import the exact
+/// tiling, so we only advertise them when the operator opts in via
+/// `ST_PIPEWIRE_MODIFIERS=all`.
+fn modifiers_for(drm_format: u32) -> Vec<u64> {
+    let linear_only = std::env::var("ST_PIPEWIRE_MODIFIERS")
+        .map(|v| !v.eq_ignore_ascii_case("all"))
+        .unwrap_or(true);
+    if linear_only || drm_format == 0 {
+        return vec![u64::from(DrmModifier::Linear)];
+    }
+    let node = super::probe_display_gpu_render_node()
+        .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
+    let mut probed = super::gbm_probe::probe_modifiers(&node, drm_format);
+    // Ensure LINEAR is first so it is also the `default` we fixate to when
+    // the compositor accepts multiple alternatives.
+    probed.retain(|m| *m != u64::from(DrmModifier::Linear));
+    let mut out = vec![u64::from(DrmModifier::Linear)];
+    out.extend(probed);
+    out
+}
+
 fn build_format_object(
     format: VideoFormat,
     width: u32,
@@ -278,14 +314,23 @@ fn build_format_object(
             pw::spa::sys::SPA_POD_PROP_FLAG_MANDATORY
                 | pw::spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
         );
+        let drm = drm_format_for(format);
+        let mods = modifiers_for(drm);
+        // `default` should match `alternatives[0]` — the compositor picks one.
+        let default_mod = *mods.first().unwrap_or(&u64::from(DrmModifier::Linear));
+        let alternatives: Vec<i64> = mods
+            .iter()
+            .copied()
+            .map(u64_to_spa_long_bits)
+            .collect();
         properties.push(Property {
             key: pw::spa::param::format::FormatProperties::VideoModifier.as_raw(),
             flags: modifier_flags,
             value: Value::Choice(ChoiceValue::Long(Choice(
                 ChoiceFlags::empty(),
                 ChoiceEnum::Enum {
-                    default: u64_to_spa_long_bits(DrmModifier::Linear.into()),
-                    alternatives: vec![u64_to_spa_long_bits(DrmModifier::Linear.into())],
+                    default: u64_to_spa_long_bits(default_mod),
+                    alternatives,
                 },
             ))),
         });
@@ -400,7 +445,42 @@ fn build_stream_param_buffers(
         pods.push(serialize_object_pod(&cursor_meta)?);
     }
 
+    if explicit_sync_requested() {
+        // SPA_META_SyncTimeline (enum value 9) was added in PipeWire 1.2.
+        // libspa-sys 0.9.x does not expose the constant yet, so we use the
+        // raw integer. Size of `struct spa_meta_sync_timeline` is 24 bytes
+        // (2x u32 + 2x u64). Compositors without support will simply ignore
+        // this metadata request, so it's safe to always request when opted in.
+        const SPA_META_SYNC_TIMELINE: u32 = 9;
+        const SPA_META_SYNC_TIMELINE_SIZE: i32 = 24;
+        let sync_meta = pw::spa::pod::Object {
+            type_: SpaTypes::ObjectParamMeta.as_raw(),
+            id: pw::spa::param::ParamType::Meta.as_raw(),
+            properties: vec![
+                Property {
+                    key: pw::spa::sys::SPA_PARAM_META_type,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Id(Id(SPA_META_SYNC_TIMELINE)),
+                },
+                Property {
+                    key: pw::spa::sys::SPA_PARAM_META_size,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Int(SPA_META_SYNC_TIMELINE_SIZE),
+                },
+            ],
+        };
+        pods.push(serialize_object_pod(&sync_meta)?);
+    }
+
     Ok(pods)
+}
+
+/// Returns true when `ST_EXPLICIT_SYNC=1` is set. Gates the opt-in explicit
+/// sync plumbing (SPA_META_SyncTimeline request + detection telemetry).
+pub(crate) fn explicit_sync_requested() -> bool {
+    std::env::var("ST_EXPLICIT_SYNC")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 fn duplicate_dmabuf_planes(
@@ -605,6 +685,10 @@ impl PipeWireCapture {
 // ---------------------------------------------------------------------------
 
 fn token_path() -> PathBuf {
+    // ST_STATE_DIR wins (system-service deployments override per-user paths).
+    if let Ok(dir) = std::env::var("ST_STATE_DIR") {
+        return PathBuf::from(dir).join("portal_token");
+    }
     let state_dir = std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -1238,6 +1322,10 @@ fn request_remote_desktop_screencast(
         opts.insert("types", Value::U32(1));
         opts.insert("cursor_mode", Value::U32(4));
         opts.insert("multiple", Value::Bool(false));
+        opts.insert("persist_mode", Value::U32(2));
+        if let Some(ref token) = restore_token {
+            opts.insert("restore_token", Value::from(token.as_str()));
+        }
         let _reply: OwnedObjectPath = screen_cast
             .call("SelectSources", &(&session_obj, opts))
             .await
@@ -1896,6 +1984,38 @@ fn run_pipewire_stream(
                 let mut cache = cursor_cache_process.lock().unwrap();
                 extract_cursor(spa_buffer, &mut cache)
             };
+
+            // Explicit-sync telemetry: if the compositor honored our
+            // SPA_META_SyncTimeline request, record the acquire/release
+            // points so we can verify the plumbing. Actual fence wait/signal
+            // is a follow-up once we have a confirmed compositor that
+            // produces these points; until then the caller still relies on
+            // implicit sync from dma-fence attached to the underlying FD.
+            if explicit_sync_requested() && process_idx < 8 {
+                const SPA_META_SYNC_TIMELINE: u32 = 9;
+                const SPA_META_SYNC_TIMELINE_SIZE: usize = 24;
+                let meta = unsafe {
+                    pw::spa::sys::spa_buffer_find_meta_data(
+                        spa_buffer.cast_const(),
+                        SPA_META_SYNC_TIMELINE,
+                        SPA_META_SYNC_TIMELINE_SIZE,
+                    )
+                };
+                if !meta.is_null() {
+                    // struct spa_meta_sync_timeline { u32 flags; u32 _pad; u64 acq; u64 rel; }
+                    let ptr = meta as *const u8;
+                    let flags = unsafe { *(ptr as *const u32) };
+                    let acquire = unsafe { *(ptr.add(8) as *const u64) };
+                    let release = unsafe { *(ptr.add(16) as *const u64) };
+                    eprintln!(
+                        "[pipewire][explicit-sync] frame #{process_idx}: flags=0x{flags:x} acquire={acquire} release={release}"
+                    );
+                } else if process_idx == 0 {
+                    eprintln!(
+                        "[pipewire][explicit-sync] compositor does not provide SPA_META_SyncTimeline on this buffer"
+                    );
+                }
+            }
             let info = *video_info_process.lock().unwrap();
             if let Some(info) = info {
                 let raw_type = data.as_raw().type_;

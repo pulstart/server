@@ -53,6 +53,13 @@ impl PersistedSettings {
 }
 
 fn config_path() -> Option<PathBuf> {
+    // ST_STATE_DIR lets a system service (e.g. /var/lib/st-server) override the
+    // per-user XDG path. Must be an absolute directory path.
+    if let Some(state_dir) = std::env::var_os("ST_STATE_DIR") {
+        let dir = PathBuf::from(state_dir);
+        let _ = std::fs::create_dir_all(&dir);
+        return Some(dir.join(CONFIG_FILENAME));
+    }
     // Prefer XDG state directory for stable persistence across rebuilds.
     if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME") {
         let dir = PathBuf::from(state_dir).join("st");

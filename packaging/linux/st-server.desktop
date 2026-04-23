@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=st Server
+GenericName=Low-Latency Game Streaming Server
+Comment=Streams this desktop to st clients over the network
+Exec=/usr/bin/st-server
+Icon=st-server
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupWMClass=st-server
+StartupNotify=false
+NoDisplay=true

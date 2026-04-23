@@ -1,0 +1,17 @@
+# Install as /etc/udev/rules.d/99-st-server.rules (or /usr/lib/udev/rules.d/).
+# Grants the `st` system user the device access needed for KMS capture +
+# uinput injection on the login screen.
+
+# uinput: virtual mouse/keyboard for input injection.
+KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
+
+# DRM card + render nodes: KMS capture needs read access to /dev/dri/card*.
+# The `video` + `render` groups are the conventional gates; the service
+# unit already has those as SupplementaryGroups, so these rules just
+# ensure the device ownership is correct.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", MODE="0660", GROUP="video"
+SUBSYSTEM=="drm", KERNEL=="renderD*",   MODE="0660", GROUP="render"
+
+# evdev input devices — only needed if a future backend reads real input;
+# present for symmetry with uinput injection.
+SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"

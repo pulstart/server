@@ -2,7 +2,8 @@ use super::super::{CaptureBackend, CapturedCursor, CapturedFrame, DmaBufPlane, F
 use super::target_frame_interval;
 use crossbeam_channel::{Sender, TrySendError};
 use std::fs::{File, OpenOptions};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, FromRawFd};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -422,6 +423,17 @@ impl CaptureBackend for KmsCapture {
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;
 
+            // Prefer a kernel timerfd pacer so the capture cadence doesn't drift
+            // under load the way `thread::sleep(remainder)` does. If the kernel
+            // rejects the syscall for some reason, fall back to the legacy
+            // sleep-based loop.
+            let mut pacer = TimerFdPacer::new(target_interval).ok();
+            if pacer.is_none() {
+                eprintln!(
+                    "[kms] timerfd unavailable; falling back to sleep-based pacer"
+                );
+            }
+
             while running.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
 
@@ -457,10 +469,18 @@ impl CaptureBackend for KmsCapture {
                     }
                 }
 
-                // Throttle to ~60 FPS
-                let elapsed = frame_start.elapsed();
-                if elapsed < target_interval {
-                    thread::sleep(target_interval - elapsed);
+                match pacer.as_mut() {
+                    Some(p) => {
+                        // Block on the timerfd; coalesced expirations (capture was
+                        // slower than the target interval) mean we skip ahead.
+                        let _ = p.wait();
+                    }
+                    None => {
+                        let elapsed = frame_start.elapsed();
+                        if elapsed < target_interval {
+                            thread::sleep(target_interval - elapsed);
+                        }
+                    }
                 }
             }
 
@@ -476,5 +496,70 @@ impl CaptureBackend for KmsCapture {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+/// Periodic kernel timer wrapping `timerfd_create` / `timerfd_settime`. Provides
+/// a drift-free pacing source for the capture loop — `read()` blocks until the
+/// next expiration and returns the number of missed ticks if capture overran
+/// the target interval.
+struct TimerFdPacer {
+    fd: OwnedFd,
+}
+
+impl TimerFdPacer {
+    fn new(interval: Duration) -> io::Result<Self> {
+        let raw = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        let spec = libc::itimerspec {
+            it_interval: duration_to_timespec(interval),
+            it_value: duration_to_timespec(interval),
+        };
+        let rc = unsafe {
+            libc::timerfd_settime(fd.as_raw_fd(), 0, &spec, std::ptr::null_mut())
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    /// Block until the next expiration. Returns the number of expirations that
+    /// occurred since the last read (>= 1). EINTR is transparently retried.
+    fn wait(&mut self) -> io::Result<u64> {
+        let mut expirations: u64 = 0;
+        loop {
+            let n = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    &mut expirations as *mut u64 as *mut libc::c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(expirations);
+        }
+    }
+}
+
+fn duration_to_timespec(d: Duration) -> libc::timespec {
+    libc::timespec {
+        tv_sec: d.as_secs() as libc::time_t,
+        tv_nsec: d.subsec_nanos() as libc::c_long,
     }
 }

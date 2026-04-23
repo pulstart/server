@@ -23,6 +23,8 @@ mod encode_vt;
 #[cfg(target_os = "macos")]
 mod macos_display;
 mod input;
+#[cfg(target_os = "linux")]
+mod linux_uring;
 mod server_control;
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -110,11 +112,6 @@ enum EncoderBackend {
     #[cfg(target_os = "windows")]
     MediaFoundation,
     Software,
-}
-
-#[cfg(target_os = "linux")]
-fn create_linux_encoder(config: &EncoderConfig) -> Result<EncoderKind, String> {
-    create_linux_encoder_with_hint(config, None)
 }
 
 #[cfg(target_os = "linux")]
