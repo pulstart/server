@@ -239,6 +239,35 @@ maybe_add_user_to_group() {
     usermod -aG st "$target"
 }
 
+# Kick the tray companion in the current user's session so the icon
+# appears without waiting for a re-login. The new process inherits
+# supplementary groups freshly from /etc/group, so it picks up the `st`
+# group even though the user's running shell does not.
+maybe_launch_tray_now() {
+    local target="${SUDO_USER:-}"
+    if [[ -z "$target" ]] || [[ "$target" == "root" ]]; then
+        log "Skipping tray auto-launch (no SUDO_USER). It will start on next login via the autostart entry."
+        return
+    fi
+    local uid bus
+    uid="$(id -u "$target")"
+    bus="/run/user/${uid}/bus"
+    if [[ ! -S "$bus" ]]; then
+        warn "No user D-Bus session at $bus; tray will appear on next desktop login."
+        return
+    fi
+
+    # Don't stack multiple tray instances.
+    pkill -u "$target" -f "${PREFIX}/st-server --tray" 2>/dev/null || true
+
+    log "Launching tray companion for '$target' in the current session"
+    runuser -u "$target" -- env \
+        XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}" \
+        nohup "${PREFIX}/st-server" --tray </dev/null >/dev/null 2>&1 &
+    disown || true
+}
+
 maybe_enable_service() {
     systemctl daemon-reload
     if [[ -n "${ST_SERVER_NO_ENABLE:-}" ]]; then
@@ -285,6 +314,9 @@ EOF
 
 uninstall() {
     local purge="${1:-0}"
+
+    log "Stopping any running tray companions"
+    pkill -f "${PREFIX}/st-server --tray" 2>/dev/null || true
 
     log "Stopping and disabling st-server.service"
     systemctl disable --now st-server.service 2>/dev/null || true
@@ -372,6 +404,7 @@ EOF
     write_autostart_entry
     maybe_add_user_to_group
     maybe_enable_service
+    maybe_launch_tray_now
     print_token_hint
 }
 
