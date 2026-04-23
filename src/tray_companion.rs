@@ -112,6 +112,11 @@ impl ksni::Tray for CompanionTray {
                 activate: Box::new(|_| open_logs()),
                 ..Default::default()
             }),
+            LinuxMenuItem::Standard(LinuxStandardItem {
+                label: "Update to latest".into(),
+                activate: Box::new(|_| install_latest_via_installer()),
+                ..Default::default()
+            }),
             LinuxMenuItem::Separator,
             LinuxMenuItem::Standard(LinuxStandardItem {
                 label: "Start server".into(),
@@ -239,6 +244,34 @@ fn pkexec_systemctl(action: &str) {
         .status();
     if let Err(err) = result {
         eprintln!("[tray-companion] failed to run pkexec systemctl {action}: {err}");
+    }
+}
+
+fn install_latest_via_installer() {
+    // Re-runs install.sh from the main branch. pkexec pops a polkit dialog
+    // on the user's desktop session → the script runs as root → stops the
+    // service → swaps /opt/st-server/ with the newest release → restarts.
+    // This reuses the one tested path for upgrades instead of the broken
+    // in-process auto-updater (which tries to write to a root-owned dir
+    // from the unprivileged `st` service user and gets stuck on pkexec
+    // having no polkit agent under systemd).
+    let cmdline = "curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash";
+    let result = Command::new("pkexec")
+        .args(["bash", "-c", cmdline])
+        .status();
+    match result {
+        Ok(status) if status.success() => {
+            eprintln!("[tray-companion] installer ran successfully");
+        }
+        Ok(status) => {
+            eprintln!(
+                "[tray-companion] installer exited with {:?} (polkit cancelled?)",
+                status.code()
+            );
+        }
+        Err(err) => {
+            eprintln!("[tray-companion] pkexec bash failed: {err}");
+        }
     }
 }
 
