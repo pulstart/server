@@ -170,9 +170,16 @@ fn recvmsg_with_fds(
     mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
     mhdr.msg_controllen = cmsg_buf.len() as _;
 
-    // MSG_CMSG_CLOEXEC so any received fds land with FD_CLOEXEC set —
-    // no need for a separate fcntl round-trip.
-    let ret = unsafe { libc::recvmsg(fd, &mut mhdr, libc::MSG_CMSG_CLOEXEC) };
+    // MSG_CMSG_CLOEXEC makes received fds land with FD_CLOEXEC atomically.
+    // Linux-only flag; macOS has no equivalent and we fall back to 0
+    // (fd-passing still works, fds just won't be CLOEXEC — the tray that
+    // actually sends fds is Linux-only, so in practice macOS never
+    // receives any here).
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags: libc::c_int = 0;
+    let ret = unsafe { libc::recvmsg(fd, &mut mhdr, flags) };
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
     }
