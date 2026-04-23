@@ -1,17 +1,16 @@
 # Install as /etc/udev/rules.d/99-st-server.rules (or /usr/lib/udev/rules.d/).
-# Grants the `st` system user the device access needed for KMS capture +
-# uinput injection on the login screen.
+# Grants the `st` system user the device access needed for uinput injection.
+#
+# We intentionally do NOT set MODE/GROUP on DRM nodes (/dev/dri/card*,
+# renderD*) or on evdev devices here. The distro default rules already
+# give them sensible ownership, and — critically — logind attaches a
+# per-session uaccess ACL to those nodes when a user logs in graphically.
+# If we rewrite MODE/GROUP with our own rule, udev resets the permissions
+# and the ACL is wiped until the next login; the currently-logged-in user
+# loses GPU access mid-session (Mesa silently falls back to llvmpipe).
+# The `st` service user gets access via SupplementaryGroups=video render
+# input on its systemd unit, so it needs no udev help here.
 
-# uinput: virtual mouse/keyboard for input injection.
+# uinput: virtual mouse/keyboard for input injection. No distro default
+# makes /dev/uinput group-writable, so we have to create it ourselves.
 KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
-
-# DRM card + render nodes: KMS capture needs read access to /dev/dri/card*.
-# The `video` + `render` groups are the conventional gates; the service
-# unit already has those as SupplementaryGroups, so these rules just
-# ensure the device ownership is correct.
-SUBSYSTEM=="drm", KERNEL=="card[0-9]*", MODE="0660", GROUP="video"
-SUBSYSTEM=="drm", KERNEL=="renderD*",   MODE="0660", GROUP="render"
-
-# evdev input devices — only needed if a future backend reads real input;
-# present for symmetry with uinput injection.
-SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"

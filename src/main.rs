@@ -8,6 +8,8 @@ mod broadcast;
 mod capture;
 mod clipboard;
 mod colorspace;
+#[cfg(unix)]
+mod control_socket;
 mod file_transfer;
 #[cfg(target_os = "linux")]
 mod encode;
@@ -26,6 +28,7 @@ mod input;
 #[cfg(target_os = "linux")]
 mod linux_uring;
 mod server_control;
+mod session_bridge;
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod tray;
@@ -1050,16 +1053,40 @@ fn run_shared_pipeline(
         ))
     };
 
-    // Start audio pipeline — broadcasts to audio_bc
+    // Start audio pipeline — encode + relay run persistently; capture is
+    // attached on-demand. In user-mode we auto-detect against whatever PA
+    // daemon is visible to this process; in system-service mode we wait
+    // for the tray companion to push a SessionContext over the control
+    // socket (so PA connects as the logged-in user, not as `st`).
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let mut audio_pipeline = {
+    let audio_pipeline_shared = {
         let mut ap = audio::AudioPipeline::new();
         match ap.start(audio_config.clone(), audio_bc) {
             Ok(()) => println!("[pipeline] Audio pipeline started"),
             Err(e) => eprintln!("[pipeline] Audio pipeline failed (video-only): {e}"),
         }
-        ap
+        let wrapped = Arc::new(std::sync::Mutex::new(ap));
+
+        if std::env::var_os("ST_STATE_DIR").is_some() {
+            // System-service path: follow the tray.
+            let bridge = session_bridge::global();
+            let ap_cb = Arc::clone(&wrapped);
+            bridge.subscribe(move |ctx| {
+                if let Ok(mut guard) = ap_cb.lock() {
+                    guard.apply_context(ctx);
+                }
+            });
+        } else {
+            // User-mode path: the ambient PA/PW session is ours, just use it.
+            if let Ok(mut guard) = wrapped.lock() {
+                guard.apply_auto_detect();
+            }
+        }
+
+        wrapped
     };
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    let audio_pipeline = Arc::clone(&audio_pipeline_shared);
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let stream_config = config.to_stream_config(&audio_config);
@@ -1352,7 +1379,9 @@ fn run_shared_pipeline(
         }
     }
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    audio_pipeline.stop();
+    if let Ok(mut ap) = audio_pipeline.lock() {
+        ap.stop();
+    }
     capture_backend.stop();
     input.clear_for_stop();
     println!("Shared pipeline stopped");
@@ -2416,7 +2445,23 @@ fn probe_backends() {
         }
     }
 
-    let capture_backend = match ds.as_str() {
+    let capture_override = std::env::var("ST_CAPTURE").ok();
+    let capture_backend = if let Some(ref forced) = capture_override {
+        // Honor ST_CAPTURE explicitly — this is the path the system-service
+        // unit takes (ST_CAPTURE=kms), and it would be misleading to report
+        // "none available" just because this probe didn't try to open
+        // `/dev/dri/card*`. The real selection happens later in select_backend().
+        match forced.to_lowercase().as_str() {
+            "kms" => "KMS (ST_CAPTURE override)",
+            "nvfbc" => "NvFBC (ST_CAPTURE override)",
+            "pipewire" | "portal" => "PipeWire (ST_CAPTURE override)",
+            "wayland" => "Wayland screencopy (ST_CAPTURE override)",
+            "x11" => "X11 XShm (ST_CAPTURE override)",
+            "ext-image-copy" => "ext-image-copy-capture-v1 (ST_CAPTURE override)",
+            _ => "unknown ST_CAPTURE value",
+        }
+    } else {
+        match ds.as_str() {
         "wayland" => {
             if wlr_ok {
                 "Wayland (wlr-screencopy)"
@@ -2447,6 +2492,7 @@ fn probe_backends() {
             } else {
                 "none available"
             }
+        }
         }
     };
     println!("[probe] Selected capture: {capture_backend}");
@@ -3244,6 +3290,16 @@ fn main() {
 
     let listen_port = configured_listen_port();
     let control = ServerControl::new();
+
+    // System-service deployments (ST_STATE_DIR set) expose a local IPC
+    // socket so the user-session tray companion can query live state and
+    // push config changes without shelling out. User-mode runs keep the
+    // in-process tray and don't need the socket.
+    #[cfg(unix)]
+    if std::env::var_os("ST_STATE_DIR").is_some() {
+        let _ = control_socket::spawn(Arc::clone(&control));
+    }
+
     let tunnel_state = Some(Arc::new(api_client::ApiTunnelState::new()));
     let state = build_server_state(Arc::clone(&control), listen_port, tunnel_state.clone());
 

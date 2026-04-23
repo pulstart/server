@@ -33,9 +33,13 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/st-server
-DeviceAllow=/dev/uinput rw
-DeviceAllow=char-drm rw
-DeviceAllow=char-input rw
+# Device access is gated by Unix group membership, not a cgroup whitelist.
+# The `st` user has SupplementaryGroups=video render input (above) and the
+# shipped udev rules chmod /dev/uinput, /dev/dri/card*, /dev/dri/renderD*,
+# and /dev/input/event* to group-writable. That covers Intel (i915),
+# AMD (amdgpu), and NVIDIA (char-major 195) transparently. Adding a
+# DeviceAllow= line anywhere here would flip the cgroup to whitelist mode
+# and silently break GPU access on at least one vendor.
 RestrictSUIDSGID=true
 LockPersonality=true
 

@@ -2,7 +2,7 @@
 Type=Application
 Name=st Server Tray
 Comment=Status tray icon + controls for the st-server system service
-Exec=/opt/st-server/st-server --tray
+Exec=systemd-cat -t st-server-tray /opt/st-server/st-server --tray
 Icon=st-server
 Terminal=false
 Categories=Network;RemoteAccess;

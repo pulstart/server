@@ -126,15 +126,19 @@ EOF
 
 write_udev() {
     log "Writing $UDEV_PATH"
+    # Intentionally minimal: only /dev/uinput needs a custom rule because
+    # no distro ships one. Writing MODE/GROUP on DRM or evdev nodes here
+    # would reset udev permissions and wipe logind's per-session uaccess
+    # ACL — the logged-in user would lose GPU access until re-login, and
+    # Mesa would silently fall back to llvmpipe. The `st` service user
+    # already gets DRM + evdev access via SupplementaryGroups on the unit.
     install -Dm0644 /dev/stdin "$UDEV_PATH" <<'EOF'
 # Created by packaging/linux/install.sh.
-# Grants the `st` system user the device access needed for KMS capture +
-# uinput injection on the login screen.
+# Grants /dev/uinput the group access needed for input injection.
+# DRM and evdev nodes are deliberately left to the distro defaults so
+# logind's uaccess ACL for the logged-in user isn't reset.
 
 KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
-SUBSYSTEM=="drm", KERNEL=="card[0-9]*", MODE="0660", GROUP="video"
-SUBSYSTEM=="drm", KERNEL=="renderD*",   MODE="0660", GROUP="render"
-SUBSYSTEM=="input", KERNEL=="event*",   MODE="0660", GROUP="input"
 EOF
     udevadm control --reload
     udevadm trigger --subsystem-match=drm --subsystem-match=input || true
@@ -183,9 +187,11 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=${STATE_DIR}
-DeviceAllow=/dev/uinput rw
-DeviceAllow=char-drm rw
-DeviceAllow=char-input rw
+# Device access is gated by Unix group membership, not a cgroup whitelist.
+# SupplementaryGroups=video render input + the udev rules we ship cover
+# Intel (i915), AMD (amdgpu), and NVIDIA (char-major 195) transparently.
+# Do NOT re-introduce DeviceAllow= here; it flips the cgroup device
+# controller to whitelist mode and silently breaks at least one vendor.
 RestrictSUIDSGID=true
 LockPersonality=true
 
@@ -203,14 +209,45 @@ ensure_state_dir() {
     install -d -o st -g st -m 0750 "$STATE_DIR"
 }
 
+# On first install, carry the invoking user's existing user-mode config
+# (token, codec/bitrate/quality, peer id) into the system-service state dir
+# so users don't have to re-pair clients or re-configure the server. Only
+# runs if the system state file does not already exist — subsequent
+# installs leave the system config alone.
+maybe_migrate_user_state() {
+    local target="${SUDO_USER:-}"
+    [[ -n "$target" && "$target" != "root" ]] || return
+    local home
+    home="$(getent passwd "$target" | cut -d: -f6 || true)"
+    [[ -n "$home" && -d "$home" ]] || return
+
+    local src="${home}/.local/state/st/st-server-config.json"
+    local dst="${STATE_DIR}/st-server-config.json"
+
+    if [[ -f "$dst" ]]; then
+        log "System config $dst already exists — skipping user-mode migration."
+        return
+    fi
+    if [[ ! -f "$src" ]]; then
+        log "No prior user-mode config at $src — nothing to migrate."
+        return
+    fi
+
+    log "Migrating user-mode config $src -> $dst"
+    install -o st -g st -m 0640 "$src" "$dst"
+    log "Old token, codec/bitrate/quality, and peer id carried over. Clients do not need to re-pair."
+}
+
 write_autostart_entry() {
     log "Writing $AUTOSTART_PATH (user-session tray companion)"
+    # systemd-cat pipes stdout+stderr into the user journal under the tag
+    # "st-server-tray", so `journalctl --user -t st-server-tray` works.
     install -Dm0644 /dev/stdin "$AUTOSTART_PATH" <<EOF
 [Desktop Entry]
 Type=Application
 Name=st Server Tray
 Comment=Status tray icon + controls for the st-server system service
-Exec=${PREFIX}/st-server --tray
+Exec=systemd-cat -t st-server-tray ${PREFIX}/st-server --tray
 Icon=st-server
 Terminal=false
 Categories=Network;RemoteAccess;
@@ -261,10 +298,12 @@ maybe_launch_tray_now() {
     pkill -u "$target" -f "${PREFIX}/st-server --tray" 2>/dev/null || true
 
     log "Launching tray companion for '$target' in the current session"
+    # systemd-cat puts stdout/stderr into the user journal under tag
+    # "st-server-tray"; view later with `journalctl --user -t st-server-tray -f`.
     runuser -u "$target" -- env \
         XDG_RUNTIME_DIR="/run/user/${uid}" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}" \
-        nohup "${PREFIX}/st-server" --tray </dev/null >/dev/null 2>&1 &
+        systemd-cat -t st-server-tray "${PREFIX}/st-server" --tray </dev/null &
     disown || true
 }
 
@@ -288,11 +327,12 @@ print_token_hint() {
 -------------------------------------------------------------------
 st-server is installed and running as a system service.
 
-  Status:   systemctl status st-server
-  Logs:     journalctl -u st-server -f
-  Binary:   ${PREFIX}/st-server
-  State:    ${STATE_DIR}
-  Unit:     ${SERVICE_PATH}
+  Status:      systemctl status st-server
+  Server logs: journalctl -u st-server -f
+  Tray logs:   journalctl --user -t st-server-tray -f
+  Binary:      ${PREFIX}/st-server
+  State:       ${STATE_DIR}
+  Unit:        ${SERVICE_PATH}
 
 First-connect token (keep it secret — anyone with it can control this
 machine):
@@ -398,6 +438,7 @@ EOF
     download_and_extract "$version" "$platform" "$PREFIX"
     write_sysusers
     ensure_state_dir
+    maybe_migrate_user_state
     write_udev
     write_service
     write_bin_symlink

@@ -35,8 +35,9 @@ curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linu
 After install:
 
 ```sh
-systemctl status st-server        # is it running?
-journalctl -u st-server -f        # live logs
+systemctl status st-server                      # is it running?
+journalctl -u st-server -f                      # service logs
+journalctl --user -t st-server-tray -f          # tray companion logs
 sudo cat /var/lib/st-server/st-server-config.json   # first-connect token
 ```
 
@@ -52,6 +53,58 @@ the tray lives in a separate user-side process.
 The installer adds the sudo user to the `st` group so the tray can read
 the token; **log out and back in** (or `newgrp st` in a fresh shell) for
 that to take effect.
+
+### Control socket (for scripting / the tray companion)
+
+When running as a system service the server also opens a local Unix socket
+at `/run/st-server/control.sock` (mode `0660`, owner `st:st`). Any member
+of the `st` group can speak line-delimited JSON to it. Poke at it with
+`nc -U`:
+
+```sh
+# Read live state (token, codec, bitrate, connected clients, etc.)
+printf '{"op":"get_state"}\n' | nc -U /run/st-server/control.sock
+
+# Switch codec
+printf '{"op":"set_codec","codec":"hevc"}\n' | nc -U /run/st-server/control.sock
+
+# Pin a bitrate in kbps (0 = auto/ABR)
+printf '{"op":"set_bitrate","kbps":25000}\n' | nc -U /run/st-server/control.sock
+
+# Regenerate the trust token — returns the new one
+printf '{"op":"regen_token"}\n' | nc -U /run/st-server/control.sock
+```
+
+The full op set: `get_state`, `set_codec`, `set_bitrate`, `set_quality`,
+`regen_token`, `set_token`, `disconnect_all`, `shutdown`,
+`set_session_context`, `clear_session_context`.
+
+### Audio under the system service
+
+The service can't capture your desktop audio directly — PulseAudio /
+PipeWire daemons run per-user, and the `st` system user isn't logged in.
+Instead the tray companion (which *does* run in your session) probes
+`$XDG_RUNTIME_DIR/pulse/native` plus the PulseAudio cookie on startup and
+pushes both to the server via `set_session_context`. The server then
+captures against that endpoint — no more, no less.
+
+Consequences:
+
+- **No user logged in (SDDM/GDM greeter)**: no tray, no session context,
+  no audio — the client sees a silent video stream.
+- **User logs in**: tray fires, pushes context, audio capture starts mid-
+  stream. Clients already watching suddenly get sound.
+- **User logs out**: tray exits on SIGTERM, sends `clear_session_context`;
+  audio capture tears down, video keeps streaming silently until someone
+  logs back in.
+- **Fast user switch**: the new session's tray pushes its own context;
+  server rebinds to the new user's audio daemon.
+
+The mechanism (`server/src/session_bridge.rs`) is deliberately generic:
+future user-session resources — D-Bus bus address for notifications,
+Wayland display for direct-capture variants, XDG paths — can plug into
+the same bridge by adding fields to `SessionContext` and subscribing on
+the server side.
 
 Full packaging details (manual install, uninstall, NVIDIA caveats) are in
 [`packaging/linux/README.md`](packaging/linux/README.md).
