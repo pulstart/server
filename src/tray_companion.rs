@@ -404,6 +404,13 @@ fn build_session_payload() -> Option<serde_json::Value> {
     }))
 }
 
+/// True if the server control socket is present. The socket only exists
+/// when st-server runs as a systemd service with `ST_STATE_DIR` set, so on
+/// a dev/user-mode run this is `false` and the tray skips IPC silently.
+fn control_socket_available() -> bool {
+    Path::new(CONTROL_SOCKET).exists()
+}
+
 fn send_control(op: serde_json::Value) -> Result<(), String> {
     let mut sock = UnixStream::connect(CONTROL_SOCKET)
         .map_err(|e| format!("connect {CONTROL_SOCKET}: {e}"))?;
@@ -488,6 +495,11 @@ fn maybe_offer_portal_session() {
     if slot.lock().unwrap().is_some() {
         return;
     }
+    // No server listening? Don't burn a portal session — the fd would be
+    // dropped on the floor and the user would see a spurious approval dialog.
+    if !control_socket_available() {
+        return;
+    }
 
     let offer = match tray_portal::request_screencast() {
         Ok(offer) => offer,
@@ -533,19 +545,22 @@ fn revoke_portal_session() {
 }
 
 fn push_session_context() {
+    if !control_socket_available() {
+        return;
+    }
     let Some(ctx) = build_session_payload() else {
         return;
     };
     let req = serde_json::json!({ "op": "set_session_context", "context": ctx });
     if let Err(err) = send_control(req) {
-        // Server might be stopped or the socket group perms not granted
-        // yet — log once-per-interval rather than spam every 15s. For a
-        // v1 tray, eprintln! is fine (goes into the user journal).
         eprintln!("[tray-companion] push session context failed: {err}");
     }
 }
 
 fn clear_session_context() {
+    if !control_socket_available() {
+        return;
+    }
     let req = serde_json::json!({ "op": "clear_session_context" });
     if let Err(err) = send_control(req) {
         eprintln!("[tray-companion] clear session context failed: {err}");
@@ -593,8 +608,20 @@ pub fn run() -> Result<(), String> {
     // NVIDIA (where KMS can't read the compositor's framebuffer). Silent
     // on systems where the portal isn't available — KMS takes over then.
     // We do it in a background thread because `request_screencast` blocks
-    // the portal dialog; the tray icon should appear instantly.
-    thread::spawn(maybe_offer_portal_session);
+    // the portal dialog; the tray icon should appear instantly. Retry on
+    // the same cadence so the offer lands once the server starts.
+    thread::spawn(|| loop {
+        maybe_offer_portal_session();
+        if PORTAL_SESSION
+            .get()
+            .and_then(|s| s.lock().ok().map(|g| g.is_some()))
+            .unwrap_or(false)
+        {
+            // Portal session stashed — no need to re-probe.
+            break;
+        }
+        thread::sleep(SESSION_PUSH_INTERVAL);
+    });
 
     // On SIGTERM / SIGINT — fired when the user logs out or quits the
     // tray — tell the server to drop the session context so it doesn't
