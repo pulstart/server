@@ -29,6 +29,8 @@ mod server_control;
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod tray;
+#[cfg(target_os = "linux")]
+mod tray_companion;
 mod updater;
 
 use adaptive_bitrate::{AdaptiveBitrateState, ClientRateController};
@@ -3216,6 +3218,18 @@ fn join_server_thread(handle: std::thread::JoinHandle<Result<(), String>>) -> ! 
 }
 
 fn main() {
+    // `--tray` short-circuits the whole server: runs only the user-session
+    // tray companion and exits. Used by the XDG autostart entry on systems
+    // where st-server itself runs as a system service.
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|a| a == "--tray") {
+        if let Err(err) = tray_companion::run() {
+            eprintln!("[tray-companion] {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     match updater::maybe_run_apply_update_from_args() {
         Ok(true) => return,
         Ok(false) => {}

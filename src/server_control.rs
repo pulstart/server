@@ -132,11 +132,19 @@ fn resolve_token(saved: &mut PersistedSettings) -> String {
                 if let Err(err) = std::fs::write(&path, &json) {
                     eprintln!("[config] Failed to persist token to {}: {err}", path.display());
                 } else {
-                    // Restrict file permissions so other users cannot read the token.
+                    // In system-service mode (ST_STATE_DIR set) the user-session
+                    // tray companion runs as a different user and needs to read
+                    // the token. We rely on the file being group-owned by `st`
+                    // and the companion's user being in that group.
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                        let mode = if std::env::var_os("ST_STATE_DIR").is_some() {
+                            0o640
+                        } else {
+                            0o600
+                        };
+                        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
                     }
                     eprintln!("[config] Token persisted to {}", path.display());
                 }

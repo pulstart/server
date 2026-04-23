@@ -24,6 +24,7 @@ SERVICE_PATH="/etc/systemd/system/st-server.service"
 SYSUSERS_PATH="/usr/lib/sysusers.d/st-server.conf"
 UDEV_PATH="/etc/udev/rules.d/99-st-server.rules"
 BIN_SYMLINK="/usr/local/bin/st-server"
+AUTOSTART_PATH="/etc/xdg/autostart/st-server-tray.desktop"
 
 log()  { printf '\033[1;34m[st-install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[st-install]\033[0m %s\n' "$*" >&2; }
@@ -81,19 +82,25 @@ download_and_extract() {
     local url="https://github.com/${REPO}/releases/download/${version}/${asset}"
     local tmp
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' RETURN
 
     log "Downloading $url"
-    curl -fsSL "$url" -o "$tmp/$asset" || die "Failed to download $url"
+    if ! curl -fsSL "$url" -o "$tmp/$asset"; then
+        rm -rf "$tmp"
+        die "Failed to download $url"
+    fi
 
     log "Extracting into $target_dir"
     rm -rf "$target_dir"
     mkdir -p "$target_dir"
     tar -xzf "$tmp/$asset" -C "$tmp"
     local extracted="$tmp/st-server-${version}-${platform}"
-    [[ -d "$extracted" ]] || die "Unexpected archive layout: $extracted missing"
+    if [[ ! -d "$extracted" ]]; then
+        rm -rf "$tmp"
+        die "Unexpected archive layout: $extracted missing"
+    fi
     # Flatten: move contents of the versioned dir into $target_dir.
     ( shopt -s dotglob; mv "$extracted"/* "$target_dir"/ )
+    rm -rf "$tmp"
 
     [[ -x "$target_dir/st-server" ]] || die "Launcher $target_dir/st-server is missing or not executable"
 }
@@ -187,6 +194,42 @@ ensure_state_dir() {
     install -d -o st -g st -m 0750 "$STATE_DIR"
 }
 
+write_autostart_entry() {
+    log "Writing $AUTOSTART_PATH (user-session tray companion)"
+    install -Dm0644 /dev/stdin "$AUTOSTART_PATH" <<EOF
+[Desktop Entry]
+Type=Application
+Name=st Server Tray
+Comment=Status tray icon + controls for the st-server system service
+Exec=${PREFIX}/st-server --tray
+Icon=st-server
+Terminal=false
+Categories=Network;RemoteAccess;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+NoDisplay=true
+EOF
+}
+
+# Add the invoking user to the `st` group so the tray companion can read
+# the config file (mode 0640 st:st). Skipped if the installer is not being
+# run via sudo (no SUDO_USER set).
+maybe_add_user_to_group() {
+    local target="${SUDO_USER:-}"
+    if [[ -z "$target" ]] || [[ "$target" == "root" ]]; then
+        warn "Not running via sudo (SUDO_USER is empty) — skipping 'usermod -aG st'."
+        warn "The tray companion will not be able to read the token until you run:"
+        warn "    sudo usermod -aG st <your-user>"
+        return
+    fi
+    if id -nG "$target" | tr ' ' '\n' | grep -qx st; then
+        log "User '$target' already in group 'st'."
+        return
+    fi
+    log "Adding user '$target' to group 'st' (log out + back in for it to take effect)."
+    usermod -aG st "$target"
+}
+
 maybe_enable_service() {
     systemctl daemon-reload
     if [[ -n "${ST_SERVER_NO_ENABLE:-}" ]]; then
@@ -246,6 +289,8 @@ main() {
     write_udev
     write_service
     write_bin_symlink
+    write_autostart_entry
+    maybe_add_user_to_group
     maybe_enable_service
     print_token_hint
 }

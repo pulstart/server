@@ -28,6 +28,19 @@ journalctl -u st-server -f        # live logs
 sudo cat /var/lib/st-server/st-server-config.json   # first-connect token
 ```
 
+### Tray icon
+
+The installer also drops `/etc/xdg/autostart/st-server-tray.desktop`, which
+launches a small user-session companion (`st-server --tray`) on desktop
+login. It shows service status, a "Copy token" menu entry, and start/stop/
+restart actions (via `pkexec systemctl`). The system service itself runs
+as the `st` user and has no access to your D-Bus session bus, which is why
+the tray lives in a separate user-side process.
+
+The installer adds the sudo user to the `st` group so the tray can read
+the token; **log out and back in** (or `newgrp st` in a fresh shell) for
+that to take effect.
+
 Full packaging details (manual install, uninstall, NVIDIA caveats) are in
 [`packaging/linux/README.md`](packaging/linux/README.md).
 
