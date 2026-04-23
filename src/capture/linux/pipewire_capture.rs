@@ -548,14 +548,6 @@ impl CursorCache {
             visible: self.visible,
         })
     }
-
-    fn mark_hidden(&mut self) -> Option<CapturedCursor> {
-        if !self.has_state {
-            return None;
-        }
-        self.visible = false;
-        self.current_cursor()
-    }
 }
 
 fn convert_cursor_bitmap_to_bgra(
@@ -618,11 +610,21 @@ fn extract_cursor(
             std::mem::size_of::<pw::spa::sys::spa_meta_cursor>(),
         ) as *mut pw::spa::sys::spa_meta_cursor
     };
+    extract_cursor_from_meta(cursor_ptr.cast_const(), cache)
+}
+
+fn extract_cursor_from_meta(
+    cursor_ptr: *const pw::spa::sys::spa_meta_cursor,
+    cache: &mut CursorCache,
+) -> Option<CapturedCursor> {
     if cursor_ptr.is_null() {
-        return cache.mark_hidden();
+        // No SPA_META_Cursor on this buffer means no cursor update. Keep the
+        // previous state instead of turning a metadata gap into a hide event.
+        return cache.current_cursor();
     }
-    if !spa_meta_cursor_is_valid_local(cursor_ptr.cast_const()) {
-        return cache.mark_hidden();
+    if !spa_meta_cursor_is_valid_local(cursor_ptr) {
+        // SPA documents id == 0 as "no new cursor data".
+        return cache.current_cursor();
     }
 
     let cursor = unsafe { &*cursor_ptr };
@@ -2167,4 +2169,64 @@ fn run_pipewire_stream(
     mainloop.run();
     println!("[capture] PipeWire main loop exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cached_visible_cursor() -> CursorCache {
+        CursorCache {
+            pixels: vec![1, 2, 3, 4],
+            width: 1,
+            height: 1,
+            hotspot_x: 2,
+            hotspot_y: 3,
+            shape_serial: 42,
+            x: 10,
+            y: 20,
+            visible: true,
+            has_state: true,
+        }
+    }
+
+    fn assert_cached_cursor(cursor: CapturedCursor) {
+        assert_eq!(cursor.pixels.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(cursor.width, 1);
+        assert_eq!(cursor.height, 1);
+        assert_eq!(cursor.hotspot_x, 2);
+        assert_eq!(cursor.hotspot_y, 3);
+        assert_eq!(cursor.shape_serial, 42);
+        assert_eq!(cursor.x, 10);
+        assert_eq!(cursor.y, 20);
+        assert!(cursor.visible);
+    }
+
+    #[test]
+    fn missing_cursor_meta_keeps_cached_state() {
+        let mut cache = cached_visible_cursor();
+        let cursor = extract_cursor_from_meta(std::ptr::null(), &mut cache).unwrap();
+        assert_cached_cursor(cursor);
+    }
+
+    #[test]
+    fn invalid_cursor_meta_keeps_cached_state() {
+        let mut cache = cached_visible_cursor();
+        let meta = pw::spa::sys::spa_meta_cursor {
+            id: 0,
+            flags: 0,
+            position: pw::spa::sys::spa_point { x: 999, y: 888 },
+            hotspot: pw::spa::sys::spa_point { x: 0, y: 0 },
+            bitmap_offset: 0,
+        };
+
+        let cursor = extract_cursor_from_meta(&meta, &mut cache).unwrap();
+        assert_cached_cursor(cursor);
+    }
+
+    #[test]
+    fn missing_cursor_meta_without_cache_returns_none() {
+        let mut cache = CursorCache::default();
+        assert!(extract_cursor_from_meta(std::ptr::null(), &mut cache).is_none());
+    }
 }
