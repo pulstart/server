@@ -9,7 +9,7 @@ One-liner — downloads the latest release and installs it as a systemd
 **user** service that starts on desktop login. Do **not** run as root:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zhey/st/main/packaging/linux/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash
 ```
 
 The script re-execs itself with `sudo` only for the single udev-rule step
@@ -24,7 +24,7 @@ Useful env overrides (set before the pipe):
 Uninstall:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zhey/st/main/packaging/linux/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash -s -- --uninstall
 ```
 
 After install:

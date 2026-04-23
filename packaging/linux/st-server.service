@@ -1,6 +1,6 @@
 [Unit]
 Description=st low-latency game-streaming server
-Documentation=https://github.com/zhey/st
+Documentation=https://github.com/pulstart/server
 # graphical-session.target is started by the desktop environment once the
 # session bus is up. Running under it means PipeWire, PulseAudio, and
 # xdg-desktop-portal are all reachable by this unit natively.

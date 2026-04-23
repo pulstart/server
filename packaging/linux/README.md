@@ -13,7 +13,7 @@ different feature and a different architecture. Start a session first.
 Downloads the latest GitHub release and wires it up:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zhey/st/main/packaging/linux/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash
 ```
 
 Do **not** run this as root. The script re-execs itself with `sudo` only

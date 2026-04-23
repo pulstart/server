@@ -7,13 +7,13 @@
 # natively — no cross-user permission juggling.
 #
 # One-liner:
-#     curl -fsSL https://raw.githubusercontent.com/zhey/st/main/packaging/linux/install.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash
 #
 # The only step that needs root is the /dev/uinput udev rule (input
 # injection). The script re-execs itself via sudo for that bit only.
 #
 # Uninstall:
-#     curl -fsSL https://raw.githubusercontent.com/zhey/st/main/packaging/linux/install.sh | bash -s -- --uninstall
+#     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash -s -- --uninstall
 #
 # Environment knobs:
 #     ST_SERVER_VERSION=v0.4.6    Pin a specific release (default: latest).
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-REPO="zhey/st"
+REPO="pulstart/server"
 PREFIX="${ST_SERVER_PREFIX:-${HOME}/.local/share/st-server}"
 BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
