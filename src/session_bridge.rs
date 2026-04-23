@@ -28,6 +28,7 @@
 //!                                          subscribers tear down
 
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -101,6 +102,8 @@ pub struct SessionBridge {
     /// `SessionContext` because file descriptors aren't `Clone` and are
     /// transmitted out-of-band (SCM_RIGHTS on the control socket). The
     /// capture backend consumes it via [`take_pipewire_fd`] when starting.
+    /// Unix-only — Windows has no equivalent and the tray isn't built there.
+    #[cfg(unix)]
     pipewire_fd: Mutex<Option<OwnedFd>>,
 }
 
@@ -109,18 +112,21 @@ impl SessionBridge {
         Arc::new(Self {
             current: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
+            #[cfg(unix)]
             pipewire_fd: Mutex::new(None),
         })
     }
 
     /// Hand a freshly-received PipeWire fd to the bridge. Replaces (and
-    /// closes) any previous offer via `OwnedFd`'s Drop.
+    /// closes) any previous offer via `OwnedFd`'s Drop. Unix-only.
+    #[cfg(unix)]
     pub fn set_pipewire_fd(&self, fd: Option<OwnedFd>) {
         *self.pipewire_fd.lock().unwrap() = fd;
     }
 
     /// Take ownership of the current PipeWire fd. Used by the capture
     /// backend when it starts a stream against the offered connection.
+    #[cfg(unix)]
     #[allow(dead_code)] // consumed in Slice 2 when capture backend is wired
     pub fn take_pipewire_fd(&self) -> Option<OwnedFd> {
         self.pipewire_fd.lock().unwrap().take()
