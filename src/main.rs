@@ -34,6 +34,8 @@ mod transport;
 mod tray;
 #[cfg(target_os = "linux")]
 mod tray_companion;
+#[cfg(target_os = "linux")]
+mod tray_portal;
 mod updater;
 
 use adaptive_bitrate::{AdaptiveBitrateState, ClientRateController};

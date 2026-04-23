@@ -14,11 +14,14 @@
 
 use crate::encode_config::{Codec, QualityPreset};
 use crate::server_control::{ConnectedClientSnapshot, ServerControl};
-use crate::session_bridge::{self, SessionContext};
+use crate::session_bridge::{self, PipewireOffer, SessionContext};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::VecDeque;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -95,41 +98,115 @@ pub fn spawn(control: Arc<ServerControl>) -> Option<PathBuf> {
 }
 
 fn handle_client(stream: UnixStream, control: Arc<ServerControl>) {
-    let read_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(err) => {
-            eprintln!("[control-socket] clone stream: {err}");
-            return;
-        }
-    };
+    let fd = stream.as_raw_fd();
     let mut writer = stream;
-    let reader = BufReader::new(read_stream);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    // Line accumulator — recvmsg may deliver a partial line or several
+    // concatenated lines. Ancillary fds are collected separately and
+    // consumed in FIFO order by ops that need one (currently only
+    // `offer_pipewire_fd`). This matches the tray's send pattern where a
+    // single sendmsg carries both the fd via SCM_RIGHTS and the op bytes.
+    let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut pending_fds: VecDeque<OwnedFd> = VecDeque::new();
+
+    loop {
+        let mut data = [0u8; 4096];
+        let mut cmsg = [0u8; 256];
+        let (n, fds) = match recvmsg_with_fds(fd, &mut data, &mut cmsg) {
+            Ok((0, _)) => break, // peer closed
+            Ok((n, fds)) => (n, fds),
+            Err(err) => {
+                eprintln!("[control-socket] recvmsg: {err}");
+                break;
+            }
         };
-        if line.trim().is_empty() {
-            continue;
+        for f in fds {
+            pending_fds.push_back(f);
         }
 
-        let reply = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle_request(req, &control),
-            Err(err) => Response::err(format!("parse: {err}")),
-        };
+        line_buf.extend_from_slice(&data[..n]);
 
-        let serialized = match serde_json::to_string(&reply) {
-            Ok(s) => s,
-            Err(err) => format!(r#"{{"ok":false,"error":"serialize: {err}"}}"#),
-        };
-        if writeln!(writer, "{serialized}").is_err() || writer.flush().is_err() {
-            break;
+        while let Some(pos) = line_buf.iter().position(|b| *b == b'\n') {
+            let line_bytes = line_buf.drain(..=pos).collect::<Vec<_>>();
+            let line = match std::str::from_utf8(&line_bytes[..pos]) {
+                Ok(s) => s.trim(),
+                Err(_) => continue,
+            };
+            if line.is_empty() {
+                continue;
+            }
+
+            let reply = match serde_json::from_str::<Request>(line) {
+                Ok(req) => handle_request(req, &control, &mut pending_fds),
+                Err(err) => Response::err(format!("parse: {err}")),
+            };
+
+            let serialized = match serde_json::to_string(&reply) {
+                Ok(s) => s,
+                Err(err) => format!(r#"{{"ok":false,"error":"serialize: {err}"}}"#),
+            };
+            if writeln!(writer, "{serialized}").is_err() || writer.flush().is_err() {
+                return;
+            }
         }
     }
 }
 
-fn handle_request(req: Request, control: &Arc<ServerControl>) -> Response {
+/// Receive a datagram of bytes + any SCM_RIGHTS file descriptors attached
+/// to it. Returns `(bytes_read, fds)`. An Ok(0, _) return means the peer
+/// closed the connection cleanly.
+fn recvmsg_with_fds(
+    fd: RawFd,
+    data: &mut [u8],
+    cmsg_buf: &mut [u8],
+) -> std::io::Result<(usize, Vec<OwnedFd>)> {
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
+    let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    mhdr.msg_iov = &mut iov;
+    mhdr.msg_iovlen = 1;
+    mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    mhdr.msg_controllen = cmsg_buf.len() as _;
+
+    // MSG_CMSG_CLOEXEC so any received fds land with FD_CLOEXEC set —
+    // no need for a separate fcntl round-trip.
+    let ret = unsafe { libc::recvmsg(fd, &mut mhdr, libc::MSG_CMSG_CLOEXEC) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let n = ret as usize;
+
+    let mut fds = Vec::new();
+    unsafe {
+        let mut cmsg_ptr = libc::CMSG_FIRSTHDR(&mhdr);
+        while !cmsg_ptr.is_null() {
+            let cmsg = &*cmsg_ptr;
+            if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_RIGHTS {
+                let data_ptr = libc::CMSG_DATA(cmsg_ptr) as *const RawFd;
+                let header_len = libc::CMSG_LEN(0) as usize;
+                let payload_len = cmsg.cmsg_len as usize - header_len;
+                let count = payload_len / std::mem::size_of::<RawFd>();
+                for i in 0..count {
+                    let raw_fd = std::ptr::read_unaligned(data_ptr.add(i));
+                    if raw_fd >= 0 {
+                        fds.push(OwnedFd::from_raw_fd(raw_fd));
+                    }
+                }
+            }
+            cmsg_ptr = libc::CMSG_NXTHDR(&mhdr, cmsg_ptr);
+        }
+    }
+
+    Ok((n, fds))
+}
+
+fn handle_request(
+    req: Request,
+    control: &Arc<ServerControl>,
+    pending_fds: &mut VecDeque<OwnedFd>,
+) -> Response {
     match req {
         Request::GetState => Response::State(build_state(control)),
         Request::SetCodec { codec } => {
@@ -196,6 +273,52 @@ fn handle_request(req: Request, control: &Arc<ServerControl>) -> Response {
         }
         Request::ClearSessionContext => {
             session_bridge::global().set(None);
+            session_bridge::global().set_pipewire_fd(None);
+            Response::ok()
+        }
+        Request::OfferPipewireFd { node_id, width, height } => {
+            let Some(fd) = pending_fds.pop_front() else {
+                return Response::err(
+                    "offer_pipewire_fd requires an SCM_RIGHTS attachment with the PipeWire fd",
+                );
+            };
+            eprintln!(
+                "[control-socket] received PipeWire offer fd={} node={} size={}x{}",
+                fd.as_raw_fd(),
+                node_id,
+                width,
+                height
+            );
+            let bridge = session_bridge::global();
+            bridge.set_pipewire_fd(Some(fd));
+            // Stamp the offer into the current session context too so
+            // subscribers (capture-backend selector, etc.) see the update.
+            let new_ctx = match bridge.current() {
+                Some(mut ctx) => {
+                    ctx.pipewire_offer = Some(PipewireOffer { node_id, width, height });
+                    ctx
+                }
+                None => SessionContext {
+                    uid: unsafe { libc::getuid() },
+                    username: "unknown".into(),
+                    xdg_runtime_dir: PathBuf::from("/run/user/0"),
+                    audio: None,
+                    wayland_display: None,
+                    x11_display: None,
+                    dbus_session_bus_address: None,
+                    pipewire_offer: Some(PipewireOffer { node_id, width, height }),
+                },
+            };
+            bridge.set(Some(new_ctx));
+            Response::ok()
+        }
+        Request::ClearPipewireFd => {
+            let bridge = session_bridge::global();
+            bridge.set_pipewire_fd(None);
+            if let Some(mut ctx) = bridge.current() {
+                ctx.pipewire_offer = None;
+                bridge.set(Some(ctx));
+            }
             Response::ok()
         }
     }
@@ -307,6 +430,11 @@ enum Request {
     Shutdown,
     SetSessionContext { context: SessionContext },
     ClearSessionContext,
+    /// Tray offers its portal-derived PipeWire connection to the server.
+    /// Must be sent with an SCM_RIGHTS attachment carrying the PipeWire fd.
+    OfferPipewireFd { node_id: u32, width: u32, height: u32 },
+    /// Tray revokes the offer (session teardown / portal session died).
+    ClearPipewireFd,
 }
 
 #[derive(Debug, Serialize)]

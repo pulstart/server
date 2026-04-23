@@ -17,6 +17,8 @@ use ksni::blocking::TrayMethods as _;
 use ksni::menu::{MenuItem as LinuxMenuItem, StandardItem as LinuxStandardItem};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::io::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,6 +27,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::tray::{copy_to_clipboard, server_icon_rgba};
+use crate::tray_portal;
 
 const SERVICE_UNIT: &str = "st-server.service";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -144,6 +147,7 @@ impl ksni::Tray for CompanionTray {
                     // down the tray also tears down streaming. If the service
                     // is already stopped we skip the pkexec prompt.
                     let active = tray.state.lock().unwrap().service_active;
+                    revoke_portal_session();
                     clear_session_context();
                     if active {
                         pkexec_systemctl("stop");
@@ -415,6 +419,119 @@ fn send_control(op: serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Send a JSON op together with a single `SCM_RIGHTS` attachment carrying
+/// a file descriptor. Atomic: the fd and the op bytes travel in one
+/// `sendmsg`, so the server's matching `recvmsg` delivers both together.
+fn send_control_with_fd(op: serde_json::Value, fd: RawFd) -> Result<(), String> {
+    let sock = UnixStream::connect(CONTROL_SOCKET)
+        .map_err(|e| format!("connect {CONTROL_SOCKET}: {e}"))?;
+    let line = serde_json::to_string(&op).map_err(|e| format!("serialize: {e}"))?;
+    let mut bytes = line.into_bytes();
+    bytes.push(b'\n');
+
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    // CMSG buffer: one SCM_RIGHTS with one fd. CMSG_SPACE handles alignment.
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    mhdr.msg_iov = &mut iov;
+    mhdr.msg_iovlen = 1;
+    mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    mhdr.msg_controllen = cmsg_buf.len() as _;
+
+    let ret = unsafe {
+        let cmsg_ptr = libc::CMSG_FIRSTHDR(&mhdr);
+        if cmsg_ptr.is_null() {
+            return Err("CMSG_FIRSTHDR returned null".into());
+        }
+        let cmsg = &mut *cmsg_ptr;
+        cmsg.cmsg_level = libc::SOL_SOCKET;
+        cmsg.cmsg_type = libc::SCM_RIGHTS;
+        cmsg.cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
+        let data_ptr = libc::CMSG_DATA(cmsg_ptr) as *mut RawFd;
+        std::ptr::write_unaligned(data_ptr, fd);
+        mhdr.msg_controllen = cmsg.cmsg_len;
+
+        libc::sendmsg(sock.as_fd().as_raw_fd(), &mhdr, 0)
+    };
+    if ret < 0 {
+        return Err(format!("sendmsg: {}", std::io::Error::last_os_error()));
+    }
+    // Brief read so the server finishes processing before we drop the socket.
+    let mut reader = BufReader::new(sock);
+    let mut buf = String::new();
+    let _ = reader.read_line(&mut buf);
+    Ok(())
+}
+
+// Holds the portal session alive for the lifetime of the tray process —
+// dropping it closes the screencast session and invalidates the fd we
+// handed to the server.
+static PORTAL_SESSION: std::sync::OnceLock<Mutex<Option<tray_portal::ScreencastSession>>> =
+    std::sync::OnceLock::new();
+
+fn stash_portal_session(session: tray_portal::ScreencastSession) {
+    let slot = PORTAL_SESSION.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap() = Some(session);
+}
+
+/// Ask the portal for a ScreenCast session once (or pick up a persisted
+/// one without a dialog thanks to our saved restore_token) and hand the
+/// resulting PipeWire fd to the server. No-op if we already did it this
+/// session — the portal session is kept alive in a static.
+fn maybe_offer_portal_session() {
+    let slot = PORTAL_SESSION.get_or_init(|| Mutex::new(None));
+    if slot.lock().unwrap().is_some() {
+        return;
+    }
+
+    let offer = match tray_portal::request_screencast() {
+        Ok(offer) => offer,
+        Err(err) => {
+            eprintln!("[tray-companion] portal screencast unavailable: {err}");
+            return;
+        }
+    };
+
+    eprintln!(
+        "[tray-companion] portal granted PipeWire node {} ({}x{}), fd={}; offering to server",
+        offer.node_id,
+        offer.logical_width,
+        offer.logical_height,
+        offer.pw_fd.as_raw_fd()
+    );
+
+    let op = serde_json::json!({
+        "op": "offer_pipewire_fd",
+        "node_id": offer.node_id,
+        "width": offer.logical_width,
+        "height": offer.logical_height,
+    });
+    // Send the fd + op atomically. The server dups the fd into its own
+    // OwnedFd, so our copy can be dropped as soon as sendmsg returns.
+    let pw_fd: OwnedFd = offer.pw_fd;
+    let raw = pw_fd.as_raw_fd();
+    if let Err(err) = send_control_with_fd(op, raw) {
+        eprintln!("[tray-companion] offer_pipewire_fd failed: {err}");
+        return;
+    }
+    // Keep the session alive so the portal doesn't revoke the stream.
+    stash_portal_session(offer.session);
+    // pw_fd is dropped here — closes our copy; server kept its own dup.
+}
+
+fn revoke_portal_session() {
+    if let Some(slot) = PORTAL_SESSION.get() {
+        *slot.lock().unwrap() = None;
+    }
+    let op = serde_json::json!({ "op": "clear_pipewire_fd" });
+    let _ = send_control(op);
+}
+
 fn push_session_context() {
     let Some(ctx) = build_session_payload() else {
         return;
@@ -471,6 +588,14 @@ pub fn run() -> Result<(), String> {
         push_session_context();
     });
 
+    // Ask the portal for a ScreenCast session and hand its PipeWire fd to
+    // the server. This is what makes video capture work on Wayland +
+    // NVIDIA (where KMS can't read the compositor's framebuffer). Silent
+    // on systems where the portal isn't available — KMS takes over then.
+    // We do it in a background thread because `request_screencast` blocks
+    // the portal dialog; the tray icon should appear instantly.
+    thread::spawn(maybe_offer_portal_session);
+
     // On SIGTERM / SIGINT — fired when the user logs out or quits the
     // tray — tell the server to drop the session context so it doesn't
     // keep a stale PA cookie around expecting a gone daemon.
@@ -488,6 +613,7 @@ fn ctrlc_cleanup() -> Result<(), String> {
     // tray doesn't need fancy handling, just a chance to flush the
     // session context on the way out.
     extern "C" fn handler(_: libc::c_int) {
+        revoke_portal_session();
         clear_session_context();
         std::process::exit(0);
     }

@@ -28,6 +28,7 @@
 //!                                          subscribers tear down
 
 use serde::{Deserialize, Serialize};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -56,6 +57,18 @@ pub struct AudioEndpoint {
     pub cookie_hex: Option<String>,
 }
 
+/// Metadata for a live PipeWire screencast node offered by the tray.
+/// The actual file descriptor for the PipeWire connection is passed
+/// out-of-band via `SCM_RIGHTS` on the control socket; the server stashes
+/// the `OwnedFd` in [`SessionBridge::pipewire_fd`] so the capture backend
+/// can dup and claim it later.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PipewireOffer {
+    pub node_id: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Snapshot of the active user session as observed by the tray companion.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionContext {
@@ -72,6 +85,8 @@ pub struct SessionContext {
     pub x11_display: Option<String>,
     #[serde(default)]
     pub dbus_session_bus_address: Option<String>,
+    #[serde(default)]
+    pub pipewire_offer: Option<PipewireOffer>,
 }
 
 type Subscriber = Box<dyn Fn(Option<&SessionContext>) + Send + Sync>;
@@ -82,6 +97,11 @@ type Subscriber = Box<dyn Fn(Option<&SessionContext>) + Send + Sync>;
 pub struct SessionBridge {
     current: Mutex<Option<SessionContext>>,
     subscribers: Mutex<Vec<Subscriber>>,
+    /// The live PipeWire fd offered by the tray (if any). Kept out of
+    /// `SessionContext` because file descriptors aren't `Clone` and are
+    /// transmitted out-of-band (SCM_RIGHTS on the control socket). The
+    /// capture backend consumes it via [`take_pipewire_fd`] when starting.
+    pipewire_fd: Mutex<Option<OwnedFd>>,
 }
 
 impl SessionBridge {
@@ -89,7 +109,21 @@ impl SessionBridge {
         Arc::new(Self {
             current: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
+            pipewire_fd: Mutex::new(None),
         })
+    }
+
+    /// Hand a freshly-received PipeWire fd to the bridge. Replaces (and
+    /// closes) any previous offer via `OwnedFd`'s Drop.
+    pub fn set_pipewire_fd(&self, fd: Option<OwnedFd>) {
+        *self.pipewire_fd.lock().unwrap() = fd;
+    }
+
+    /// Take ownership of the current PipeWire fd. Used by the capture
+    /// backend when it starts a stream against the offered connection.
+    #[allow(dead_code)] // consumed in Slice 2 when capture backend is wired
+    pub fn take_pipewire_fd(&self) -> Option<OwnedFd> {
+        self.pipewire_fd.lock().unwrap().take()
     }
 
     /// Snapshot the current context. `None` means no active user session.
