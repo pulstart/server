@@ -14,7 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FFMPEG_VERSION: "8.0"
+  # Must match the ABI the Rust crates are compiled against (ffmpeg-next in
+  # Cargo.toml). BtbN only ships n7.1 and n8.1 — n8.0 does not exist.
+  FFMPEG_VERSION: "8.1"
   FFMPEG_BUILD_TAG: "latest"
 
 jobs:
