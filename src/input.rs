@@ -143,6 +143,8 @@ struct InputRuntimeInner {
     cursor_state: CursorState,
     cursor_shape_version: u64,
     cursor_state_version: u64,
+    stream_width: u32,
+    stream_height: u32,
 }
 
 enum InputBackend {
@@ -187,6 +189,8 @@ impl InputRuntime {
                 cursor_state: CursorState::default(),
                 cursor_shape_version: 0,
                 cursor_state_version: 0,
+                stream_width: 0,
+                stream_height: 0,
             }),
         })
     }
@@ -271,6 +275,8 @@ impl InputRuntime {
         inner.cursor_state = CursorState::default();
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+        inner.stream_width = _stream_width;
+        inner.stream_height = _stream_height;
         self.set_active_controller(None);
 
         #[cfg(target_os = "linux")]
@@ -366,6 +372,8 @@ impl InputRuntime {
         inner.cursor_state = CursorState::default();
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+        inner.stream_width = 0;
+        inner.stream_height = 0;
         self.set_active_controller(None);
     }
 
@@ -602,10 +610,12 @@ impl InputRuntime {
             InputPacket::MouseAbsolute(packet) => {
                 inner.sync_buttons(packet.buttons);
                 inner.move_absolute(packet.x, packet.y);
+                inner.predict_cursor_absolute(packet.x, packet.y);
             }
             InputPacket::MouseRelative(packet) => {
                 inner.sync_buttons(packet.buttons);
                 inner.move_relative(packet.dx, packet.dy);
+                inner.predict_cursor_relative(packet.dx, packet.dy);
             }
             InputPacket::MouseButtons(packet) => {
                 inner.sync_buttons(packet.buttons);
@@ -654,6 +664,80 @@ impl InputRuntimeInner {
 
     fn release_keyboard(&mut self) {
         self.sync_keyboard([0u8; KEYBOARD_STATE_BYTES]);
+    }
+
+    fn predict_cursor_absolute(&mut self, x: u16, y: u16) {
+        if !self.cursor_prediction_active() {
+            return;
+        }
+
+        let (hotspot_x, hotspot_y) = self.cursor_hotspot();
+        let target_x = normalized_to_stream_coord(x, self.stream_width);
+        let target_y = normalized_to_stream_coord(y, self.stream_height);
+        let next_state = CursorState {
+            serial: self.cursor_state.serial,
+            x: target_x - hotspot_x,
+            y: target_y - hotspot_y,
+            visible: true,
+        };
+        self.set_predicted_cursor_state(next_state);
+    }
+
+    fn predict_cursor_relative(&mut self, dx: i16, dy: i16) {
+        if !self.cursor_prediction_active() {
+            return;
+        }
+
+        let (hotspot_x, hotspot_y) = self.cursor_hotspot();
+        let target_x = clamp_stream_coord(
+            i64::from(self.cursor_state.x) + i64::from(hotspot_x) + i64::from(dx),
+            self.stream_width,
+        );
+        let target_y = clamp_stream_coord(
+            i64::from(self.cursor_state.y) + i64::from(hotspot_y) + i64::from(dy),
+            self.stream_height,
+        );
+        let next_state = CursorState {
+            serial: self.cursor_state.serial,
+            x: target_x - hotspot_x,
+            y: target_y - hotspot_y,
+            visible: true,
+        };
+        self.set_predicted_cursor_state(next_state);
+    }
+
+    fn cursor_prediction_active(&self) -> bool {
+        self.capabilities.separate_cursor
+            && self.cursor_state.visible
+            && self.stream_width > 0
+            && self.stream_height > 0
+    }
+
+    fn cursor_hotspot(&self) -> (i32, i32) {
+        self.cursor_shape
+            .as_ref()
+            .map(|shape| (i32::from(shape.hotspot_x), i32::from(shape.hotspot_y)))
+            .unwrap_or((0, 0))
+    }
+
+    fn set_predicted_cursor_state(&mut self, next_state: CursorState) {
+        if self.cursor_state == next_state {
+            return;
+        }
+        self.cursor_state = next_state;
+        self.cursor_state_version = self.cursor_state_version.wrapping_add(1);
+        if trace_enabled() {
+            let log_idx = TRACE_CURSOR_UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if log_idx < 12 {
+                eprintln!(
+                    "[trace][cursor] predicted state serial={} pos=({}, {}) visible={}",
+                    self.cursor_state.serial,
+                    self.cursor_state.x,
+                    self.cursor_state.y,
+                    self.cursor_state.visible
+                );
+            }
+        }
     }
 
     fn sync_buttons(&mut self, next: u8) {
@@ -787,6 +871,22 @@ impl InputRuntimeInner {
 fn input_seq_is_newer(seq: u16, last_seq: u16) -> bool {
     let delta = seq.wrapping_sub(last_seq);
     delta != 0 && delta < 0x8000
+}
+
+fn normalized_to_stream_coord(value: u16, span: u32) -> i32 {
+    if span <= 1 {
+        0
+    } else {
+        ((i64::from(value) * i64::from(span - 1) + 32767) / 65535) as i32
+    }
+}
+
+fn clamp_stream_coord(value: i64, span: u32) -> i32 {
+    if span <= 1 {
+        0
+    } else {
+        value.clamp(0, i64::from(span - 1)) as i32
+    }
 }
 
 fn button_mappings() -> [(u8, u32); 5] {
@@ -2488,7 +2588,43 @@ fn x11_key_name(key: KeyboardKey) -> Option<&'static std::ffi::CStr> {
 
 #[cfg(test)]
 mod tests {
-    use super::input_seq_is_newer;
+    use super::*;
+
+    fn predictive_cursor_inner() -> InputRuntimeInner {
+        InputRuntimeInner {
+            backend: InputBackend::Unavailable,
+            backend_label: "test".to_string(),
+            capabilities: InputCapabilities {
+                mouse_absolute: true,
+                mouse_relative: true,
+                keyboard: true,
+                separate_cursor: true,
+                hover_capture: true,
+            },
+            controller_id: Some(1),
+            last_input_seq_by_client: BTreeMap::new(),
+            button_mask: 0,
+            keyboard_state: [0u8; KEYBOARD_STATE_BYTES],
+            cursor_shape: Some(CursorShape {
+                serial: 7,
+                width: 16,
+                height: 16,
+                hotspot_x: 3,
+                hotspot_y: 5,
+                rgba: vec![0; 16 * 16 * 4],
+            }),
+            cursor_state: CursorState {
+                serial: 7,
+                x: 10,
+                y: 20,
+                visible: true,
+            },
+            cursor_shape_version: 1,
+            cursor_state_version: 1,
+            stream_width: 1920,
+            stream_height: 1080,
+        }
+    }
 
     #[test]
     fn input_seq_rejects_duplicates_and_older_packets() {
@@ -2502,5 +2638,39 @@ mod tests {
         assert!(input_seq_is_newer(11, 10));
         assert!(input_seq_is_newer(0, u16::MAX));
         assert!(input_seq_is_newer(2, u16::MAX));
+    }
+
+    #[test]
+    fn cursor_prediction_updates_relative_position_without_capture_frame() {
+        let mut inner = predictive_cursor_inner();
+
+        inner.predict_cursor_relative(10, -5);
+
+        assert_eq!(inner.cursor_state.x, 20);
+        assert_eq!(inner.cursor_state.y, 15);
+        assert_eq!(inner.cursor_state_version, 2);
+    }
+
+    #[test]
+    fn cursor_prediction_updates_absolute_position_without_capture_frame() {
+        let mut inner = predictive_cursor_inner();
+
+        inner.predict_cursor_absolute(u16::MAX, 0);
+
+        assert_eq!(inner.cursor_state.x, 1916);
+        assert_eq!(inner.cursor_state.y, -5);
+        assert_eq!(inner.cursor_state_version, 2);
+    }
+
+    #[test]
+    fn cursor_prediction_does_not_make_hidden_cursor_visible() {
+        let mut inner = predictive_cursor_inner();
+        inner.cursor_state.visible = false;
+
+        inner.predict_cursor_relative(10, 10);
+
+        assert_eq!(inner.cursor_state.x, 10);
+        assert_eq!(inner.cursor_state.y, 20);
+        assert_eq!(inner.cursor_state_version, 1);
     }
 }
