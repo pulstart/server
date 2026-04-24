@@ -59,7 +59,14 @@ impl ClipboardSync {
     where
         F: Fn() -> bool + Send + 'static,
     {
-        Self::start_inner(label, send_initial_snapshot_on_activate, is_active, outbound_tx, None, None)
+        Self::start_inner(
+            label,
+            send_initial_snapshot_on_activate,
+            is_active,
+            outbound_tx,
+            None,
+            None,
+        )
     }
 
     pub fn start_with_file_detection<F>(
@@ -329,9 +336,7 @@ end try"#;
 #[cfg(target_os = "windows")]
 fn detect_clipboard_files() -> Vec<PathBuf> {
     use windows::Win32::Foundation::HGLOBAL;
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, OpenClipboard,
-    };
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows::Win32::UI::Shell::DragQueryFileW;
 

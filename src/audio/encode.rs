@@ -97,8 +97,7 @@ impl OpusEncoder {
 
             if expected_loss > 0 {
                 let packet_loss_key = std::ffi::CString::new("packet_loss").unwrap();
-                let packet_loss_value =
-                    std::ffi::CString::new(expected_loss.to_string()).unwrap();
+                let packet_loss_value = std::ffi::CString::new(expected_loss.to_string()).unwrap();
                 ffi::av_opt_set(
                     (*ctx).priv_data,
                     packet_loss_key.as_ptr(),

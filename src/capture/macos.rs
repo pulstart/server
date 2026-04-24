@@ -158,8 +158,8 @@ impl CursorTracker {
     }
 
     fn capture_cursor(&mut self) -> Result<Option<CapturedCursor>, String> {
-        let location =
-            current_cursor_location().ok_or_else(|| "CGEventGetLocation returned null".to_string())?;
+        let location = current_cursor_location()
+            .ok_or_else(|| "CGEventGetLocation returned null".to_string())?;
         let cursor = current_system_cursor();
         let serial = cursor
             .as_ref()
@@ -290,7 +290,12 @@ fn load_cursor_shape(cursor: &NSCursor) -> Result<CapturedCursor, String> {
     }
 
     let pixels = convert_bitmap_to_bgra(
-        unsafe { std::slice::from_raw_parts(src_ptr as *const u8, bytes_per_row as usize * height as usize) },
+        unsafe {
+            std::slice::from_raw_parts(
+                src_ptr as *const u8,
+                bytes_per_row as usize * height as usize,
+            )
+        },
         width as usize,
         height as usize,
         bytes_per_row as usize,
@@ -364,7 +369,5 @@ fn clamp_hotspot(value: f64, limit: u32) -> u32 {
     if limit == 0 {
         return 0;
     }
-    value
-        .round()
-        .clamp(0.0, (limit.saturating_sub(1)) as f64) as u32
+    value.round().clamp(0.0, (limit.saturating_sub(1)) as f64) as u32
 }

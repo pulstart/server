@@ -173,7 +173,6 @@ impl EncoderConfig {
         framerate: u32,
         codec: Codec,
     ) -> Self {
-
         let dynamic_range = if std::env::var("ST_HDR").unwrap_or_default() == "1" {
             DynamicRange::Hdr
         } else {

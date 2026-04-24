@@ -100,7 +100,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             match interface.as_str() {
                 "wl_shm" => {
                     state.shm = Some(registry.bind(name, version.min(1), qh, ()));
@@ -354,8 +359,7 @@ impl CaptureBackend for ExtImageCopyCapture {
 
         // Fast validation on the caller's thread.
         {
-            let conn = Connection::connect_to_env()
-                .map_err(|e| format!("Wayland connect: {e}"))?;
+            let conn = Connection::connect_to_env().map_err(|e| format!("Wayland connect: {e}"))?;
             let display = conn.display();
             let mut eq = conn.new_event_queue();
             let qh = eq.handle();
@@ -367,9 +371,7 @@ impl CaptureBackend for ExtImageCopyCapture {
                 return Err("ext_image_copy_capture_manager_v1 not available".into());
             }
             if state.source_manager.is_none() {
-                return Err(
-                    "ext_output_image_capture_source_manager_v1 not available".into(),
-                );
+                return Err("ext_output_image_capture_source_manager_v1 not available".into());
             }
             if state.shm.is_none() {
                 return Err("wl_shm not available".into());
@@ -414,10 +416,7 @@ fn pick_shm_format(formats: &[wl_shm::Format]) -> Option<wl_shm::Format> {
         wl_shm::Format::Xbgr8888,
         wl_shm::Format::Abgr8888,
     ];
-    preference
-        .iter()
-        .copied()
-        .find(|f| formats.contains(f))
+    preference.iter().copied().find(|f| formats.contains(f))
 }
 
 fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Result<(), String> {
@@ -463,8 +462,8 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
         return Err("capture session stopped during setup".into());
     }
     let (mut width, mut height) = state.size.ok_or("compositor did not send buffer_size")?;
-    let mut chosen_format = pick_shm_format(&state.shm_formats)
-        .ok_or("compositor offered no usable wl_shm format")?;
+    let mut chosen_format =
+        pick_shm_format(&state.shm_formats).ok_or("compositor offered no usable wl_shm format")?;
 
     let target_interval = target_frame_interval();
     let trace = std::env::var_os("ST_TRACE").is_some();

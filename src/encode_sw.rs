@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::ptr;
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 
@@ -150,7 +150,12 @@ impl SoftwareEncoder {
                 let stream_params = std::ffi::CString::new("repeat-headers=1:aud=1").unwrap();
                 unsafe {
                     ffi::av_opt_set((*ctx).priv_data, forced_idr.as_ptr(), one.as_ptr(), 0);
-                    ffi::av_opt_set((*ctx).priv_data, x264_params.as_ptr(), stream_params.as_ptr(), 0);
+                    ffi::av_opt_set(
+                        (*ctx).priv_data,
+                        x264_params.as_ptr(),
+                        stream_params.as_ptr(),
+                        0,
+                    );
                 }
             }
             Codec::Hevc => {
@@ -170,7 +175,12 @@ impl SoftwareEncoder {
                 let stream_params = std::ffi::CString::new("repeat-headers=1:aud=1").unwrap();
                 unsafe {
                     ffi::av_opt_set((*ctx).priv_data, forced_idr.as_ptr(), one.as_ptr(), 0);
-                    ffi::av_opt_set((*ctx).priv_data, x265_params.as_ptr(), stream_params.as_ptr(), 0);
+                    ffi::av_opt_set(
+                        (*ctx).priv_data,
+                        x265_params.as_ptr(),
+                        stream_params.as_ptr(),
+                        0,
+                    );
                 }
             }
             Codec::Av1 => {
@@ -248,9 +258,7 @@ impl SoftwareEncoder {
             }
             #[cfg(target_os = "linux")]
             FrameData::DmaBuf {
-                planes,
-                drm_format,
-                ..
+                planes, drm_format, ..
             } => {
                 self.fill_bgra_from_dmabuf(planes, *drm_format, frame.width, frame.height)?;
             }
@@ -438,7 +446,8 @@ impl SoftwareEncoder {
             let src = mapped.pData as *const u8;
 
             for row in 0..height as usize {
-                let src_row = unsafe { std::slice::from_raw_parts(src.add(row * src_stride), row_bytes) };
+                let src_row =
+                    unsafe { std::slice::from_raw_parts(src.add(row * src_stride), row_bytes) };
                 let dst_start = row * dst_stride;
                 self.bgra_frame.data_mut(0)[dst_start..dst_start + row_bytes]
                     .copy_from_slice(src_row);

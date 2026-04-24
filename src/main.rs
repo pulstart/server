@@ -1,4 +1,7 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod adaptive_bitrate;
 mod api_client;
@@ -8,23 +11,23 @@ mod broadcast;
 mod capture;
 mod clipboard;
 mod colorspace;
-mod file_transfer;
 #[cfg(target_os = "linux")]
 mod encode;
 mod encode_config;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod encode_sw;
-#[cfg(target_os = "windows")]
-mod encode_win;
 #[cfg(target_os = "linux")]
 mod encode_vaapi;
 #[cfg(target_os = "macos")]
 mod encode_vt;
-#[cfg(target_os = "macos")]
-mod macos_display;
+#[cfg(target_os = "windows")]
+mod encode_win;
+mod file_transfer;
 mod input;
 #[cfg(target_os = "linux")]
 mod linux_uring;
+#[cfg(target_os = "macos")]
+mod macos_display;
 mod server_control;
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -174,9 +177,9 @@ fn create_encoder_for_backend(
     backend: EncoderBackend,
 ) -> Result<EncoderKind, String> {
     match backend {
-        EncoderBackend::Nvenc | EncoderBackend::Amf | EncoderBackend::MediaFoundation => Err(
-            "Windows hardware encoder rebuild requires a live D3D11 capture context".into(),
-        ),
+        EncoderBackend::Nvenc | EncoderBackend::Amf | EncoderBackend::MediaFoundation => {
+            Err("Windows hardware encoder rebuild requires a live D3D11 capture context".into())
+        }
         EncoderBackend::Software => encode_sw::SoftwareEncoder::with_config(config)
             .map(EncoderKind::Software)
             .map_err(|err| format!("software reconfigure failed: {err}")),
@@ -257,7 +260,10 @@ fn encoder_chroma_name(chroma: encode_config::ChromaSampling) -> &'static str {
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn supports_yuv444_codec(codec: encode_config::Codec) -> bool {
-    matches!(codec, encode_config::Codec::H264 | encode_config::Codec::Hevc)
+    matches!(
+        codec,
+        encode_config::Codec::H264 | encode_config::Codec::Hevc
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -284,9 +290,7 @@ fn encoder_backend(encoder: &EncoderKind) -> EncoderBackend {
         EncoderKind::Hardware(e) => match e.backend() {
             encode_win::WindowsEncoderBackend::Nvenc => EncoderBackend::Nvenc,
             encode_win::WindowsEncoderBackend::Amf => EncoderBackend::Amf,
-            encode_win::WindowsEncoderBackend::MediaFoundation => {
-                EncoderBackend::MediaFoundation
-            }
+            encode_win::WindowsEncoderBackend::MediaFoundation => EncoderBackend::MediaFoundation,
         },
         EncoderKind::Software(_) => EncoderBackend::Software,
     }
@@ -328,7 +332,12 @@ fn codec_selection_score(
         encode_config::Codec::Hevc => 1,
         encode_config::Codec::Av1 => 2,
     };
-    (hardware_yuv444_rank, backend_rank, client_hw_rank, codec_rank)
+    (
+        hardware_yuv444_rank,
+        backend_rank,
+        client_hw_rank,
+        codec_rank,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -392,8 +401,7 @@ fn select_linux_encoder(
     let prefer_first_success =
         forced_codec.is_some() || EncoderConfig::preferred_codec_from_env().is_some();
     let mut failures = Vec::new();
-    let mut selected: Option<(EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8, u8))> =
-        None;
+    let mut selected: Option<(EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8, u8))> = None;
 
     let codec_order = if let Some(codec) = forced_codec {
         encode_config::Codec::preferred_order(Some(codec))
@@ -449,8 +457,12 @@ fn select_linux_encoder(
             match create_linux_encoder_with_hint(&config, capture_render_node) {
                 Ok(encoder) => {
                     let backend = encoder_backend(&encoder);
-                    let score =
-                        codec_selection_score(codec, config.chroma, backend, client_hardware_codecs);
+                    let score = codec_selection_score(
+                        codec,
+                        config.chroma,
+                        backend,
+                        client_hardware_codecs,
+                    );
                     let replace = best_for_codec
                         .as_ref()
                         .map(|(_, _, _, best_score)| score > *best_score)
@@ -565,8 +577,9 @@ fn select_windows_encoder(
 
         if let Some(texture) = hardware_capture {
             for backend in &hardware_backends {
-                match encode_win::WindowsHwEncoder::with_config_and_backend(&config, texture, *backend)
-                {
+                match encode_win::WindowsHwEncoder::with_config_and_backend(
+                    &config, texture, *backend,
+                ) {
                     Ok(encoder) => {
                         println!(
                             "[encoder] Selected {} with {} backend",
@@ -756,8 +769,7 @@ fn should_schedule_bitrate_reconfigure(
             && delta_kbps >= min_delta
     } else {
         let min_delta = (current_kbps / 10).max(5_000);
-        now.duration_since(last_reconfigure) >= Duration::from_secs(4)
-            && delta_kbps >= min_delta
+        now.duration_since(last_reconfigure) >= Duration::from_secs(4) && delta_kbps >= min_delta
     }
 }
 
@@ -908,8 +920,9 @@ fn run_shared_pipeline(
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    audio_bc: Arc<Broadcaster<Vec<u8>>>,
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))] audio_bc: Arc<
+        Broadcaster<Vec<u8>>,
+    >,
 ) {
     let (frame_tx, frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
     let trace = trace_enabled();
@@ -953,10 +966,7 @@ fn run_shared_pipeline(
         let first_has_cursor = false;
         eprintln!(
             "[trace][server] first captured frame: {}x{} cursor={} capture_ts={}",
-            first_frame.width,
-            first_frame.height,
-            first_has_cursor,
-            first_frame_captured_micros
+            first_frame.width, first_frame.height, first_has_cursor, first_frame_captured_micros
         );
     }
     let mut trace_capture_frames = 1usize;
@@ -1088,11 +1098,7 @@ fn run_shared_pipeline(
 
     println!(
         "Shared pipeline started: {}x{} (video: {:?} {:?} {:?})",
-        first_frame.width,
-        first_frame.height,
-        config.codec,
-        config.dynamic_range,
-        config.chroma,
+        first_frame.width, first_frame.height, config.codec, config.dynamic_range, config.chroma,
     );
 
     // Tell the control plane we started OK
@@ -1128,7 +1134,7 @@ fn run_shared_pipeline(
                 Ok(f) => (f, unix_time_micros()),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        };
+            };
         if trace && trace_capture_frames < 8 {
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             let frame_has_cursor = frame.cursor.is_some();
@@ -1191,14 +1197,13 @@ fn run_shared_pipeline(
                     } else {
                         current_config.with_bitrate_kbps(target_bitrate)
                     };
-                    match encoder.update_bitrate(
-                        next_config.bitrate_bps().min(u32::MAX as i64) as u32,
-                    ) {
+                    match encoder
+                        .update_bitrate(next_config.bitrate_bps().min(u32::MAX as i64) as u32)
+                    {
                         Ok(()) => {
                             println!(
                                 "[abr] videotoolbox bitrate {} -> {} kbps",
-                                current_config.bitrate_kbps,
-                                next_config.bitrate_kbps
+                                current_config.bitrate_kbps, next_config.bitrate_kbps
                             );
                             current_config = next_config;
                             last_encoder_reconfigure = Instant::now();
@@ -1465,24 +1470,31 @@ fn encode_and_broadcast(
                 #[cfg(target_os = "windows")]
                 capture::FrameData::D3D11Texture { .. } => frame,
                 #[cfg(target_os = "linux")]
-                capture::FrameData::DmaBuf { .. } => match capture::try_clone_frame_to_ram_bgra(frame) {
-                    Ok(Some(mut composited)) => {
-                        capture::composite_cursor(&mut composited, frame.width, frame.height, cursor);
-                        frame_with_cursor = capture::CapturedFrame {
-                            data: capture::FrameData::Ram(composited),
-                            width: frame.width,
-                            height: frame.height,
-                            #[cfg(any(target_os = "linux", target_os = "windows"))]
-                            cursor: None,
-                        };
-                        &frame_with_cursor
+                capture::FrameData::DmaBuf { .. } => {
+                    match capture::try_clone_frame_to_ram_bgra(frame) {
+                        Ok(Some(mut composited)) => {
+                            capture::composite_cursor(
+                                &mut composited,
+                                frame.width,
+                                frame.height,
+                                cursor,
+                            );
+                            frame_with_cursor = capture::CapturedFrame {
+                                data: capture::FrameData::Ram(composited),
+                                width: frame.width,
+                                height: frame.height,
+                                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                                cursor: None,
+                            };
+                            &frame_with_cursor
+                        }
+                        Ok(None) => frame,
+                        Err(err) => {
+                            eprintln!("[capture] DMA-BUF cursor readback failed: {err}");
+                            frame
+                        }
                     }
-                    Ok(None) => frame,
-                    Err(err) => {
-                        eprintln!("[capture] DMA-BUF cursor readback failed: {err}");
-                        frame
-                    }
-                },
+                }
             }
         } else {
             frame
@@ -1580,7 +1592,8 @@ fn run_transport(
                         last_backlog_keyframe_request = Instant::now();
                     }
                     if trace {
-                        let skipped_before_transport = source_gap.saturating_sub(skipped_frames as u64);
+                        let skipped_before_transport =
+                            source_gap.saturating_sub(skipped_frames as u64);
                         eprintln!(
                             "[trace][server] detected {source_gap} locally dropped video unit(s) for {addr} (drained_now={skipped_frames}, evicted_before_transport={skipped_before_transport}); requesting recovery keyframe"
                         );
@@ -1874,9 +1887,7 @@ async fn handle_client(
         Ok(false) => {
             eprintln!("[auth] Client {addr} failed authentication");
             let _ = stream
-                .write_all(
-                    &ControlMessage::Error("Authentication failed.".into()).serialize(),
-                )
+                .write_all(&ControlMessage::Error("Authentication failed.".into()).serialize())
                 .await;
             return;
         }
@@ -1902,9 +1913,9 @@ async fn handle_client(
     let client_requested_fps = client_display_fps_hint(startup_prefs.display);
     let client_supported_codecs = client_supported_video_codecs(startup_prefs.display);
     let client_hardware_codecs = client_hardware_video_codecs(startup_prefs.display);
-    let client_supported_yuv444_codecs = client_supported_yuv444_video_codecs(startup_prefs.display);
-    let client_hardware_yuv444_codecs =
-        client_hardware_yuv444_video_codecs(startup_prefs.display);
+    let client_supported_yuv444_codecs =
+        client_supported_yuv444_video_codecs(startup_prefs.display);
+    let client_hardware_yuv444_codecs = client_hardware_yuv444_video_codecs(startup_prefs.display);
     if let Some(display) = startup_prefs.display {
         println!(
             "[client {addr}] display refresh hint: {:.3} Hz, media udp port: {}",
@@ -2146,8 +2157,7 @@ async fn handle_client(
 
     println!("[pipeline] Client {addr} subscribed (transport started)");
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
-    let (file_detect_tx, file_detect_rx) =
-        crossbeam_channel::bounded::<std::path::PathBuf>(8);
+    let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
     let suppressed_paths = clipboard::new_suppressed_paths();
     let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "server",
@@ -2197,9 +2207,9 @@ async fn handle_client(
             break;
         }
         while let Ok(path) = file_detect_rx.try_recv() {
-            let _ = ft_manager.inbound_tx.try_send(
-                file_transfer::FtInbound::SendFile { path },
-            );
+            let _ = ft_manager
+                .inbound_tx
+                .try_send(file_transfer::FtInbound::SendFile { path });
         }
         let mut ft_write_failed = false;
         while let Ok(message) = ft_manager.outbound_rx.try_recv() {
@@ -2289,34 +2299,70 @@ async fn handle_client(
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
                         }
-                        ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
+                        ControlMessage::FileOffer {
+                            transfer_id,
+                            file_size,
+                            file_name,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                                file_transfer::FtInbound::OfferReceived {
+                                    transfer_id,
+                                    file_size,
+                                    file_name,
+                                },
                             );
                         }
-                        ControlMessage::FileAccept { transfer_id, accepted } => {
+                        ControlMessage::FileAccept {
+                            transfer_id,
+                            accepted,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::AcceptReceived { transfer_id, accepted },
+                                file_transfer::FtInbound::AcceptReceived {
+                                    transfer_id,
+                                    accepted,
+                                },
                             );
                         }
-                        ControlMessage::FileChunk { transfer_id, chunk_index, data } => {
+                        ControlMessage::FileChunk {
+                            transfer_id,
+                            chunk_index,
+                            data,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::ChunkReceived { transfer_id, chunk_index, data },
+                                file_transfer::FtInbound::ChunkReceived {
+                                    transfer_id,
+                                    chunk_index,
+                                    data,
+                                },
                             );
                         }
-                        ControlMessage::FileComplete { transfer_id, total_chunks, sha256 } => {
+                        ControlMessage::FileComplete {
+                            transfer_id,
+                            total_chunks,
+                            sha256,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::CompleteReceived { transfer_id, total_chunks, sha256 },
+                                file_transfer::FtInbound::CompleteReceived {
+                                    transfer_id,
+                                    total_chunks,
+                                    sha256,
+                                },
                             );
                         }
                         ControlMessage::FileCancel { transfer_id } => {
-                            let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::CancelReceived { transfer_id },
-                            );
+                            let _ = ft_manager
+                                .inbound_tx
+                                .try_send(file_transfer::FtInbound::CancelReceived { transfer_id });
                         }
-                        ControlMessage::FileProgress { transfer_id, chunks_received } => {
+                        ControlMessage::FileProgress {
+                            transfer_id,
+                            chunks_received,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::ProgressReceived { transfer_id, chunks_received },
+                                file_transfer::FtInbound::ProgressReceived {
+                                    transfer_id,
+                                    chunks_received,
+                                },
                             );
                         }
                         ControlMessage::ClientDisplayInfo(_)
@@ -2439,37 +2485,37 @@ fn probe_backends() {
         }
     } else {
         match ds.as_str() {
-        "wayland" => {
-            if wlr_ok {
-                "Wayland (wlr-screencopy)"
-            } else if pipewire_ok {
-                "PipeWire (xdg-desktop-portal)"
-            } else {
-                "none available"
+            "wayland" => {
+                if wlr_ok {
+                    "Wayland (wlr-screencopy)"
+                } else if pipewire_ok {
+                    "PipeWire (xdg-desktop-portal)"
+                } else {
+                    "none available"
+                }
             }
-        }
-        "x11" => {
-            if matches!(
-                &nvfbc_probe,
-                Some(Ok(capture::linux::NvfbcProbe {
-                    is_capture_possible: true,
-                    can_create_now: true,
-                }))
-            ) {
-                "NvFBC (NVIDIA)"
-            } else if x11_ok {
-                "X11 (XShm)"
-            } else {
-                "none available"
+            "x11" => {
+                if matches!(
+                    &nvfbc_probe,
+                    Some(Ok(capture::linux::NvfbcProbe {
+                        is_capture_possible: true,
+                        can_create_now: true,
+                    }))
+                ) {
+                    "NvFBC (NVIDIA)"
+                } else if x11_ok {
+                    "X11 (XShm)"
+                } else {
+                    "none available"
+                }
             }
-        }
-        _ => {
-            if pipewire_ok {
-                "PipeWire (xdg-desktop-portal)"
-            } else {
-                "none available"
+            _ => {
+                if pipewire_ok {
+                    "PipeWire (xdg-desktop-portal)"
+                } else {
+                    "none available"
+                }
             }
-        }
         }
     };
     println!("[probe] Selected capture: {capture_backend}");
@@ -2625,8 +2671,16 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                 }
             };
 
-            println!("[hole-punch] Attempting to punch through to {} candidate(s)...", candidates.len());
-            match st_protocol::tunnel::hole_punch(&socket, &candidates, &crypto, Duration::from_secs(10)) {
+            println!(
+                "[hole-punch] Attempting to punch through to {} candidate(s)...",
+                candidates.len()
+            );
+            match st_protocol::tunnel::hole_punch(
+                &socket,
+                &candidates,
+                &crypto,
+                Duration::from_secs(10),
+            ) {
                 Ok(peer) => {
                     last_handled_punch_nonce = pending_punch_nonce;
                     println!("[hole-punch] Success! Peer confirmed at {peer}");
@@ -2740,7 +2794,15 @@ fn handle_punched_client(
 
     // --- Start/subscribe to pipeline ---
     let state2 = Arc::clone(&state);
-    let setup: Result<(ClientSubscription, StreamConfig, Arc<AdaptiveBitrateState>, SessionDebugInfo), String> = (|| {
+    let setup: Result<
+        (
+            ClientSubscription,
+            StreamConfig,
+            Arc<AdaptiveBitrateState>,
+            SessionDebugInfo,
+        ),
+        String,
+    > = (|| {
         if let Some(handle) = state2.pending_pipeline_stop.lock().unwrap().take() {
             let _ = handle.join();
         }
@@ -2794,9 +2856,17 @@ fn handle_punched_client(
                         vid_sub_id: vid_id,
                         vid_rx,
                         video_bc: Arc::clone(&p.video_bc),
-                        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "windows",
+                            target_os = "macos"
+                        ))]
                         aud_sub_id: aud_id,
-                        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "windows",
+                            target_os = "macos"
+                        ))]
                         aud_rx,
                     },
                     p.stream_config,
@@ -2822,8 +2892,11 @@ fn handle_punched_client(
     // --- Send startup control bundle ---
     let mut control_buf = ControlMessage::StreamConfig(stream_config).serialize();
     control_buf.extend_from_slice(&ControlMessage::SessionDebugInfo(session_debug).serialize());
-    control_buf.extend_from_slice(&ControlMessage::InputSession(InputSession { client_id }).serialize());
-    control_buf.extend_from_slice(&ControlMessage::InputCapabilities(state.input.capabilities()).serialize());
+    control_buf
+        .extend_from_slice(&ControlMessage::InputSession(InputSession { client_id }).serialize());
+    control_buf.extend_from_slice(
+        &ControlMessage::InputCapabilities(state.input.capabilities()).serialize(),
+    );
     control_buf.extend_from_slice(&ControlMessage::ControllerState(controller_state).serialize());
     let _ = punched.send_control(&control_buf);
 
@@ -2841,7 +2914,9 @@ fn handle_punched_client(
                     break;
                 }
             }
-            if ready { break; }
+            if ready {
+                break;
+            }
         }
     }
     if !ready {
@@ -2884,8 +2959,7 @@ fn handle_punched_client(
     let _ = punched.send_control(&ControlMessage::StreamStarted.serialize());
     println!("[punched] Client {peer} subscribed (transport started)");
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
-    let (file_detect_tx, file_detect_rx) =
-        crossbeam_channel::bounded::<std::path::PathBuf>(8);
+    let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
     let suppressed_paths = clipboard::new_suppressed_paths();
     let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "server-punched",
@@ -2919,16 +2993,17 @@ fn handle_punched_client(
         punched.tick();
         let controller_state = state.input.controller_state_for(client_id);
         if controller_state != last_controller_state {
-            let _ = punched.send_control(&ControlMessage::ControllerState(controller_state).serialize());
+            let _ = punched
+                .send_control(&ControlMessage::ControllerState(controller_state).serialize());
             last_controller_state = controller_state;
         }
         while let Ok(message) = clipboard_control_rx.try_recv() {
             let _ = punched.send_control(&message.serialize());
         }
         while let Ok(path) = file_detect_rx.try_recv() {
-            let _ = ft_manager.inbound_tx.try_send(
-                file_transfer::FtInbound::SendFile { path },
-            );
+            let _ = ft_manager
+                .inbound_tx
+                .try_send(file_transfer::FtInbound::SendFile { path });
         }
         while let Ok(message) = ft_manager.outbound_rx.try_recv() {
             let _ = punched.send_control(&message.serialize());
@@ -2974,34 +3049,70 @@ fn handle_punched_client(
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
                         }
-                        ControlMessage::FileOffer { transfer_id, file_size, file_name } => {
+                        ControlMessage::FileOffer {
+                            transfer_id,
+                            file_size,
+                            file_name,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::OfferReceived { transfer_id, file_size, file_name },
+                                file_transfer::FtInbound::OfferReceived {
+                                    transfer_id,
+                                    file_size,
+                                    file_name,
+                                },
                             );
                         }
-                        ControlMessage::FileAccept { transfer_id, accepted } => {
+                        ControlMessage::FileAccept {
+                            transfer_id,
+                            accepted,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::AcceptReceived { transfer_id, accepted },
+                                file_transfer::FtInbound::AcceptReceived {
+                                    transfer_id,
+                                    accepted,
+                                },
                             );
                         }
-                        ControlMessage::FileChunk { transfer_id, chunk_index, data } => {
+                        ControlMessage::FileChunk {
+                            transfer_id,
+                            chunk_index,
+                            data,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::ChunkReceived { transfer_id, chunk_index, data },
+                                file_transfer::FtInbound::ChunkReceived {
+                                    transfer_id,
+                                    chunk_index,
+                                    data,
+                                },
                             );
                         }
-                        ControlMessage::FileComplete { transfer_id, total_chunks, sha256 } => {
+                        ControlMessage::FileComplete {
+                            transfer_id,
+                            total_chunks,
+                            sha256,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::CompleteReceived { transfer_id, total_chunks, sha256 },
+                                file_transfer::FtInbound::CompleteReceived {
+                                    transfer_id,
+                                    total_chunks,
+                                    sha256,
+                                },
                             );
                         }
                         ControlMessage::FileCancel { transfer_id } => {
-                            let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::CancelReceived { transfer_id },
-                            );
+                            let _ = ft_manager
+                                .inbound_tx
+                                .try_send(file_transfer::FtInbound::CancelReceived { transfer_id });
                         }
-                        ControlMessage::FileProgress { transfer_id, chunks_received } => {
+                        ControlMessage::FileProgress {
+                            transfer_id,
+                            chunks_received,
+                        } => {
                             let _ = ft_manager.inbound_tx.try_send(
-                                file_transfer::FtInbound::ProgressReceived { transfer_id, chunks_received },
+                                file_transfer::FtInbound::ProgressReceived {
+                                    transfer_id,
+                                    chunks_received,
+                                },
                             );
                         }
                         _ => {}
@@ -3075,7 +3186,8 @@ fn run_punched_transport(
                         last_backlog_keyframe_request = Instant::now();
                     }
                     if trace {
-                        let skipped_before_transport = source_gap.saturating_sub(skipped_frames as u64);
+                        let skipped_before_transport =
+                            source_gap.saturating_sub(skipped_frames as u64);
                         eprintln!(
                             "[trace][server] detected {source_gap} locally dropped punched video unit(s) (drained_now={skipped_frames}, evicted_before_transport={skipped_before_transport}); requesting recovery keyframe"
                         );
@@ -3145,9 +3257,10 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
             .unwrap_or_else(|_| API_SERVER_URL.to_string())
             .trim_end_matches('/')
             .to_string();
-        let tunnel = state.tunnel_state.clone().unwrap_or_else(|| {
-            Arc::new(api_client::ApiTunnelState::new())
-        });
+        let tunnel = state
+            .tunnel_state
+            .clone()
+            .unwrap_or_else(|| Arc::new(api_client::ApiTunnelState::new()));
         api_client::start_api_registration(
             api_url,
             Arc::clone(&state.control),
@@ -3182,8 +3295,10 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
                     println!("[server] Rejecting blocked client connection from {addr}");
                     let _ = stream
                         .write_all(
-                            &ControlMessage::Error("Server is currently blocking new connections.".into())
-                                .serialize(),
+                            &ControlMessage::Error(
+                                "Server is currently blocking new connections.".into(),
+                            )
+                            .serialize(),
                         )
                         .await;
                     continue;

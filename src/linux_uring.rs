@@ -166,7 +166,8 @@ mod tests {
         let recv_addr = recv.local_addr().unwrap();
         let send = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         send.connect(recv_addr).expect("connect");
-        recv.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
 
         let payload = b"io_uring correctness check";
         uring
@@ -189,11 +190,10 @@ mod tests {
         let recv_addr = recv.local_addr().unwrap();
         let send = UdpSocket::bind("127.0.0.1:0").expect("bind");
         send.connect(recv_addr).unwrap();
-        recv.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
 
-        let packets: Vec<Vec<u8>> = (0..128u32)
-            .map(|i| i.to_be_bytes().to_vec())
-            .collect();
+        let packets: Vec<Vec<u8>> = (0..128u32).map(|i| i.to_be_bytes().to_vec()).collect();
         let refs: Vec<&[u8]> = packets.iter().map(|v| v.as_slice()).collect();
         uring.send_all(send.as_raw_fd(), &refs).expect("send_all");
 
@@ -270,8 +270,7 @@ mod tests {
         for (i, got) in seen.iter().enumerate() {
             let got = got.as_ref().expect("every index must be received");
             assert_eq!(
-                got,
-                &packets[i],
+                got, &packets[i],
                 "packet {i} arrived with corrupted bytes — uring send is trampling buffers"
             );
         }
@@ -334,7 +333,9 @@ mod tests {
             })
             .collect();
         let refs: Vec<&[u8]> = second.iter().map(|v| v.as_slice()).collect();
-        uring.send_all(send.as_raw_fd(), &refs).expect("second send");
+        uring
+            .send_all(send.as_raw_fd(), &refs)
+            .expect("second send");
         for _ in 0..second.len() {
             let (n, _) = recv.recv_from(&mut buf).expect("recv second");
             assert_eq!(n, 800);

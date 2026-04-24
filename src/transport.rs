@@ -104,8 +104,7 @@ mod linux_send {
                 let cmsg = libc::CMSG_FIRSTHDR(&hdr);
                 (*cmsg).cmsg_level = libc::IPPROTO_UDP;
                 (*cmsg).cmsg_type = UDP_SEGMENT;
-                (*cmsg).cmsg_len =
-                    libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
                 let data_ptr = libc::CMSG_DATA(cmsg) as *mut u16;
                 std::ptr::write_unaligned(data_ptr, seg_size as u16);
             }
@@ -161,9 +160,7 @@ mod linux_send {
                     self.msgs.push(hdr);
                 }
                 let vlen = self.msgs.len() as libc::c_uint;
-                let ret = unsafe {
-                    libc::sendmmsg(fd, self.msgs.as_mut_ptr(), vlen, 0)
-                };
+                let ret = unsafe { libc::sendmmsg(fd, self.msgs.as_mut_ptr(), vlen, 0) };
                 if ret < 0 {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::EINTR) {
@@ -319,7 +316,10 @@ pub struct UdpSender {
 }
 
 impl UdpSender {
-    pub fn new(client_addr: SocketAddr, crypto: Option<Arc<CryptoContext>>) -> Result<Self, String> {
+    pub fn new(
+        client_addr: SocketAddr,
+        crypto: Option<Arc<CryptoContext>>,
+    ) -> Result<Self, String> {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind UDP: {e}"))?;
         configure_direct_udp_socket(&socket, client_addr);
         socket
@@ -327,13 +327,13 @@ impl UdpSender {
             .map_err(|e| format!("connect UDP: {e}"))?;
         let overhead = if crypto.is_some() { CRYPTO_OVERHEAD } else { 0 };
         let max_udp = select_max_udp_packet_size(client_addr).saturating_sub(overhead);
-        if std::env::var_os("ST_TRACE").is_some()
-            || max_udp != LOOPBACK_MAX_UDP
-            || crypto.is_some()
+        if std::env::var_os("ST_TRACE").is_some() || max_udp != LOOPBACK_MAX_UDP || crypto.is_some()
         {
             eprintln!(
                 "[transport] UDP max payload {} bytes for {} (encrypted={})",
-                max_udp, client_addr, crypto.is_some()
+                max_udp,
+                client_addr,
+                crypto.is_some()
             );
         }
         #[cfg(target_os = "linux")]
@@ -405,7 +405,6 @@ fn build_uring_send() -> Option<crate::linux_uring::UringSend> {
 }
 
 impl UdpSender {
-
     /// Create a sender that uses a punched socket for media delivery.
     pub fn from_punched(punched: Arc<PunchedSocket>) -> Self {
         // Punched connections always use the safe (public internet) MTU
@@ -452,9 +451,7 @@ impl UdpSender {
                         .send(&encrypt_buf[..n])
                         .map_err(|e| format!("send: {e}"))?;
                 } else {
-                    socket
-                        .send(plaintext)
-                        .map_err(|e| format!("send: {e}"))?;
+                    socket.send(plaintext).map_err(|e| format!("send: {e}"))?;
                 }
             }
             SendBackend::Punched(punched) => {
@@ -485,8 +482,7 @@ impl UdpSender {
 
         // Build a flat list of plaintext packets to send: the sliced packets,
         // optionally a parity packet, optionally a duplicate of the first.
-        let mut plaintexts: Vec<&[u8]> =
-            Vec::with_capacity(packets.len() + 2);
+        let mut plaintexts: Vec<&[u8]> = Vec::with_capacity(packets.len() + 2);
         for pkt in packets.iter() {
             plaintexts.push(pkt);
         }
@@ -755,10 +751,15 @@ mod gso_tests {
     #[test]
     fn gso_skips_single_packet_batch() {
         let send = UdpSocket::bind("127.0.0.1:0").expect("bind send");
-        send.connect("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
-            // Any valid loopback; we never send here.
-            "127.0.0.1:9".parse().unwrap()
-        })).ok();
+        send.connect(
+            "127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap_or_else(|_| {
+                    // Any valid loopback; we never send here.
+                    "127.0.0.1:9".parse().unwrap()
+                }),
+        )
+        .ok();
         let mut batch = SendBatch::new();
         let _ = batch.probe_gso(send.as_raw_fd());
         let only = vec![0u8; 1000];

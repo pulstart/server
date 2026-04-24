@@ -1,13 +1,11 @@
 use crossbeam_channel::Sender;
 
-use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use std::{
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-};
-use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(target_os = "windows")]
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 static TARGET_FPS: AtomicU32 = AtomicU32::new(60);
 
@@ -186,9 +184,7 @@ pub fn try_clone_frame_to_ram_bgra(frame: &CapturedFrame) -> Result<Option<Vec<u
     match &frame.data {
         FrameData::Ram(data) => Ok(Some(data.clone())),
         FrameData::DmaBuf {
-            planes,
-            drm_format,
-            ..
+            planes, drm_format, ..
         } => {
             if !matches!(*drm_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888) {
                 return Ok(None);
@@ -284,12 +280,10 @@ pub fn composite_cursor_with_stride(
 
                 frame_data[frame_offset] =
                     ((cb as u32 * alpha + frame_data[frame_offset] as u32 * inv_alpha) / 255) as u8;
-                frame_data[frame_offset + 1] = ((cg as u32
-                    * alpha
+                frame_data[frame_offset + 1] = ((cg as u32 * alpha
                     + frame_data[frame_offset + 1] as u32 * inv_alpha)
                     / 255) as u8;
-                frame_data[frame_offset + 2] = ((cr as u32
-                    * alpha
+                frame_data[frame_offset + 2] = ((cr as u32 * alpha
                     + frame_data[frame_offset + 2] as u32 * inv_alpha)
                     / 255) as u8;
                 frame_data[frame_offset + 3] = 255;

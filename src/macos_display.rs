@@ -3,15 +3,18 @@ use screencapturekit::prelude::*;
 const DISPLAY_ID_ENV: &str = "ST_MACOS_DISPLAY_ID";
 
 pub fn select_capture_display() -> Result<SCDisplay, String> {
-    let content =
-        SCShareableContent::get().map_err(|err| format!("Failed to enumerate displays: {err:?}"))?;
+    let content = SCShareableContent::get()
+        .map_err(|err| format!("Failed to enumerate displays: {err:?}"))?;
     let displays = content.displays();
     if displays.is_empty() {
         return Err("No displays found".into());
     }
 
     if let Some(requested_id) = requested_display_id()? {
-        if let Some(display) = displays.iter().find(|display| display.display_id() == requested_id) {
+        if let Some(display) = displays
+            .iter()
+            .find(|display| display.display_id() == requested_id)
+        {
             return Ok(display.clone());
         }
         return Err(format!(
@@ -24,7 +27,12 @@ pub fn select_capture_display() -> Result<SCDisplay, String> {
 
     displays
         .iter()
-        .max_by_key(|display| (u64::from(display.width()) * u64::from(display.height()), display.display_id()))
+        .max_by_key(|display| {
+            (
+                u64::from(display.width()) * u64::from(display.height()),
+                display.display_id(),
+            )
+        })
         .cloned()
         .ok_or_else(|| "No displays found".to_string())
 }

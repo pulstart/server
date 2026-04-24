@@ -250,9 +250,7 @@ impl NvencEncoder {
                 self.fill_bgra_from_slice(data);
             }
             FrameData::DmaBuf {
-                planes,
-                drm_format,
-                ..
+                planes, drm_format, ..
             } => {
                 // DMA-BUF path: mmap directly into bgra_frame (avoids intermediate Vec).
                 self.fill_bgra_from_dmabuf(planes, *drm_format, frame.width, frame.height)?;

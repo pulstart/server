@@ -14,20 +14,16 @@ use ksni::menu::{
     CheckmarkItem as LinuxCheckmarkItem, MenuItem as LinuxMenuItem,
     StandardItem as LinuxStandardItem, SubMenu as LinuxSubMenu,
 };
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::time::Instant;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::time::Instant;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder,
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::{Icon as DesktopTrayIcon, TrayIcon, TrayIconBuilder};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use winit::application::ApplicationHandler;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 #[cfg(target_os = "windows")]
 use windows::core::{w, Error as WindowsError, PCWSTR};
 #[cfg(target_os = "windows")]
@@ -46,16 +42,20 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW,
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_LEFT,
-    GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowTextW, HMENU, IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassW,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, WNDCLASSW,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_SETFONT, WS_BORDER,
-    WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_EX_TOPMOST, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE, CW_USEDEFAULT, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WINDOW_EX_STYLE,
-    WINDOW_STYLE,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
+    LoadCursorW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON,
+    CREATESTRUCTW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_LEFT, GWLP_USERDATA, HMENU, IDC_ARROW, MSG,
+    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION,
+    WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_EX_TOPMOST, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use winit::application::ApplicationHandler;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const ALLOW_CONNECTIONS_ID: &str = "allow-connections";
@@ -107,7 +107,10 @@ pub fn should_run_tray() -> bool {
     }
 }
 
-pub fn run_tray(control: Arc<ServerControl>, tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
+pub fn run_tray(
+    control: Arc<ServerControl>,
+    tunnel_state: Option<Arc<ApiTunnelState>>,
+) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         run_linux_tray(control, tunnel_state)
@@ -125,7 +128,10 @@ pub fn run_tray(control: Arc<ServerControl>, tunnel_state: Option<Arc<ApiTunnelS
 }
 
 #[cfg(target_os = "linux")]
-fn run_linux_tray(control: Arc<ServerControl>, tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
+fn run_linux_tray(
+    control: Arc<ServerControl>,
+    tunnel_state: Option<Arc<ApiTunnelState>>,
+) -> Result<(), String> {
     let mut last_version = control.ui_version();
     let mut last_api_connected = tunnel_state.as_ref().map(|ts| ts.is_connected());
     let handle = LinuxTray {
@@ -261,7 +267,10 @@ impl ksni::Tray for LinuxTray {
                     }
                     .into(),
                     LinuxSubMenu {
-                        label: format!("Bitrate: {}", bitrate_label(self.control.forced_bitrate_kbps())),
+                        label: format!(
+                            "Bitrate: {}",
+                            bitrate_label(self.control.forced_bitrate_kbps())
+                        ),
                         submenu: linux_bitrate_menu_items(&self.control),
                         ..Default::default()
                     }
@@ -322,7 +331,11 @@ fn linux_client_menu_items(clients: &[ConnectedClientSnapshot]) -> Vec<LinuxMenu
         .map(|client| {
             let client_id = client.id;
             LinuxStandardItem {
-                label: format!("Disconnect {} ({})", client.addr, connected_since_label(client)),
+                label: format!(
+                    "Disconnect {} ({})",
+                    client.addr,
+                    connected_since_label(client)
+                ),
                 activate: Box::new(move |tray: &mut LinuxTray| {
                     let _ = tray.control.request_disconnect(client_id);
                 }),
@@ -416,9 +429,15 @@ fn linux_quality_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<L
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn run_desktop_tray(control: Arc<ServerControl>, _tunnel_state: Option<Arc<ApiTunnelState>>) -> Result<(), String> {
-    let event_loop = EventLoop::new().map_err(|err| format!("Failed to create tray event loop: {err}"))?;
-    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(200)));
+fn run_desktop_tray(
+    control: Arc<ServerControl>,
+    _tunnel_state: Option<Arc<ApiTunnelState>>,
+) -> Result<(), String> {
+    let event_loop =
+        EventLoop::new().map_err(|err| format!("Failed to create tray event loop: {err}"))?;
+    event_loop.set_control_flow(ControlFlow::WaitUntil(
+        Instant::now() + Duration::from_millis(200),
+    ));
     let mut app = TrayApp::new(control);
     event_loop
         .run_app(&mut app)
@@ -491,7 +510,8 @@ impl TrayApp {
         );
         let set_token_item = MenuItem::with_id(SET_TOKEN_ID, "Set Token...", true, None);
         let update_status_item = MenuItem::new("Checking GitHub releases...", false, None);
-        let check_updates_item = MenuItem::with_id(CHECK_UPDATES_ID, "Check For Updates", true, None);
+        let check_updates_item =
+            MenuItem::with_id(CHECK_UPDATES_ID, "Check For Updates", true, None);
         let install_update_item =
             MenuItem::with_id(INSTALL_UPDATE_ID, "Update To Latest", false, None);
         let allow_item = CheckMenuItem::with_id(
@@ -523,13 +543,18 @@ impl TrayApp {
             .map_err(|err| format!("Failed to build codec submenu: {err}"))?;
         let mut codec_items = Vec::new();
         for (codec, label) in &codec_options {
-            let id = format!("{VIDEO_CODEC_PREFIX}{}", codec.map_or("auto", |c| match c {
-                Codec::H264 => "h264",
-                Codec::Hevc => "hevc",
-                Codec::Av1 => "av1",
-            }));
+            let id = format!(
+                "{VIDEO_CODEC_PREFIX}{}",
+                codec.map_or("auto", |c| match c {
+                    Codec::H264 => "h264",
+                    Codec::Hevc => "hevc",
+                    Codec::Av1 => "av1",
+                })
+            );
             let item = CheckMenuItem::with_id(id, *label, true, current_codec == *codec, None);
-            codec_submenu.append(&item).map_err(|err| format!("Failed to append codec item: {err}"))?;
+            codec_submenu
+                .append(&item)
+                .map_err(|err| format!("Failed to append codec item: {err}"))?;
             codec_items.push(item);
         }
 
@@ -556,7 +581,9 @@ impl TrayApp {
         for (kbps, label) in &bitrate_options {
             let id = format!("{VIDEO_BITRATE_PREFIX}{kbps}");
             let item = CheckMenuItem::with_id(id, *label, true, current_bitrate == *kbps, None);
-            bitrate_submenu.append(&item).map_err(|err| format!("Failed to append bitrate item: {err}"))?;
+            bitrate_submenu
+                .append(&item)
+                .map_err(|err| format!("Failed to append bitrate item: {err}"))?;
             bitrate_items.push(item);
         }
 
@@ -574,13 +601,18 @@ impl TrayApp {
             .map_err(|err| format!("Failed to build quality submenu: {err}"))?;
         let mut quality_items = Vec::new();
         for (quality, label) in &quality_options {
-            let id = format!("{VIDEO_QUALITY_PREFIX}{}", quality.map_or("auto", |q| match q {
-                QualityPreset::LowLatency => "low-latency",
-                QualityPreset::Balanced => "balanced",
-                QualityPreset::HighQuality => "high-quality",
-            }));
+            let id = format!(
+                "{VIDEO_QUALITY_PREFIX}{}",
+                quality.map_or("auto", |q| match q {
+                    QualityPreset::LowLatency => "low-latency",
+                    QualityPreset::Balanced => "balanced",
+                    QualityPreset::HighQuality => "high-quality",
+                })
+            );
             let item = CheckMenuItem::with_id(id, *label, true, current_quality == *quality, None);
-            quality_submenu.append(&item).map_err(|err| format!("Failed to append quality item: {err}"))?;
+            quality_submenu
+                .append(&item)
+                .map_err(|err| format!("Failed to append quality item: {err}"))?;
             quality_items.push(item);
         }
 
@@ -589,9 +621,15 @@ impl TrayApp {
             .enabled(true)
             .build()
             .map_err(|err| format!("Failed to build video submenu: {err}"))?;
-        video_submenu.append(&codec_submenu).map_err(|err| format!("Failed to append codec submenu: {err}"))?;
-        video_submenu.append(&bitrate_submenu).map_err(|err| format!("Failed to append bitrate submenu: {err}"))?;
-        video_submenu.append(&quality_submenu).map_err(|err| format!("Failed to append quality submenu: {err}"))?;
+        video_submenu
+            .append(&codec_submenu)
+            .map_err(|err| format!("Failed to append codec submenu: {err}"))?;
+        video_submenu
+            .append(&bitrate_submenu)
+            .map_err(|err| format!("Failed to append bitrate submenu: {err}"))?;
+        video_submenu
+            .append(&quality_submenu)
+            .map_err(|err| format!("Failed to append quality submenu: {err}"))?;
 
         // Use a real root menu for the tray popup. On Windows, attaching a
         // Submenu as the tray context menu goes through muda's submenu
@@ -729,7 +767,8 @@ impl TrayApp {
         if let Some(sub) = &self.codec_submenu {
             sub.set_text(format!("Codec: {}", codec_label(current_codec)));
         }
-        let codec_values: [Option<Codec>; 4] = [None, Some(Codec::H264), Some(Codec::Hevc), Some(Codec::Av1)];
+        let codec_values: [Option<Codec>; 4] =
+            [None, Some(Codec::H264), Some(Codec::Hevc), Some(Codec::Av1)];
         for (item, value) in self.codec_items.iter().zip(codec_values.iter()) {
             item.set_checked(current_codec == *value);
         }
@@ -737,7 +776,9 @@ impl TrayApp {
         if let Some(sub) = &self.bitrate_submenu {
             sub.set_text(format!("Bitrate: {}", bitrate_label(current_bitrate)));
         }
-        let bitrate_values: [u32; 11] = [0, 1_000, 5_000, 10_000, 20_000, 30_000, 50_000, 80_000, 100_000, 150_000, 200_000];
+        let bitrate_values: [u32; 11] = [
+            0, 1_000, 5_000, 10_000, 20_000, 30_000, 50_000, 80_000, 100_000, 150_000, 200_000,
+        ];
         for (item, value) in self.bitrate_items.iter().zip(bitrate_values.iter()) {
             item.set_checked(current_bitrate == *value);
         }
@@ -780,7 +821,11 @@ impl TrayApp {
         for client in clients {
             let item = MenuItem::with_id(
                 format!("{DROP_CLIENT_ID_PREFIX}{}", client.id),
-                format!("Disconnect {} ({})", client.addr, connected_since_label(client)),
+                format!(
+                    "Disconnect {} ({})",
+                    client.addr,
+                    connected_since_label(client)
+                ),
                 true,
                 None,
             );
@@ -949,7 +994,9 @@ fn tray_status_text(control: &ServerControl) -> String {
 
 fn tray_update_status_text(state: &UpdateStateSnapshot) -> String {
     match state {
-        UpdateStateSnapshot::Unsupported(message) => format!("Updates unavailable: {}", trim_tray_label(message)),
+        UpdateStateSnapshot::Unsupported(message) => {
+            format!("Updates unavailable: {}", trim_tray_label(message))
+        }
         UpdateStateSnapshot::Idle => "Updates: ready to check GitHub releases".into(),
         UpdateStateSnapshot::Checking => "Updates: checking GitHub releases...".into(),
         UpdateStateSnapshot::UpToDate { version } => {
@@ -1062,7 +1109,9 @@ fn try_kdialog(current: &str) -> Result<Option<String>, String> {
     {
         Ok(output) => {
             if output.status.success() {
-                Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+                Ok(Some(
+                    String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                ))
             } else {
                 // Non-zero exit (e.g. user cancelled) is not an error
                 Ok(None)
@@ -1085,7 +1134,9 @@ fn try_zenity(current: &str) -> Result<Option<String>, String> {
     {
         Ok(output) => {
             if output.status.success() {
-                Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+                Ok(Some(
+                    String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                ))
             } else {
                 Ok(None)
             }
@@ -1190,9 +1241,8 @@ fn ensure_windows_token_dialog_class() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn register_windows_token_dialog_class() -> Result<(), String> {
-    let module = unsafe {
-        GetModuleHandleW(None).map_err(|err| format!("GetModuleHandleW failed: {err}"))?
-    };
+    let module =
+        unsafe { GetModuleHandleW(None).map_err(|err| format!("GetModuleHandleW failed: {err}"))? };
     let cursor = unsafe {
         LoadCursorW(None, IDC_ARROW).map_err(|err| format!("LoadCursorW failed: {err}"))?
     };
@@ -1206,16 +1256,18 @@ fn register_windows_token_dialog_class() -> Result<(), String> {
     };
     let atom = unsafe { RegisterClassW(&window_class) };
     if atom == 0 {
-        return Err(format!("RegisterClassW failed: {}", WindowsError::from_win32()));
+        return Err(format!(
+            "RegisterClassW failed: {}",
+            WindowsError::from_win32()
+        ));
     }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn run_windows_token_input_dialog(current: &str) -> Result<Option<String>, String> {
-    let module = unsafe {
-        GetModuleHandleW(None).map_err(|err| format!("GetModuleHandleW failed: {err}"))?
-    };
+    let module =
+        unsafe { GetModuleHandleW(None).map_err(|err| format!("GetModuleHandleW failed: {err}"))? };
     let hinstance = HINSTANCE(module.0);
     let ex_style = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT | WS_EX_TOPMOST;
     let style = WS_CAPTION | WS_SYSMENU;
@@ -1271,7 +1323,10 @@ fn run_windows_token_input_dialog(current: &str) -> Result<Option<String>, Strin
                 }
                 let mut state = unsafe { Box::from_raw(state_ptr) };
                 state.result = None;
-                return Err(format!("GetMessageW failed: {}", WindowsError::from_win32()));
+                return Err(format!(
+                    "GetMessageW failed: {}",
+                    WindowsError::from_win32()
+                ));
             }
             0 => break,
             _ => {}
@@ -1424,10 +1479,7 @@ unsafe fn create_windows_token_dialog_controls(hwnd: HWND) -> Result<(), String>
         WINDOW_EX_STYLE(0),
         w!("BUTTON"),
         PCWSTR(ok_text.as_ptr()),
-        WS_CHILD
-            | WS_VISIBLE
-            | WS_TABSTOP
-            | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         252,
         88,
         75,
@@ -1442,10 +1494,7 @@ unsafe fn create_windows_token_dialog_controls(hwnd: HWND) -> Result<(), String>
         WINDOW_EX_STYLE(0),
         w!("BUTTON"),
         PCWSTR(cancel_text.as_ptr()),
-        WS_CHILD
-            | WS_VISIBLE
-            | WS_TABSTOP
-            | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         333,
         88,
         75,
@@ -1471,7 +1520,9 @@ unsafe fn create_windows_token_dialog_controls(hwnd: HWND) -> Result<(), String>
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn windows_token_dialog_state_mut(hwnd: HWND) -> Option<&'static mut WindowsTokenDialogState> {
+unsafe fn windows_token_dialog_state_mut(
+    hwnd: HWND,
+) -> Option<&'static mut WindowsTokenDialogState> {
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowsTokenDialogState;
     state_ptr.as_mut()
 }
@@ -1556,9 +1607,7 @@ fn server_icon_rgba(connected: bool) -> (Vec<u8>, u32, u32) {
 
             // Round the monitor corners
             if pixel == white {
-                let corners = [
-                    (4i32, 4i32), (4, 21), (27, 4), (27, 21),
-                ];
+                let corners = [(4i32, 4i32), (4, 21), (27, 4), (27, 21)];
                 for (cx, cy) in corners {
                     if x as i32 == cx && y as i32 == cy {
                         pixel = [0, 0, 0, 0];

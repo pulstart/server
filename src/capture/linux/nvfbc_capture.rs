@@ -65,18 +65,12 @@ type FnCreateHandle =
     unsafe extern "C" fn(*mut SessionHandle, *mut NvfbcCreateHandleParams) -> NvFbcStatus;
 type FnDestroyHandle =
     unsafe extern "C" fn(SessionHandle, *mut NvfbcDestroyHandleParams) -> NvFbcStatus;
-type FnGetStatus =
-    unsafe extern "C" fn(SessionHandle, *mut NvfbcGetStatusParams) -> NvFbcStatus;
-type FnCreateCaptureSession = unsafe extern "C" fn(
-    SessionHandle,
-    *mut NvfbcCreateCaptureSessionParams,
-) -> NvFbcStatus;
-type FnDestroyCaptureSession = unsafe extern "C" fn(
-    SessionHandle,
-    *mut NvfbcDestroyCaptureSessionParams,
-) -> NvFbcStatus;
-type FnToSysSetUp =
-    unsafe extern "C" fn(SessionHandle, *mut NvfbcToSysSetupParams) -> NvFbcStatus;
+type FnGetStatus = unsafe extern "C" fn(SessionHandle, *mut NvfbcGetStatusParams) -> NvFbcStatus;
+type FnCreateCaptureSession =
+    unsafe extern "C" fn(SessionHandle, *mut NvfbcCreateCaptureSessionParams) -> NvFbcStatus;
+type FnDestroyCaptureSession =
+    unsafe extern "C" fn(SessionHandle, *mut NvfbcDestroyCaptureSessionParams) -> NvFbcStatus;
+type FnToSysSetUp = unsafe extern "C" fn(SessionHandle, *mut NvfbcToSysSetupParams) -> NvFbcStatus;
 type FnToSysGrabFrame =
     unsafe extern "C" fn(SessionHandle, *mut NvfbcToSysGrabFrameParams) -> NvFbcStatus;
 
@@ -201,14 +195,20 @@ fn nvfbc_struct_version<T>(version: u32) -> u32 {
 
 fn status_code_message(code: NvFbcStatus) -> &'static str {
     match code {
-        NVFBC_ERR_API_VERSION => "The API version between the client and the library is not compatible",
+        NVFBC_ERR_API_VERSION => {
+            "The API version between the client and the library is not compatible"
+        }
         NVFBC_ERR_INTERNAL => "An internal error occurred",
-        NVFBC_ERR_INVALID_PARAM => "One or more of the parameters passed to the API call is invalid",
+        NVFBC_ERR_INVALID_PARAM => {
+            "One or more of the parameters passed to the API call is invalid"
+        }
         NVFBC_ERR_INVALID_PTR => "One or more of the pointers passed to the API call is invalid",
         NVFBC_ERR_INVALID_HANDLE => "The session handle passed to the API call is invalid",
         NVFBC_ERR_MAX_CLIENTS => "The maximum number of threaded clients has been reached",
         NVFBC_ERR_UNSUPPORTED => "The requested feature is not supported by the library",
-        NVFBC_ERR_OUT_OF_MEMORY => "Unable to allocate enough memory to perform the requested operation",
+        NVFBC_ERR_OUT_OF_MEMORY => {
+            "Unable to allocate enough memory to perform the requested operation"
+        }
         NVFBC_ERR_BAD_REQUEST => "The API call was not expected in the current state",
         NVFBC_ERR_X => "An X error occurred in the NVIDIA driver",
         NVFBC_ERR_GLX => "A GLX error occurred in the NVIDIA driver",
@@ -391,7 +391,8 @@ impl DynamicSystemCapturer {
     fn new() -> Result<Self, String> {
         let api = NvFbcApi::load()?;
         let mut params: NvfbcCreateHandleParams = unsafe { MaybeUninit::zeroed().assume_init() };
-        params.dwVersion = nvfbc_struct_version::<NvfbcCreateHandleParams>(CREATE_HANDLE_PARAMS_VERSION);
+        params.dwVersion =
+            nvfbc_struct_version::<NvfbcCreateHandleParams>(CREATE_HANDLE_PARAMS_VERSION);
         params.privateData = MAGIC_PRIVATE_DATA.as_ptr().cast();
         params.privateDataSize = size_of::<[u32; 4]>() as u32;
         params.bExternallyManagedContext = NVFBC_FALSE;
@@ -399,7 +400,10 @@ impl DynamicSystemCapturer {
         let mut handle = 0;
         let ret = unsafe { (api.create_handle)(&mut handle, &mut params) };
         if ret != NVFBC_SUCCESS {
-            return Err(format!("failed to create NvFBC handle: {}", status_code_message(ret)));
+            return Err(format!(
+                "failed to create NvFBC handle: {}",
+                status_code_message(ret)
+            ));
         }
 
         Ok(Self {
@@ -423,10 +427,9 @@ impl DynamicSystemCapturer {
     fn start(&mut self, fps: u32) -> Result<(), String> {
         let mut session_params: NvfbcCreateCaptureSessionParams =
             unsafe { MaybeUninit::zeroed().assume_init() };
-        session_params.dwVersion =
-            nvfbc_struct_version::<NvfbcCreateCaptureSessionParams>(
-                CREATE_CAPTURE_SESSION_PARAMS_VERSION,
-            );
+        session_params.dwVersion = nvfbc_struct_version::<NvfbcCreateCaptureSessionParams>(
+            CREATE_CAPTURE_SESSION_PARAMS_VERSION,
+        );
         session_params.eCaptureType = NVFBC_CAPTURE_TO_SYS;
         session_params.eTrackingType = NVFBC_TRACKING_DEFAULT;
         session_params.frameSize = NvfbcSize { w: 0, h: 0 };
@@ -451,9 +454,9 @@ impl DynamicSystemCapturer {
         params.dwVersion = nvfbc_struct_version::<NvfbcDestroyCaptureSessionParams>(
             DESTROY_CAPTURE_SESSION_PARAMS_VERSION,
         );
-        let _ = self
-            .api
-            .check_ret(self.handle, unsafe { (self.api.destroy_capture_session)(self.handle, &mut params) });
+        let _ = self.api.check_ret(self.handle, unsafe {
+            (self.api.destroy_capture_session)(self.handle, &mut params)
+        });
     }
 
     fn next_frame(
@@ -462,8 +465,7 @@ impl DynamicSystemCapturer {
         timeout: Option<Duration>,
     ) -> Result<SystemFrameInfo<'_>, String> {
         let mut frame_info: NvfbcFrameGrabInfo = unsafe { MaybeUninit::zeroed().assume_init() };
-        let mut params: NvfbcToSysGrabFrameParams =
-            unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut params: NvfbcToSysGrabFrameParams = unsafe { MaybeUninit::zeroed().assume_init() };
         params.dwVersion =
             nvfbc_struct_version::<NvfbcToSysGrabFrameParams>(TOSYS_GRAB_FRAME_PARAMS_VERSION);
         params.dwFlags = capture_method as u32;
@@ -506,9 +508,9 @@ impl Drop for DynamicSystemCapturer {
         let mut params: NvfbcDestroyHandleParams = unsafe { MaybeUninit::zeroed().assume_init() };
         params.dwVersion =
             nvfbc_struct_version::<NvfbcDestroyHandleParams>(DESTROY_HANDLE_PARAMS_VERSION);
-        let _ = self
-            .api
-            .check_ret(self.handle, unsafe { (self.api.destroy_handle)(self.handle, &mut params) });
+        let _ = self.api.check_ret(self.handle, unsafe {
+            (self.api.destroy_handle)(self.handle, &mut params)
+        });
     }
 }
 
@@ -559,10 +561,8 @@ impl CaptureBackend for NvfbcCapture {
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;
             while running.load(Ordering::SeqCst) {
-                match capturer.next_frame(
-                    CaptureMethod::Blocking,
-                    Some(Duration::from_millis(50)),
-                ) {
+                match capturer.next_frame(CaptureMethod::Blocking, Some(Duration::from_millis(50)))
+                {
                     Ok(frame_info) => {
                         let _ = frame_info.current_frame;
                         let _ = frame_info.is_new_frame;

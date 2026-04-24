@@ -10,13 +10,13 @@ use std::thread;
 use std::time::Duration;
 use tar::Archive;
 use tempfile::TempDir;
-use zip::ZipArchive;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{
     OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
+use zip::ZipArchive;
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/pulstart/server/releases/latest";
 const APPLY_UPDATE_FLAG: &str = "--apply-update";
@@ -196,8 +196,7 @@ pub fn prepare_and_spawn_update(release: &ReleaseInfo) -> Result<(), String> {
         // On Unix we can overwrite running executables directly.  Copy files
         // BEFORE shutting down so the user can see the pkexec dialog through
         // the active stream if elevated permissions are needed.
-        if let Err(direct_err) =
-            sync_package_contents(&package_root, &install_target.install_root)
+        if let Err(direct_err) = sync_package_contents(&package_root, &install_target.install_root)
         {
             eprintln!("[updater] {direct_err}");
             eprintln!("[updater] Requesting elevated permissions...");
@@ -279,12 +278,13 @@ fn archive_kind() -> Result<ArchiveKind, String> {
 }
 
 fn current_install_target() -> Result<InstallTarget, String> {
-    let current_executable =
-        std::env::current_exe().map_err(|err| format!("Failed to locate current executable: {err}"))?;
+    let current_executable = std::env::current_exe()
+        .map_err(|err| format!("Failed to locate current executable: {err}"))?;
 
     if cfg!(target_os = "macos") {
         let app_root = macos_app_bundle_root(&current_executable).ok_or_else(|| {
-            "Full package update on macOS requires the server to run from a .app bundle.".to_string()
+            "Full package update on macOS requires the server to run from a .app bundle."
+                .to_string()
         })?;
         return Ok(InstallTarget {
             relaunch_executable: app_root.join("Contents/MacOS/st-server"),
@@ -340,8 +340,8 @@ fn spawn_relaunch_helper(
 
 #[cfg(target_os = "linux")]
 fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), String> {
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to locate current executable: {e}"))?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Failed to locate current executable: {e}"))?;
     let elevated_helper = linux_elevated_helper_path(&current_exe);
     let status = Command::new("pkexec")
         .arg(&elevated_helper)
@@ -368,8 +368,8 @@ fn linux_elevated_helper_path(current_exe: &Path) -> PathBuf {
 
 #[cfg(target_os = "macos")]
 fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), String> {
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to locate current executable: {e}"))?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Failed to locate current executable: {e}"))?;
     let shell_cmd = format!(
         "{} {} {} {}",
         shell_escape(&current_exe.to_string_lossy()),
@@ -392,8 +392,8 @@ fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), Str
 
 #[cfg(target_os = "windows")]
 fn run_elevated_copy(package_root: &Path, install_root: &Path) -> Result<(), String> {
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to locate current executable: {e}"))?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Failed to locate current executable: {e}"))?;
     let script = format!(
         "Start-Process -FilePath '{}' -Verb RunAs -Wait -ArgumentList @('{}','{}','{}')",
         powershell_escape(&current_exe.to_string_lossy()),
@@ -460,13 +460,22 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn sync_package_contents(source_root: &Path, install_root: &Path) -> Result<(), String> {
-    fs::create_dir_all(install_root)
-        .map_err(|err| format!("Failed to create install root '{}': {err}", install_root.display()))?;
+    fs::create_dir_all(install_root).map_err(|err| {
+        format!(
+            "Failed to create install root '{}': {err}",
+            install_root.display()
+        )
+    })?;
 
-    let entries = fs::read_dir(source_root)
-        .map_err(|err| format!("Failed to read extracted package '{}': {err}", source_root.display()))?;
+    let entries = fs::read_dir(source_root).map_err(|err| {
+        format!(
+            "Failed to read extracted package '{}': {err}",
+            source_root.display()
+        )
+    })?;
     for entry in entries {
-        let entry = entry.map_err(|err| format!("Failed to read extracted package entry: {err}"))?;
+        let entry =
+            entry.map_err(|err| format!("Failed to read extracted package entry: {err}"))?;
         let source_path = entry.path();
         let destination_path = install_root.join(entry.file_name());
         sync_path(&source_path, &destination_path)?;
@@ -484,8 +493,12 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
                 )
             })?;
         }
-        fs::create_dir_all(destination)
-            .map_err(|err| format!("Failed to create directory '{}': {err}", destination.display()))?;
+        fs::create_dir_all(destination).map_err(|err| {
+            format!(
+                "Failed to create directory '{}': {err}",
+                destination.display()
+            )
+        })?;
         let entries = fs::read_dir(source)
             .map_err(|err| format!("Failed to read directory '{}': {err}", source.display()))?;
         for entry in entries {
@@ -494,8 +507,9 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
         }
     } else if source.is_file() {
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("Failed to create directory '{}': {err}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|err| {
+                format!("Failed to create directory '{}': {err}", parent.display())
+            })?;
         }
         if destination.exists() {
             if destination.is_dir() {
@@ -527,8 +541,12 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn copy_permissions(source: &Path, destination: &Path) -> Result<(), String> {
-    let metadata = fs::metadata(source)
-        .map_err(|err| format!("Failed to read source permissions '{}': {err}", source.display()))?;
+    let metadata = fs::metadata(source).map_err(|err| {
+        format!(
+            "Failed to read source permissions '{}': {err}",
+            source.display()
+        )
+    })?;
     fs::set_permissions(destination, metadata.permissions()).map_err(|err| {
         format!(
             "Failed to set permissions on '{}': {err}",
@@ -543,9 +561,12 @@ fn relaunch_updated_app(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         command.current_dir(parent);
     }
-    command
-        .spawn()
-        .map_err(|err| format!("Failed to relaunch updated server '{}': {err}", path.display()))?;
+    command.spawn().map_err(|err| {
+        format!(
+            "Failed to relaunch updated server '{}': {err}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -562,8 +583,8 @@ fn extract_archive(archive_path: &Path, destination_root: &Path) -> Result<(), S
 }
 
 fn extract_zip(archive_path: &Path, destination_root: &Path) -> Result<(), String> {
-    let file =
-        File::open(archive_path).map_err(|err| format!("Failed to open downloaded archive: {err}"))?;
+    let file = File::open(archive_path)
+        .map_err(|err| format!("Failed to open downloaded archive: {err}"))?;
     let mut archive =
         ZipArchive::new(file).map_err(|err| format!("Failed to read zip archive: {err}"))?;
     archive
@@ -573,8 +594,8 @@ fn extract_zip(archive_path: &Path, destination_root: &Path) -> Result<(), Strin
 }
 
 fn extract_tar_gz(archive_path: &Path, destination_root: &Path) -> Result<(), String> {
-    let file =
-        File::open(archive_path).map_err(|err| format!("Failed to open downloaded archive: {err}"))?;
+    let file = File::open(archive_path)
+        .map_err(|err| format!("Failed to open downloaded archive: {err}"))?;
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
     archive
@@ -588,8 +609,8 @@ fn locate_package_root(extract_root: &Path) -> Result<PathBuf, String> {
         return locate_macos_package_root(extract_root);
     }
 
-    let entries =
-        fs::read_dir(extract_root).map_err(|err| format!("Failed to inspect extracted archive: {err}"))?;
+    let entries = fs::read_dir(extract_root)
+        .map_err(|err| format!("Failed to inspect extracted archive: {err}"))?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("Failed to read extracted entry: {err}"))?;
         if entry
@@ -604,8 +625,8 @@ fn locate_package_root(extract_root: &Path) -> Result<PathBuf, String> {
 }
 
 fn locate_macos_package_root(extract_root: &Path) -> Result<PathBuf, String> {
-    let entries =
-        fs::read_dir(extract_root).map_err(|err| format!("Failed to inspect extracted archive: {err}"))?;
+    let entries = fs::read_dir(extract_root)
+        .map_err(|err| format!("Failed to inspect extracted archive: {err}"))?;
 
     for entry in entries {
         let entry = entry.map_err(|err| format!("Failed to read extracted entry: {err}"))?;

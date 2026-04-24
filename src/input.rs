@@ -1,13 +1,13 @@
+#[cfg(target_os = "linux")]
+use crate::capture::linux::{active_remote_desktop_session, RemoteDesktopPortalSession};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use st_protocol::MOUSE_WHEEL_STEP_UNITS;
 use st_protocol::{
     ControlMessage, ControllerState, CursorShape, CursorState, InputCapabilities, InputPacket,
     KeyboardKey, KEYBOARD_STATE_BYTES, MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2,
     MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use st_protocol::MOUSE_WHEEL_STEP_UNITS;
 use std::collections::BTreeMap;
-#[cfg(target_os = "linux")]
-use crate::capture::linux::{active_remote_desktop_session, RemoteDesktopPortalSession};
 #[cfg(target_os = "linux")]
 use std::fs::{File, OpenOptions};
 #[cfg(target_os = "linux")]
@@ -122,8 +122,7 @@ fn fit_cursor_shape_to_payload_budget(mut shape: CursorShape) -> (CursorShape, b
 
     let dst_w = dst_width.max(1) as u32;
     let dst_h = dst_height.max(1) as u32;
-    shape.hotspot_x = (((shape.hotspot_x as u32) * dst_w + src_width as u32 / 2)
-        / src_width as u32)
+    shape.hotspot_x = (((shape.hotspot_x as u32) * dst_w + src_width as u32 / 2) / src_width as u32)
         .min(dst_w.saturating_sub(1)) as u16;
     shape.hotspot_y = (((shape.hotspot_y as u32) * dst_h + src_height as u32 / 2)
         / src_height as u32)
@@ -411,8 +410,7 @@ impl InputRuntime {
                 inner.cursor_state = next_state;
                 inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
                 if trace_enabled() {
-                    let log_idx =
-                        TRACE_CURSOR_UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                    let log_idx = TRACE_CURSOR_UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                     if log_idx < 12 {
                         eprintln!(
                             "[trace][cursor] updated state serial={} pos=({}, {}) visible={} (no-shape)",
@@ -822,8 +820,8 @@ impl WheelAccumulator {
 fn wheel_units_to_steps(pending_units: &mut i32, delta_units: i16) -> i16 {
     *pending_units += i32::from(delta_units);
     let step_units = i32::from(MOUSE_WHEEL_STEP_UNITS);
-    let steps = (*pending_units / step_units)
-        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    let steps =
+        (*pending_units / step_units).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
     *pending_units -= i32::from(steps) * step_units;
     steps
 }
@@ -865,10 +863,8 @@ impl WindowsInputController {
         self.refresh_virtual_screen();
         let width = self.width.max(1) as i64;
         let height = self.height.max(1) as i64;
-        self.tracked_x =
-            self.origin_x + ((x as i64 * (width - 1).max(0) + 32767) / 65535) as i32;
-        self.tracked_y =
-            self.origin_y + ((y as i64 * (height - 1).max(0) + 32767) / 65535) as i32;
+        self.tracked_x = self.origin_x + ((x as i64 * (width - 1).max(0) + 32767) / 65535) as i32;
+        self.tracked_y = self.origin_y + ((y as i64 * (height - 1).max(0) + 32767) / 65535) as i32;
 
         self.send_mouse(MOUSEINPUT {
             dx: normalize_windows_absolute(self.tracked_x - self.origin_x, self.width),
@@ -2295,10 +2291,14 @@ impl X11InputController {
             let mut win_y: std::os::raw::c_int = 0;
             let mut mask: std::os::raw::c_uint = 0;
             x11_ffi::XQueryPointer(
-                display, root,
-                &mut root_ret, &mut child_ret,
-                &mut root_x, &mut root_y,
-                &mut win_x, &mut win_y,
+                display,
+                root,
+                &mut root_ret,
+                &mut child_ret,
+                &mut root_x,
+                &mut root_y,
+                &mut win_x,
+                &mut win_y,
                 &mut mask,
             );
             (root_x, root_y)

@@ -22,10 +22,8 @@ mod pipewire_capture;
 pub mod wl_capture;
 pub mod x11_capture;
 
-pub(crate) use pipewire_capture::{
-    active_remote_desktop_session, RemoteDesktopPortalSession,
-};
 pub(crate) use nvfbc_capture::{probe as probe_nvfbc, NvfbcProbe};
+pub(crate) use pipewire_capture::{active_remote_desktop_session, RemoteDesktopPortalSession};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisplayServer {
@@ -387,55 +385,53 @@ impl CaptureBackend for PlatformCapture {
 
             // === PipeWire path ===
             // Fallback: PipeWire → ext-image-copy → Wayland screencopy → KMS
-            Backend::PipeWire(b) => {
-                match b.start(tx.clone()) {
-                    Ok(()) => Ok(()),
-                    Err(pw_err) => {
-                        if self.display_server == DisplayServer::Wayland {
-                            if ext_image_copy::verify_ext_image_copy() {
-                                eprintln!("[capture] PipeWire failed ({pw_err}), trying ext-image-copy-capture-v1...");
-                                let mut ec = ext_image_copy::ExtImageCopyCapture::new();
-                                match ec.start(tx.clone()) {
-                                    Ok(()) => {
-                                        self.backend = Backend::ExtImageCopy(ec);
-                                        return Ok(());
-                                    }
-                                    Err(ec_err) => {
-                                        eprintln!(
+            Backend::PipeWire(b) => match b.start(tx.clone()) {
+                Ok(()) => Ok(()),
+                Err(pw_err) => {
+                    if self.display_server == DisplayServer::Wayland {
+                        if ext_image_copy::verify_ext_image_copy() {
+                            eprintln!("[capture] PipeWire failed ({pw_err}), trying ext-image-copy-capture-v1...");
+                            let mut ec = ext_image_copy::ExtImageCopyCapture::new();
+                            match ec.start(tx.clone()) {
+                                Ok(()) => {
+                                    self.backend = Backend::ExtImageCopy(ec);
+                                    return Ok(());
+                                }
+                                Err(ec_err) => {
+                                    eprintln!(
                                             "[capture] ext-image-copy failed ({ec_err}), trying Wayland screencopy..."
                                         );
-                                    }
                                 }
                             }
-                            if wl_capture::verify_wayland() {
-                                eprintln!("[capture] Trying Wayland wlr-screencopy...");
-                                let mut wl = wl_capture::WaylandCapture::new();
-                                match wl.start(tx.clone()) {
-                                    Ok(()) => {
-                                        self.backend = Backend::Wayland(wl);
-                                        return Ok(());
-                                    }
-                                    Err(wl_err) => {
-                                        eprintln!("[capture] Wayland screencopy failed ({wl_err}), trying KMS...");
-                                    }
+                        }
+                        if wl_capture::verify_wayland() {
+                            eprintln!("[capture] Trying Wayland wlr-screencopy...");
+                            let mut wl = wl_capture::WaylandCapture::new();
+                            match wl.start(tx.clone()) {
+                                Ok(()) => {
+                                    self.backend = Backend::Wayland(wl);
+                                    return Ok(());
+                                }
+                                Err(wl_err) => {
+                                    eprintln!("[capture] Wayland screencopy failed ({wl_err}), trying KMS...");
                                 }
                             }
-                            let mut kms = kms_capture::KmsCapture::new();
-                            let result = kms.start(tx);
-                            if result.is_ok() {
-                                self.backend = Backend::Kms(kms);
-                            }
-                            result.map_err(|kms_err| {
+                        }
+                        let mut kms = kms_capture::KmsCapture::new();
+                        let result = kms.start(tx);
+                        if result.is_ok() {
+                            self.backend = Backend::Kms(kms);
+                        }
+                        result.map_err(|kms_err| {
                                 format!(
                                     "All capture backends failed.\n  PipeWire: {pw_err}\n  KMS: {kms_err}"
                                 )
                             })
-                        } else {
-                            Err(pw_err)
-                        }
+                    } else {
+                        Err(pw_err)
                     }
                 }
-            }
+            },
 
             // === ext-image-copy path ===
             // Fallback: ext-image-copy → Wayland screencopy → KMS → PipeWire
@@ -452,7 +448,9 @@ impl CaptureBackend for PlatformCapture {
                             Ok(())
                         }
                         Err(wl_err) => {
-                            eprintln!("[capture] Wayland screencopy failed ({wl_err}), trying KMS...");
+                            eprintln!(
+                                "[capture] Wayland screencopy failed ({wl_err}), trying KMS..."
+                            );
                             let mut kms = kms_capture::KmsCapture::new();
                             match kms.start(tx.clone()) {
                                 Ok(()) => {
@@ -460,7 +458,9 @@ impl CaptureBackend for PlatformCapture {
                                     Ok(())
                                 }
                                 Err(kms_err) => {
-                                    eprintln!("[capture] KMS failed ({kms_err}), trying PipeWire...");
+                                    eprintln!(
+                                        "[capture] KMS failed ({kms_err}), trying PipeWire..."
+                                    );
                                     let mut pw = pipewire_capture::PipeWireCapture::new();
                                     let result = pw.start(tx);
                                     if result.is_ok() {

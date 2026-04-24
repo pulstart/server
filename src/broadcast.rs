@@ -79,9 +79,10 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
         subs.retain(|sub| match sub.tx.try_send(Arc::clone(&arc)) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => match sub.drop_rx.try_recv() {
-                Ok(_) | Err(TryRecvError::Empty) => {
-                    !matches!(sub.tx.try_send(Arc::clone(&arc)), Err(TrySendError::Disconnected(_)))
-                }
+                Ok(_) | Err(TryRecvError::Empty) => !matches!(
+                    sub.tx.try_send(Arc::clone(&arc)),
+                    Err(TrySendError::Disconnected(_))
+                ),
                 Err(TryRecvError::Disconnected) => false,
             },
             Err(TrySendError::Disconnected(_)) => false,

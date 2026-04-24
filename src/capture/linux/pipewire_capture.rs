@@ -52,10 +52,12 @@ fn copy_mem_ptr_bgrx_frame(
     let row_bytes = width as usize * 4;
     let height = height as usize;
     let offset = offset as usize;
-    let available = src
-        .len()
-        .checked_sub(offset)
-        .ok_or_else(|| format!("PipeWire shared-memory offset {offset} exceeds buffer size {}", src.len()))?;
+    let available = src.len().checked_sub(offset).ok_or_else(|| {
+        format!(
+            "PipeWire shared-memory offset {offset} exceeds buffer size {}",
+            src.len()
+        )
+    })?;
     let valid = if size > 0 {
         available.min(size as usize)
     } else {
@@ -64,7 +66,9 @@ fn copy_mem_ptr_bgrx_frame(
     let src = &src[offset..offset + valid];
 
     if stride < 0 {
-        return Err(format!("PipeWire shared-memory stride {stride} is negative"));
+        return Err(format!(
+            "PipeWire shared-memory stride {stride} is negative"
+        ));
     }
 
     let stride = stride as usize;
@@ -251,8 +255,8 @@ fn modifiers_for(drm_format: u32) -> Vec<u64> {
     if linear_only || drm_format == 0 {
         return vec![u64::from(DrmModifier::Linear)];
     }
-    let node = super::probe_display_gpu_render_node()
-        .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
+    let node =
+        super::probe_display_gpu_render_node().unwrap_or_else(|| "/dev/dri/renderD128".to_string());
     let mut probed = super::gbm_probe::probe_modifiers(&node, drm_format);
     // Ensure LINEAR is first so it is also the `default` we fixate to when
     // the compositor accepts multiple alternatives.
@@ -311,18 +315,13 @@ fn build_format_object(
 
     if prefer_dmabuf {
         let modifier_flags = PropertyFlags::from_bits_retain(
-            pw::spa::sys::SPA_POD_PROP_FLAG_MANDATORY
-                | pw::spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
+            pw::spa::sys::SPA_POD_PROP_FLAG_MANDATORY | pw::spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
         );
         let drm = drm_format_for(format);
         let mods = modifiers_for(drm);
         // `default` should match `alternatives[0]` — the compositor picks one.
         let default_mod = *mods.first().unwrap_or(&u64::from(DrmModifier::Linear));
-        let alternatives: Vec<i64> = mods
-            .iter()
-            .copied()
-            .map(u64_to_spa_long_bits)
-            .collect();
+        let alternatives: Vec<i64> = mods.iter().copied().map(u64_to_spa_long_bits).collect();
         properties.push(Property {
             key: pw::spa::param::format::FormatProperties::VideoModifier.as_raw(),
             flags: modifier_flags,
@@ -419,7 +418,9 @@ fn build_stream_param_buffers(
             Property {
                 key: pw::spa::sys::SPA_PARAM_META_size,
                 flags: PropertyFlags::empty(),
-                value: Value::Int((std::mem::size_of::<pw::spa::sys::spa_meta_region>() * 16) as i32),
+                value: Value::Int(
+                    (std::mem::size_of::<pw::spa::sys::spa_meta_region>() * 16) as i32,
+                ),
             },
         ],
     };
@@ -495,9 +496,8 @@ fn duplicate_dmabuf_planes(
         if data.chunk.is_null() {
             return Err("PipeWire DmaBuf plane is missing a chunk descriptor".into());
         }
-        let raw_fd = i32::try_from(data.fd).map_err(|_| {
-            format!("PipeWire DmaBuf fd {} does not fit into a RawFd", data.fd)
-        })?;
+        let raw_fd = i32::try_from(data.fd)
+            .map_err(|_| format!("PipeWire DmaBuf fd {} does not fit into a RawFd", data.fd))?;
         let fd = dup(raw_fd)
             .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
             .map_err(|e| format!("dup dmabuf fd: {e}"))?;
@@ -752,8 +752,7 @@ struct PortalSession {
 
 impl PortalSession {
     fn take_pw_fd(&mut self) -> OwnedFd {
-        self
-            .pw_fd
+        self.pw_fd
             .take()
             .expect("portal session PipeWire fd already taken")
     }
@@ -799,7 +798,10 @@ impl RemoteDesktopPortalSession {
         stream_info: PortalStreamInfo,
     ) -> Self {
         Self {
-            state: Mutex::new(RemoteDesktopPortalState { runtime, connection }),
+            state: Mutex::new(RemoteDesktopPortalState {
+                runtime,
+                connection,
+            }),
             session_path,
             stream_node_id: stream_info.node_id,
             logical_width: Mutex::new(stream_info.logical_width),
@@ -835,11 +837,7 @@ impl RemoteDesktopPortalSession {
 
     fn with_remote_desktop_proxy<R>(
         &self,
-        f: impl FnOnce(
-            &tokio::runtime::Runtime,
-            &zbus::Connection,
-            &str,
-        ) -> Result<R, String>,
+        f: impl FnOnce(&tokio::runtime::Runtime, &zbus::Connection, &str) -> Result<R, String>,
     ) -> Result<R, String> {
         let state = self.state.lock().unwrap();
         f(&state.runtime, &state.connection, &self.session_path)
@@ -875,10 +873,7 @@ impl RemoteDesktopPortalSession {
                     let session = zvariant::ObjectPath::try_from(session_path)
                         .map_err(|e| format!("session path: {e}"))?;
                     let _: () = proxy
-                        .call(
-                            "NotifyPointerMotion",
-                            &(&session, opts, dx, dy),
-                        )
+                        .call("NotifyPointerMotion", &(&session, opts, dx, dy))
                         .await
                         .map_err(|e| format!("NotifyPointerMotion: {e}"))?;
                     Ok(())
@@ -971,7 +966,12 @@ impl RemoteDesktopPortalSession {
                 let _: () = proxy
                     .call(
                         "NotifyPointerButton",
-                        &(&session, opts, button as i32, if pressed { 1u32 } else { 0u32 }),
+                        &(
+                            &session,
+                            opts,
+                            button as i32,
+                            if pressed { 1u32 } else { 0u32 },
+                        ),
                     )
                     .await
                     .map_err(|e| format!("NotifyPointerButton: {e}"))?;
@@ -1033,10 +1033,10 @@ impl RemoteDesktopPortalSession {
             pending.0 += i32::from(delta_x);
             pending.1 += i32::from(delta_y);
             let step_units = i32::from(MOUSE_WHEEL_STEP_UNITS);
-            let step_x = (pending.0 / step_units)
-                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-            let step_y = (pending.1 / step_units)
-                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let step_x =
+                (pending.0 / step_units).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let step_y =
+                (pending.1 / step_units).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
             pending.0 -= i32::from(step_x) * step_units;
             pending.1 -= i32::from(step_y) * step_units;
             (step_x, step_y)
@@ -1070,7 +1070,12 @@ impl RemoteDesktopPortalSession {
                 let _: () = proxy
                     .call(
                         "NotifyKeyboardKeycode",
-                        &(&session, opts, keycode as i32, if pressed { 1u32 } else { 0u32 }),
+                        &(
+                            &session,
+                            opts,
+                            keycode as i32,
+                            if pressed { 1u32 } else { 0u32 },
+                        ),
                     )
                     .await
                     .map_err(|e| format!("NotifyKeyboardKeycode: {e}"))?;
@@ -1126,7 +1131,9 @@ impl Drop for PortalSession {
 impl Drop for RemoteDesktopPortalSession {
     fn drop(&mut self) {
         match self.state.get_mut() {
-            Ok(state) => close_portal_session(&state.runtime, &state.connection, &self.session_path),
+            Ok(state) => {
+                close_portal_session(&state.runtime, &state.connection, &self.session_path)
+            }
             Err(poisoned) => {
                 let state = poisoned.into_inner();
                 close_portal_session(&state.runtime, &state.connection, &self.session_path);
@@ -1633,7 +1640,10 @@ fn request_screencast() -> Result<PortalSession, String> {
             .ok_or_else(|| "No streams in Start response".to_string())
             .and_then(extract_first_stream_info)?;
 
-        println!("[capture] Portal granted PipeWire node {}", stream_info.node_id);
+        println!(
+            "[capture] Portal granted PipeWire node {}",
+            stream_info.node_id
+        );
 
         // ---- 4. OpenPipeWireRemote ----
         let empty_opts: HashMap<&str, Value<'_>> = HashMap::new();
@@ -1686,11 +1696,11 @@ fn try_extract_string(v: &zvariant::OwnedValue) -> Option<String> {
 fn extract_first_stream_info(
     streams_val: &zvariant::OwnedValue,
 ) -> Result<PortalStreamInfo, String> {
-    let value = zvariant::Value::try_from(streams_val).map_err(|e| format!("streams value: {e}"))?;
-    let streams: Vec<(u32, std::collections::HashMap<String, zvariant::OwnedValue>)> =
-        value
-            .try_into()
-            .map_err(|e| format!("streams value: {e}"))?;
+    let value =
+        zvariant::Value::try_from(streams_val).map_err(|e| format!("streams value: {e}"))?;
+    let streams: Vec<(u32, std::collections::HashMap<String, zvariant::OwnedValue>)> = value
+        .try_into()
+        .map_err(|e| format!("streams value: {e}"))?;
 
     for (node_id, props) in streams {
         let mut logical_width = 0.0;
@@ -1736,7 +1746,9 @@ impl CaptureBackend for PipeWireCapture {
                 None
             }
         };
-        let session = if let Some((remote_session, pw_fd, node_id, logical_width, logical_height)) = remote_desktop {
+        let session = if let Some((remote_session, pw_fd, node_id, logical_width, logical_height)) =
+            remote_desktop
+        {
             set_active_remote_desktop_session(Arc::clone(&remote_session));
             EitherPortalSession::RemoteDesktop {
                 session: remote_session,
@@ -1754,25 +1766,46 @@ impl CaptureBackend for PipeWireCapture {
         let (quit_tx, quit_rx) = pw::channel::channel();
 
         let handle = thread::spawn(move || {
-            let (mut screen_session, pw_fd, node_id, logical_width, logical_height, remote_session) = match session {
-                EitherPortalSession::ScreenCast(mut session) => {
-                    let pw_fd = session.take_pw_fd();
-                    let node_id = session.node_id;
-                    let logical_width = session.logical_width;
-                    let logical_height = session.logical_height;
-                    (Some(session), pw_fd, node_id, logical_width, logical_height, None)
-                }
-                EitherPortalSession::RemoteDesktop {
-                    session,
-                    pw_fd,
-                    node_id,
-                    logical_width,
-                    logical_height,
-                } => (None, pw_fd, node_id, logical_width, logical_height, Some(session)),
-            };
-            if let Err(e) =
-                run_pipewire_stream(pw_fd, node_id, logical_width, logical_height, tx, running, quit_rx)
-            {
+            let (mut screen_session, pw_fd, node_id, logical_width, logical_height, remote_session) =
+                match session {
+                    EitherPortalSession::ScreenCast(mut session) => {
+                        let pw_fd = session.take_pw_fd();
+                        let node_id = session.node_id;
+                        let logical_width = session.logical_width;
+                        let logical_height = session.logical_height;
+                        (
+                            Some(session),
+                            pw_fd,
+                            node_id,
+                            logical_width,
+                            logical_height,
+                            None,
+                        )
+                    }
+                    EitherPortalSession::RemoteDesktop {
+                        session,
+                        pw_fd,
+                        node_id,
+                        logical_width,
+                        logical_height,
+                    } => (
+                        None,
+                        pw_fd,
+                        node_id,
+                        logical_width,
+                        logical_height,
+                        Some(session),
+                    ),
+                };
+            if let Err(e) = run_pipewire_stream(
+                pw_fd,
+                node_id,
+                logical_width,
+                logical_height,
+                tx,
+                running,
+                quit_rx,
+            ) {
                 eprintln!("[capture] PipeWire stream error: {e}");
             }
             drop(screen_session.take());

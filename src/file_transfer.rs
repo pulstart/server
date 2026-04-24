@@ -83,10 +83,7 @@ pub enum FtInbound {
         file_name: String,
     },
     /// A remote peer accepted/rejected our offer.
-    AcceptReceived {
-        transfer_id: u32,
-        accepted: bool,
-    },
+    AcceptReceived { transfer_id: u32, accepted: bool },
     /// A chunk of file data from the remote peer.
     ChunkReceived {
         transfer_id: u32,
@@ -100,18 +97,14 @@ pub enum FtInbound {
         sha256: [u8; 32],
     },
     /// Remote peer cancelled.
-    CancelReceived {
-        transfer_id: u32,
-    },
+    CancelReceived { transfer_id: u32 },
     /// Remote peer acknowledged progress.
     ProgressReceived {
         transfer_id: u32,
         chunks_received: u32,
     },
     /// Local side wants to send a file.
-    SendFile {
-        path: PathBuf,
-    },
+    SendFile { path: PathBuf },
 }
 
 /// Messages from the file transfer manager to the control loop for sending.
@@ -172,7 +165,15 @@ impl FileTransferManager {
         let stop_flag = Arc::clone(&stop);
 
         let thread = thread::spawn(move || {
-            run_manager(mode, inbound_rx, outbound_tx, state_clone, stop_flag, suppressed_paths, auto_accept);
+            run_manager(
+                mode,
+                inbound_rx,
+                outbound_tx,
+                state_clone,
+                stop_flag,
+                suppressed_paths,
+                auto_accept,
+            );
         });
 
         Self {
@@ -388,7 +389,11 @@ fn run_manager(
             let mut offers_to_accept: Vec<(u32, u64, String)> = Vec::new();
             for id in &accepted_ids {
                 if let Some(offer) = state.pending_offers.iter().find(|o| o.transfer_id == *id) {
-                    offers_to_accept.push((offer.transfer_id, offer.file_size, offer.file_name.clone()));
+                    offers_to_accept.push((
+                        offer.transfer_id,
+                        offer.file_size,
+                        offer.file_name.clone(),
+                    ));
                 }
             }
             for id in &accepted_ids {
@@ -413,11 +418,10 @@ fn run_manager(
         {
             let mut state = shared_state.lock().unwrap();
             state.entries.retain(|e| match e.status {
-                TransferStatus::Completed | TransferStatus::Cancelled | TransferStatus::Failed => {
-                    e.completed_at
-                        .map(|t| t.elapsed().as_secs() < 10)
-                        .unwrap_or(true)
-                }
+                TransferStatus::Completed | TransferStatus::Cancelled | TransferStatus::Failed => e
+                    .completed_at
+                    .map(|t| t.elapsed().as_secs() < 10)
+                    .unwrap_or(true),
                 _ => true,
             });
         }
@@ -526,12 +530,15 @@ fn handle_offer_received(
 
     let safe_name = sanitize_filename(file_name).unwrap_or_else(|| "received_file".to_string());
 
-    add_pending_offer(shared_state, PendingOffer {
-        transfer_id,
-        file_name: safe_name.clone(),
-        file_size,
-        received_at: Instant::now(),
-    });
+    add_pending_offer(
+        shared_state,
+        PendingOffer {
+            transfer_id,
+            file_name: safe_name.clone(),
+            file_size,
+            received_at: Instant::now(),
+        },
+    );
 
     eprintln!(
         "[file-transfer] offer pending: {} ({}) id={} — waiting for paste",
@@ -795,10 +802,7 @@ fn pump_send_chunks(
         state.info.status = TransferStatus::Completed;
         update_shared_entry_completed(shared_state, &state.info);
 
-        eprintln!(
-            "[file-transfer] sent complete: {}",
-            state.info.file_name
-        );
+        eprintln!("[file-transfer] sent complete: {}", state.info.file_name);
     }
 }
 
@@ -934,10 +938,7 @@ pub fn set_clipboard_file(path: &Path) {
 #[cfg(target_os = "macos")]
 pub fn set_clipboard_file(path: &Path) {
     // Use osascript to set file on clipboard.
-    let script = format!(
-        "set the clipboard to (POSIX file \"{}\")",
-        path.display()
-    );
+    let script = format!("set the clipboard to (POSIX file \"{}\")", path.display());
     let _ = std::process::Command::new("osascript")
         .arg("-e")
         .arg(&script)
@@ -951,9 +952,7 @@ pub fn set_clipboard_file(path: &Path) {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{
-        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
-    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
     const CF_HDROP: u32 = 15;
 

@@ -193,12 +193,7 @@ mod platform {
             let sample_rate = config.sample_rate;
             let samples_per_frame = config.total_samples_per_frame();
             let fragment_size = (samples_per_frame * std::mem::size_of::<f32>()) as u32;
-            let pa = PaSimple::new(
-                device.as_deref(),
-                channels,
-                sample_rate,
-                fragment_size,
-            )?;
+            let pa = PaSimple::new(device.as_deref(), channels, sample_rate, fragment_size)?;
 
             self.running.store(true, Ordering::SeqCst);
             let running = Arc::clone(&self.running);
@@ -215,10 +210,7 @@ mod platform {
                     match pa.read_f32(&mut buf) {
                         Ok(()) => {
                             let samples = AudioSamples {
-                                data: std::mem::replace(
-                                    &mut buf,
-                                    vec![0.0f32; samples_per_frame],
-                                ),
+                                data: std::mem::replace(&mut buf, vec![0.0f32; samples_per_frame]),
                                 channels: channels as u32,
                                 sample_rate,
                             };
@@ -342,7 +334,9 @@ mod platform {
             let mut stream = SCStream::new_with_delegate(
                 &filter,
                 &stream_config,
-                ErrorHandler::new(|err| eprintln!("[audio] ScreenCaptureKit stream error: {err:?}")),
+                ErrorHandler::new(|err| {
+                    eprintln!("[audio] ScreenCaptureKit stream error: {err:?}")
+                }),
             );
             stream.add_output_handler(
                 AudioOutputHandler {
@@ -355,9 +349,9 @@ mod platform {
                 },
                 SCStreamOutputType::Audio,
             );
-            stream
-                .start_capture()
-                .map_err(|err| format!("Failed to start ScreenCaptureKit audio capture: {err:?}"))?;
+            stream.start_capture().map_err(|err| {
+                format!("Failed to start ScreenCaptureKit audio capture: {err:?}")
+            })?;
 
             println!(
                 "[audio] ScreenCaptureKit audio capture started ({}ch, {}Hz, frame={} samples)",
@@ -390,21 +384,26 @@ mod platform {
     }
 
     impl SCStreamOutputTrait for AudioOutputHandler {
-        fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType) {
+        fn did_output_sample_buffer(
+            &self,
+            sample_buffer: CMSampleBuffer,
+            of_type: SCStreamOutputType,
+        ) {
             if of_type != SCStreamOutputType::Audio {
                 return;
             }
 
-            let mut decoded = match decode_audio_samples(&sample_buffer, self.sample_rate, self.channels) {
-                Ok(decoded) => decoded,
-                Err(err) => {
-                    let log_idx = self.format_errors.fetch_add(1, Ordering::Relaxed);
-                    if log_idx < MAX_AUDIO_FORMAT_ERRORS {
-                        eprintln!("[audio] ScreenCaptureKit audio sample dropped: {err}");
+            let mut decoded =
+                match decode_audio_samples(&sample_buffer, self.sample_rate, self.channels) {
+                    Ok(decoded) => decoded,
+                    Err(err) => {
+                        let log_idx = self.format_errors.fetch_add(1, Ordering::Relaxed);
+                        if log_idx < MAX_AUDIO_FORMAT_ERRORS {
+                            eprintln!("[audio] ScreenCaptureKit audio sample dropped: {err}");
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
             if decoded.is_empty() {
                 return;
             }
@@ -736,7 +735,8 @@ mod platform {
                                 config.sample_rate,
                                 config.total_samples_per_frame()
                             );
-                            if let Err(err) = run_session_loop(&mut session, &config, &tx, &running) {
+                            if let Err(err) = run_session_loop(&mut session, &config, &tx, &running)
+                            {
                                 eprintln!("[audio] WASAPI capture error: {err}");
                             }
                         }
@@ -901,9 +901,9 @@ mod platform {
         fn read_available(&mut self, pending: &mut Vec<f32>) -> Result<(), String> {
             loop {
                 let packet_frames = unsafe {
-                    self.capture_client
-                        .GetNextPacketSize()
-                        .map_err(|err| format!("IAudioCaptureClient::GetNextPacketSize failed: {err}"))?
+                    self.capture_client.GetNextPacketSize().map_err(|err| {
+                        format!("IAudioCaptureClient::GetNextPacketSize failed: {err}")
+                    })?
                 };
                 if packet_frames == 0 {
                     break;
@@ -914,13 +914,7 @@ mod platform {
                 let mut flags = 0u32;
                 unsafe {
                     self.capture_client
-                        .GetBuffer(
-                            &mut data_ptr,
-                            &mut frames,
-                            &mut flags,
-                            None,
-                            None,
-                        )
+                        .GetBuffer(&mut data_ptr, &mut frames, &mut flags, None, None)
                         .map_err(|err| format!("IAudioCaptureClient::GetBuffer failed: {err}"))?;
                 }
 
@@ -928,14 +922,15 @@ mod platform {
                 if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data_ptr.is_null() {
                     pending.extend(std::iter::repeat(0.0f32).take(sample_count));
                 } else {
-                    let src = unsafe { std::slice::from_raw_parts(data_ptr as *const f32, sample_count) };
+                    let src =
+                        unsafe { std::slice::from_raw_parts(data_ptr as *const f32, sample_count) };
                     pending.extend_from_slice(src);
                 }
 
                 unsafe {
-                    self.capture_client
-                        .ReleaseBuffer(frames)
-                        .map_err(|err| format!("IAudioCaptureClient::ReleaseBuffer failed: {err}"))?;
+                    self.capture_client.ReleaseBuffer(frames).map_err(|err| {
+                        format!("IAudioCaptureClient::ReleaseBuffer failed: {err}")
+                    })?;
                 }
             }
 

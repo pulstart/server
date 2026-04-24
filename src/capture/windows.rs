@@ -20,9 +20,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
-    IDXGIOutputDuplication, IDXGIResource,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetObjectW,
@@ -30,8 +30,8 @@ use windows::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics, HCURSOR, ICONINFO, CURSORINFO,
-    CURSOR_SHOWING, DI_NORMAL, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING,
+    DI_NORMAL, HCURSOR, ICONINFO, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,
 };
 
@@ -82,16 +82,18 @@ impl PlatformCapture {
 impl CaptureBackend for PlatformCapture {
     fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
         match &mut self.backend {
-            Backend::Dxgi(capture) => match capture.start(tx.clone()) {
-                Ok(()) => Ok(()),
-                Err(dxgi_err) => {
-                    eprintln!("[capture] DXGI duplication failed ({dxgi_err}), falling back to GDI...");
-                    let mut gdi = GdiCapture::new();
-                    gdi.start(tx)?;
-                    self.backend = Backend::Gdi(gdi);
-                    Ok(())
+            Backend::Dxgi(capture) => {
+                match capture.start(tx.clone()) {
+                    Ok(()) => Ok(()),
+                    Err(dxgi_err) => {
+                        eprintln!("[capture] DXGI duplication failed ({dxgi_err}), falling back to GDI...");
+                        let mut gdi = GdiCapture::new();
+                        gdi.start(tx)?;
+                        self.backend = Backend::Gdi(gdi);
+                        Ok(())
+                    }
                 }
-            },
+            }
             Backend::Gdi(capture) => capture.start(tx),
         }
     }
@@ -138,7 +140,9 @@ impl CaptureBackend for DxgiCapture {
         let session = DxgiCaptureSession::new()?;
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
-        self.handle = Some(thread::spawn(move || run_dxgi_capture_loop(session, tx, running)));
+        self.handle = Some(thread::spawn(move || {
+            run_dxgi_capture_loop(session, tx, running)
+        }));
         Ok(())
     }
 
@@ -173,7 +177,9 @@ impl CaptureBackend for GdiCapture {
         let session = GdiCaptureSession::new()?;
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
-        self.handle = Some(thread::spawn(move || run_gdi_capture_loop(session, tx, running)));
+        self.handle = Some(thread::spawn(move || {
+            run_gdi_capture_loop(session, tx, running)
+        }));
         Ok(())
     }
 
@@ -312,10 +318,7 @@ impl DxgiCaptureSession {
 
         println!(
             "[capture] Using DXGI duplication ({}x{} @ {},{})",
-            width,
-            height,
-            desc.DesktopCoordinates.left,
-            desc.DesktopCoordinates.top
+            width, height, desc.DesktopCoordinates.left, desc.DesktopCoordinates.top
         );
 
         Ok(Self {
@@ -333,14 +336,16 @@ impl DxgiCaptureSession {
     fn try_acquire_texture(&mut self) -> Result<Option<Arc<D3D11FrameTexture>>, String> {
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        let acquired =
-            unsafe { self.duplication.AcquireNextFrame(0, &mut frame_info, &mut resource) };
+        let acquired = unsafe {
+            self.duplication
+                .AcquireNextFrame(0, &mut frame_info, &mut resource)
+        };
 
         match acquired {
             Ok(()) => {
                 let copy_result = (|| -> Result<Option<Arc<D3D11FrameTexture>>, String> {
-                    let resource =
-                        resource.ok_or_else(|| "AcquireNextFrame returned no resource".to_string())?;
+                    let resource = resource
+                        .ok_or_else(|| "AcquireNextFrame returned no resource".to_string())?;
                     let source = resource.cast::<ID3D11Texture2D>().map_err(|err| {
                         format!("IDXGIResource->ID3D11Texture2D cast failed: {err}")
                     })?;
@@ -576,8 +581,18 @@ impl CursorCapture {
                         .saturating_mul(height as usize)
                         .saturating_mul(4);
                     std::ptr::write_bytes(bits.cast::<u8>(), 0, len);
-                    DrawIconEx(cursor_dc, 0, 0, cursor.into(), width, height, 0, None, DI_NORMAL)
-                        .map_err(|err| format!("DrawIconEx for cursor failed: {err}"))?;
+                    DrawIconEx(
+                        cursor_dc,
+                        0,
+                        0,
+                        cursor.into(),
+                        width,
+                        height,
+                        0,
+                        None,
+                        DI_NORMAL,
+                    )
+                    .map_err(|err| format!("DrawIconEx for cursor failed: {err}"))?;
 
                     let pixels = std::slice::from_raw_parts(bits as *const u8, len).to_vec();
                     let _ = SelectObject(cursor_dc, old_bitmap);
@@ -791,9 +806,8 @@ impl Drop for GdiCaptureSession {
 }
 
 fn select_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC), String> {
-    let factory: IDXGIFactory1 = unsafe {
-        CreateDXGIFactory1().map_err(|err| format!("CreateDXGIFactory1 failed: {err}"))?
-    };
+    let factory: IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1().map_err(|err| format!("CreateDXGIFactory1 failed: {err}"))? };
 
     let mut fallback: Option<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC)> = None;
     let mut adapter_index = 0;
@@ -807,7 +821,11 @@ fn select_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC), St
 
         let (adapter_name, vendor_id) = unsafe { adapter.GetDesc() }
             .map(|d| {
-                let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                let end = d
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(d.Description.len());
                 (String::from_utf16_lossy(&d.Description[..end]), d.VendorId)
             })
             .unwrap_or_default();
@@ -847,13 +865,19 @@ fn select_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC), St
             }
         }
         if !adapter_has_output {
-            println!("[capture] Adapter {adapter_name} (vendor: 0x{vendor_id:04x}) — no display output");
+            println!(
+                "[capture] Adapter {adapter_name} (vendor: 0x{vendor_id:04x}) — no display output"
+            );
         }
     }
 
     if let Some((ref adapter, _, _)) = fallback {
         if let Ok(d) = unsafe { adapter.GetDesc() } {
-            let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+            let end = d
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(d.Description.len());
             let name = String::from_utf16_lossy(&d.Description[..end]);
             println!("[capture] Selected adapter: {name} — fallback (no primary at 0,0)");
         }
@@ -884,8 +908,7 @@ fn create_device_for_output(
     }
 
     let device = device.ok_or_else(|| "D3D11CreateDevice returned null device".to_string())?;
-    let context =
-        context.ok_or_else(|| "D3D11CreateDevice returned null context".to_string())?;
+    let context = context.ok_or_else(|| "D3D11CreateDevice returned null context".to_string())?;
 
     if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
         unsafe {
@@ -893,7 +916,10 @@ fn create_device_for_output(
         }
     }
 
-    println!("[capture] DXGI device created at feature level 0x{:x}", feature_level.0);
+    println!(
+        "[capture] DXGI device created at feature level 0x{:x}",
+        feature_level.0
+    );
     Ok((device, context))
 }
 

@@ -65,9 +65,9 @@ fn config_path() -> Option<PathBuf> {
         return Some(dir.join(CONFIG_FILENAME));
     }
     // Fall back to exe directory.
-    std::env::current_exe().ok().and_then(|exe| {
-        exe.parent().map(|dir| dir.join(CONFIG_FILENAME))
-    })
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(CONFIG_FILENAME)))
 }
 
 fn generate_token() -> String {
@@ -266,7 +266,10 @@ impl ServerControl {
 
     pub fn connected_clients(&self) -> Vec<ConnectedClientSnapshot> {
         let clients = self.clients.lock().unwrap();
-        clients.values().map(|entry| entry.snapshot.clone()).collect()
+        clients
+            .values()
+            .map(|entry| entry.snapshot.clone())
+            .collect()
     }
 
     pub fn update_state(&self) -> UpdateStateSnapshot {
@@ -274,10 +277,7 @@ impl ServerControl {
     }
 
     pub fn start_automatic_update_checks(self: &Arc<Self>) {
-        if self
-            .auto_update_checks_started
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.auto_update_checks_started.swap(true, Ordering::SeqCst) {
             return;
         }
         if matches!(self.update_state(), UpdateStateSnapshot::Unsupported(_)) {
@@ -309,10 +309,7 @@ impl ServerControl {
         if matches!(self.update_state(), UpdateStateSnapshot::Unsupported(_)) {
             return;
         }
-        if self
-            .update_task_running
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.update_task_running.swap(true, Ordering::SeqCst) {
             return;
         }
 
@@ -320,26 +317,21 @@ impl ServerControl {
         let control = Arc::clone(self);
         thread::spawn(move || {
             let next_state = match updater::check_latest_release() {
-                Ok(updater::CheckOutcome::UpToDate { latest_version: version }) => {
-                    UpdateStateSnapshot::UpToDate { version }
-                }
+                Ok(updater::CheckOutcome::UpToDate {
+                    latest_version: version,
+                }) => UpdateStateSnapshot::UpToDate { version },
                 Ok(updater::CheckOutcome::UpdateAvailable(release)) => {
                     UpdateStateSnapshot::UpdateAvailable(release)
                 }
                 Err(err) => UpdateStateSnapshot::Error(err),
             };
             control.set_update_state(next_state);
-            control
-                .update_task_running
-                .store(false, Ordering::SeqCst);
+            control.update_task_running.store(false, Ordering::SeqCst);
         });
     }
 
     pub fn begin_update_install(self: &Arc<Self>) {
-        if self
-            .update_task_running
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.update_task_running.swap(true, Ordering::SeqCst) {
             return;
         }
 
@@ -364,9 +356,7 @@ impl ServerControl {
             }
             Err(err) => {
                 control.set_update_state(UpdateStateSnapshot::Error(err));
-                control
-                    .update_task_running
-                    .store(false, Ordering::SeqCst);
+                control.update_task_running.store(false, Ordering::SeqCst);
             }
         });
     }

@@ -288,7 +288,9 @@ impl VTEncoder {
             CFRelease(bitrate as CFTypeRef);
         }
         if status != 0 {
-            return Err(format!("VTSessionSetProperty(AverageBitRate) failed: {status}"));
+            return Err(format!(
+                "VTSessionSetProperty(AverageBitRate) failed: {status}"
+            ));
         }
         Ok(())
     }

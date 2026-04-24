@@ -57,17 +57,13 @@ impl GbmLib {
             .find_map(|n| unsafe { Library::new(n).ok() })?;
         unsafe {
             let create_device = *lib.get::<GbmCreateDevice>(b"gbm_create_device\0").ok()?;
-            let device_destroy = *lib
-                .get::<GbmDeviceDestroy>(b"gbm_device_destroy\0")
-                .ok()?;
+            let device_destroy = *lib.get::<GbmDeviceDestroy>(b"gbm_device_destroy\0").ok()?;
             let bo_create = *lib.get::<GbmBoCreate>(b"gbm_bo_create\0").ok()?;
             let bo_create_with_modifiers = lib
                 .get::<GbmBoCreateWithModifiers>(b"gbm_bo_create_with_modifiers\0")
                 .ok()
                 .map(|s| *s);
-            let bo_get_modifier = *lib
-                .get::<GbmBoGetModifier>(b"gbm_bo_get_modifier\0")
-                .ok()?;
+            let bo_get_modifier = *lib.get::<GbmBoGetModifier>(b"gbm_bo_get_modifier\0").ok()?;
             let bo_destroy = *lib.get::<GbmBoDestroy>(b"gbm_bo_destroy\0").ok()?;
             Some(Self {
                 _lib: lib,

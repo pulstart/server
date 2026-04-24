@@ -210,7 +210,10 @@ impl ClientRateController {
                 && self.recommended_kbps < self.max_kbps
             {
                 let step = self.increase_step_kbps();
-                let next = self.recommended_kbps.saturating_add(step).min(self.max_kbps);
+                let next = self
+                    .recommended_kbps
+                    .saturating_add(step)
+                    .min(self.max_kbps);
                 if next > self.recommended_kbps {
                     self.pending_probe_from_kbps = Some(self.recommended_kbps);
                     self.pending_probe_started_at = Some(now);
@@ -234,7 +237,8 @@ impl ClientRateController {
     }
 
     fn probe_failed_recently(&self, now: Instant) -> bool {
-        if self.pending_probe_started_at
+        if self
+            .pending_probe_started_at
             .map(|started| now.duration_since(started) <= Self::PROBE_FAILURE_WINDOW)
             .unwrap_or(false)
         {
@@ -257,7 +261,7 @@ impl ClientRateController {
         self.probe_failures = self.probe_failures.saturating_add(1);
         let backoff_secs = (Self::BASE_PROBE_BACKOFF.as_secs()
             * (1u64 << self.probe_failures.saturating_sub(1).min(3)))
-            .min(Self::MAX_PROBE_BACKOFF.as_secs());
+        .min(Self::MAX_PROBE_BACKOFF.as_secs());
         self.probe_backoff_until = now + Duration::from_secs(backoff_secs);
         self.clear_pending_probe();
     }
@@ -304,14 +308,17 @@ mod tests {
     fn controller_reduces_bitrate_on_heavy_loss() {
         let start = Instant::now();
         let mut controller = ClientRateController::from_limits_at(2_000, 8_000, 8_000, start);
-        let next = controller.apply_feedback_at(TransportFeedback {
-            interval_ms: 500,
-            received_packets: 200,
-            lost_packets: 40,
-            late_packets: 0,
-            completed_frames: 50,
-            dropped_frames: 8,
-        }, start + Duration::from_millis(500));
+        let next = controller.apply_feedback_at(
+            TransportFeedback {
+                interval_ms: 500,
+                received_packets: 200,
+                lost_packets: 40,
+                late_packets: 0,
+                completed_frames: 50,
+                dropped_frames: 8,
+            },
+            start + Duration::from_millis(500),
+        );
         assert!(next < 8_000);
         assert!(next >= 2_000);
     }
@@ -409,14 +416,17 @@ mod tests {
         let start = Instant::now();
         let mut controller = ClientRateController::from_limits_at(2_000, 8_000, 4_000, start);
 
-        let lowered = controller.apply_feedback_at(TransportFeedback {
-            interval_ms: 500,
-            received_packets: 200,
-            lost_packets: 30,
-            late_packets: 0,
-            completed_frames: 45,
-            dropped_frames: 5,
-        }, start + Duration::from_millis(500));
+        let lowered = controller.apply_feedback_at(
+            TransportFeedback {
+                interval_ms: 500,
+                received_packets: 200,
+                lost_packets: 30,
+                late_packets: 0,
+                completed_frames: 45,
+                dropped_frames: 5,
+            },
+            start + Duration::from_millis(500),
+        );
         assert!(lowered < 4_000);
 
         let clean = TransportFeedback {

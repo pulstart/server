@@ -422,9 +422,7 @@ impl VaapiEncoder {
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
         match &frame.data {
             FrameData::DmaBuf {
-                planes,
-                drm_format,
-                ..
+                planes, drm_format, ..
             } => {
                 // Try zero-copy DMA-BUF import unless we've hit 3+ consecutive failures
                 if self.dmabuf_fail_count < 3 {
@@ -636,8 +634,7 @@ impl VaapiEncoder {
                 let src_row =
                     unsafe { std::slice::from_raw_parts(src.add(row * pitch), row_bytes) };
                 let dst_start = row * dst_stride;
-                bgra_frame.data_mut(0)[dst_start..dst_start + row_bytes]
-                    .copy_from_slice(src_row);
+                bgra_frame.data_mut(0)[dst_start..dst_start + row_bytes].copy_from_slice(src_row);
             }
         }
 

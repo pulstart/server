@@ -85,7 +85,8 @@ impl ApiTunnelState {
     }
 
     pub fn update_pending_client_punch_nonce(&self, nonce: u64) {
-        self.pending_client_punch_nonce.fetch_max(nonce, Ordering::Relaxed);
+        self.pending_client_punch_nonce
+            .fetch_max(nonce, Ordering::Relaxed);
     }
 
     pub fn is_punch_session_active(&self) -> bool {
@@ -107,7 +108,8 @@ impl ApiTunnelState {
 
         let mut socket_guard = self.punch_socket.lock().unwrap();
         if socket_guard.is_none() {
-            let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind punch socket: {e}"))?;
+            let socket =
+                UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind punch socket: {e}"))?;
             *socket_guard = Some(socket);
         }
         let socket = socket_guard
@@ -326,9 +328,8 @@ pub fn start_api_registration(
                     Ok(resp) => {
                         if let Ok(text) = resp.into_string() {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                tunnel_state.update_shared_key_from_partner_b64(
-                                    v["partner_key"].as_str(),
-                                );
+                                tunnel_state
+                                    .update_shared_key_from_partner_b64(v["partner_key"].as_str());
                             } else {
                                 tunnel_state.set_shared_key(None);
                             }

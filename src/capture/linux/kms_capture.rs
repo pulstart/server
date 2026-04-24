@@ -3,7 +3,7 @@ use super::target_frame_interval;
 use crossbeam_channel::{Sender, TrySendError};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -429,9 +429,7 @@ impl CaptureBackend for KmsCapture {
             // sleep-based loop.
             let mut pacer = TimerFdPacer::new(target_interval).ok();
             if pacer.is_none() {
-                eprintln!(
-                    "[kms] timerfd unavailable; falling back to sleep-based pacer"
-                );
+                eprintln!("[kms] timerfd unavailable; falling back to sleep-based pacer");
             }
 
             while running.load(Ordering::SeqCst) {
@@ -448,20 +446,18 @@ impl CaptureBackend for KmsCapture {
                 };
 
                 match capture_frame(&card, current_plane, cursor_handle) {
-                    Ok(frame) => {
-                        match tx.try_send(frame) {
-                            Ok(()) => {}
-                            Err(TrySendError::Full(_)) => {
-                                if trace && dropped_frames < 8 {
-                                    eprintln!(
+                    Ok(frame) => match tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            if trace && dropped_frames < 8 {
+                                eprintln!(
                                         "[trace][kms] dropped captured frame because capture channel is full"
                                     );
-                                }
-                                dropped_frames = dropped_frames.saturating_add(1);
                             }
-                            Err(TrySendError::Disconnected(_)) => break,
+                            dropped_frames = dropped_frames.saturating_add(1);
                         }
-                    }
+                        Err(TrySendError::Disconnected(_)) => break,
+                    },
                     Err(e) => {
                         eprintln!("[kms] capture_frame error: {e}");
                         thread::sleep(Duration::from_millis(16));
@@ -509,12 +505,7 @@ struct TimerFdPacer {
 
 impl TimerFdPacer {
     fn new(interval: Duration) -> io::Result<Self> {
-        let raw = unsafe {
-            libc::timerfd_create(
-                libc::CLOCK_MONOTONIC,
-                libc::TFD_CLOEXEC,
-            )
-        };
+        let raw = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -524,9 +515,7 @@ impl TimerFdPacer {
             it_interval: duration_to_timespec(interval),
             it_value: duration_to_timespec(interval),
         };
-        let rc = unsafe {
-            libc::timerfd_settime(fd.as_raw_fd(), 0, &spec, std::ptr::null_mut())
-        };
+        let rc = unsafe { libc::timerfd_settime(fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
