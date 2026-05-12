@@ -2993,8 +2993,24 @@ fn handle_punched_client(
     let _ = punched.set_nonblocking(false);
     let _ = punched.set_read_timeout(Some(Duration::from_millis(50)));
 
+    // UDP has no FIN; if the peer vanishes (crash, network loss, normal disconnect)
+    // nothing tells us. Without this timeout the loop sits here forever holding
+    // `punch_session_active = true`, which blocks the next hole-punch attempt in
+    // `spawn_hole_punch_task` (see is_punch_session_active gate). The client sends
+    // TransportFeedback every ~500ms while a stream is running, so anything beyond
+    // a few seconds of silence means the client is gone.
+    const PUNCHED_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut last_peer_activity = Instant::now();
+
     loop {
         if registered_client.disconnect_requested() || state.control.shutdown_requested() {
+            break;
+        }
+        if last_peer_activity.elapsed() > PUNCHED_INACTIVITY_TIMEOUT {
+            println!(
+                "[punched] No traffic from {peer} for {}s — treating as disconnected",
+                PUNCHED_INACTIVITY_TIMEOUT.as_secs()
+            );
             break;
         }
         punched.tick();
@@ -3019,6 +3035,7 @@ fn handle_punched_client(
         // Read from punched socket.
         match punched.try_recv() {
             Some(PunchedMessage::Control(data)) => {
+                last_peer_activity = Instant::now();
                 let mut offset = 0;
                 while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
                     offset += used;
@@ -3127,6 +3144,7 @@ fn handle_punched_client(
                 }
             }
             Some(PunchedMessage::Media(data)) => {
+                last_peer_activity = Instant::now();
                 // Demux input packets from the media channel.
                 if let Some((header, packet)) = st_protocol::InputPacket::deserialize(&data) {
                     state.input.handle_input_packet(header.seq, packet);
