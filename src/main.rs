@@ -28,6 +28,7 @@ mod input;
 mod linux_uring;
 #[cfg(target_os = "macos")]
 mod macos_display;
+mod screen_wake;
 mod server_control;
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1967,6 +1968,12 @@ async fn handle_client(
                 }
             }
             if pipeline.is_none() {
+                // Wake the local display before capture's first-frame wait.
+                // On Wayland (PipeWire / wlroots) and KMS, the compositor /
+                // kernel stops driving frames when the monitor is in DPMS off,
+                // which would stall `frame_rx.recv()` until the 30s timeout.
+                // Disable with `ST_WAKE_ON_CONNECT=0`.
+                screen_wake::wake_display();
                 println!("[pipeline] Starting shared pipeline...");
                 let (started, sub) = SharedPipeline::start(
                     requested_fps_for_setup,

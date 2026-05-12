@@ -1,7 +1,11 @@
-use st_protocol::packet::{AudioRedundancyMeta, AUDIO_REDUNDANCY_HEADER_SIZE, HEADER_SIZE};
+use st_protocol::packet::{
+    audio_redundancy_header_size, serialize_audio_redundancy_header,
+    AUDIO_REDUNDANCY_MAX_DEPTH, HEADER_SIZE,
+};
 use st_protocol::reliable_udp::PunchedSocket;
 use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
 use st_protocol::{FrameSlicer, FrameTimingMeta, PacketHeader, PayloadType};
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 #[cfg(unix)]
@@ -203,10 +207,27 @@ fn configured_udp_dscp() -> Option<u8> {
         .filter(|value| *value <= 63)
 }
 
-fn audio_redundancy_enabled() -> bool {
-    std::env::var("ST_AUDIO_REDUNDANCY")
-        .map(|raw| raw != "0")
-        .unwrap_or(true)
+/// Number of previous opus packets to attach to every audio datagram.
+///
+/// `ST_AUDIO_REDUNDANCY` accepts either a numeric depth (0 = off, up to
+/// `AUDIO_REDUNDANCY_MAX_DEPTH`) or a boolean-style toggle. When unset the
+/// default depth is 2, which lets the client recover any burst of up to two
+/// consecutive lost audio packets without falling back to PLC.
+fn audio_redundancy_depth() -> usize {
+    const DEFAULT_DEPTH: usize = 2;
+    let raw = match std::env::var("ST_AUDIO_REDUNDANCY") {
+        Ok(value) => value,
+        Err(_) => return DEFAULT_DEPTH,
+    };
+    let trimmed = raw.trim();
+    if let Ok(n) = trimmed.parse::<usize>() {
+        return n.min(AUDIO_REDUNDANCY_MAX_DEPTH);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "0" | "off" | "false" | "no" => 0,
+        "" => DEFAULT_DEPTH,
+        _ => DEFAULT_DEPTH,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -303,9 +324,9 @@ pub struct UdpSender {
     max_datagram_size: usize,
     frame_id: u32,
     audio_seq: u16,
-    audio_redundancy: bool,
+    audio_redundancy_depth: usize,
     audio_buf: Vec<u8>,
-    previous_audio: Vec<u8>,
+    previous_audio: VecDeque<Vec<u8>>,
     encrypt_buf: Vec<u8>,
     // Pooled per-packet ciphertext buffers for sendmmsg in the crypto path.
     encrypt_pool: Vec<Vec<u8>>,
@@ -361,9 +382,9 @@ impl UdpSender {
             max_datagram_size: max_udp,
             frame_id: 0,
             audio_seq: 0,
-            audio_redundancy: audio_redundancy_enabled(),
+            audio_redundancy_depth: audio_redundancy_depth(),
             audio_buf: Vec::with_capacity(1500),
-            previous_audio: Vec::with_capacity(1500),
+            previous_audio: VecDeque::with_capacity(AUDIO_REDUNDANCY_MAX_DEPTH),
             encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
             encrypt_pool: Vec::new(),
             #[cfg(target_os = "linux")]
@@ -423,9 +444,9 @@ impl UdpSender {
             max_datagram_size: max_udp,
             frame_id: 0,
             audio_seq: 0,
-            audio_redundancy: audio_redundancy_enabled(),
+            audio_redundancy_depth: audio_redundancy_depth(),
             audio_buf: Vec::with_capacity(1500),
-            previous_audio: Vec::with_capacity(1500),
+            previous_audio: VecDeque::with_capacity(AUDIO_REDUNDANCY_MAX_DEPTH),
             encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
             encrypt_pool: Vec::new(),
             #[cfg(target_os = "linux")]
@@ -607,7 +628,10 @@ impl UdpSender {
         }
     }
 
-    /// Send a single Opus audio packet.
+    /// Send a single Opus audio packet, with up to `audio_redundancy_depth`
+    /// previously-sent opus packets attached as redundancy. The client uses
+    /// the redundant copies to recover lost packets without waiting for
+    /// retransmission.
     pub fn send_audio(&mut self, opus_data: &[u8]) -> Result<(), String> {
         let backend = &self.backend;
         let encrypt_buf = &mut self.encrypt_buf;
@@ -618,39 +642,72 @@ impl UdpSender {
         };
         self.audio_seq = self.audio_seq.wrapping_add(1);
 
-        let redundant_len = if self.audio_redundancy
-            && !self.previous_audio.is_empty()
-            && HEADER_SIZE
-                + AUDIO_REDUNDANCY_HEADER_SIZE
-                + opus_data.len()
-                + self.previous_audio.len()
-                <= self.max_datagram_size
-        {
-            self.previous_audio.len().min(u16::MAX as usize) as u16
-        } else {
-            0
-        };
-
-        self.audio_buf.clear();
-        self.audio_buf.resize(
-            HEADER_SIZE + AUDIO_REDUNDANCY_HEADER_SIZE + opus_data.len() + redundant_len as usize,
-            0,
-        );
-        header.serialize(&mut self.audio_buf[..HEADER_SIZE]);
-        AudioRedundancyMeta { redundant_len }.serialize(
-            &mut self.audio_buf[HEADER_SIZE..HEADER_SIZE + AUDIO_REDUNDANCY_HEADER_SIZE],
-        );
-        let primary_start = HEADER_SIZE + AUDIO_REDUNDANCY_HEADER_SIZE;
-        let primary_end = primary_start + opus_data.len();
-        self.audio_buf[primary_start..primary_end].copy_from_slice(opus_data);
-        if redundant_len > 0 {
-            self.audio_buf[primary_end..primary_end + redundant_len as usize]
-                .copy_from_slice(&self.previous_audio[..redundant_len as usize]);
+        // Pick the largest k <= depth such that the resulting datagram still fits
+        // inside max_datagram_size. The newest k chunks of `previous_audio` are
+        // chosen, but we attach them in oldest-first order so the client can
+        // index them as `seq - k .. seq - 1`.
+        let primary_len = opus_data.len();
+        let available_audio = self
+            .previous_audio
+            .iter()
+            .map(|chunk| chunk.len())
+            .collect::<Vec<_>>();
+        let mut chunks_to_attach: usize = 0;
+        let mut chunks_byte_total: usize = 0;
+        let max_depth = self.audio_redundancy_depth.min(available_audio.len());
+        for k in 1..=max_depth {
+            let candidate_bytes: usize =
+                available_audio[available_audio.len() - k..].iter().sum();
+            let total = HEADER_SIZE
+                + audio_redundancy_header_size(k)
+                + primary_len
+                + candidate_bytes;
+            if total > self.max_datagram_size {
+                break;
+            }
+            chunks_to_attach = k;
+            chunks_byte_total = candidate_bytes;
         }
 
+        let redundancy_header_bytes = audio_redundancy_header_size(chunks_to_attach);
+        let total_size =
+            HEADER_SIZE + redundancy_header_bytes + primary_len + chunks_byte_total;
+        self.audio_buf.clear();
+        self.audio_buf.resize(total_size, 0);
+        header.serialize(&mut self.audio_buf[..HEADER_SIZE]);
+        let chunk_start_idx = self.previous_audio.len() - chunks_to_attach;
+        let chunk_lens: Vec<u16> = (chunk_start_idx..self.previous_audio.len())
+            .map(|i| self.previous_audio[i].len() as u16)
+            .collect();
+        let written = serialize_audio_redundancy_header(
+            &mut self.audio_buf[HEADER_SIZE..HEADER_SIZE + redundancy_header_bytes],
+            &chunk_lens,
+        );
+        debug_assert_eq!(written, redundancy_header_bytes);
+        let primary_start = HEADER_SIZE + redundancy_header_bytes;
+        let primary_end = primary_start + primary_len;
+        self.audio_buf[primary_start..primary_end].copy_from_slice(opus_data);
+        let mut cursor = primary_end;
+        for i in chunk_start_idx..self.previous_audio.len() {
+            let chunk = &self.previous_audio[i];
+            self.audio_buf[cursor..cursor + chunk.len()].copy_from_slice(chunk);
+            cursor += chunk.len();
+        }
+        debug_assert_eq!(cursor, total_size);
+
         let send_result = Self::send_bytes_with(backend, encrypt_buf, &self.audio_buf);
-        self.previous_audio.clear();
-        self.previous_audio.extend_from_slice(opus_data);
+
+        // Track this packet for future datagrams' redundancy, bounded by the
+        // currently-configured depth. If depth is 0, drop the history entirely.
+        if self.audio_redundancy_depth > 0 {
+            self.previous_audio.push_back(opus_data.to_vec());
+            while self.previous_audio.len() > self.audio_redundancy_depth {
+                self.previous_audio.pop_front();
+            }
+        } else {
+            self.previous_audio.clear();
+        }
+
         send_result
     }
 }
