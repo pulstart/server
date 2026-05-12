@@ -3261,6 +3261,12 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
             .tunnel_state
             .clone()
             .unwrap_or_else(|| Arc::new(api_client::ApiTunnelState::new()));
+        // Ask the router for an explicit external port forward via NAT-PMP.
+        // When it succeeds, the resulting candidate works even on symmetric
+        // NATs and survives idle periods — a strict superset of what STUN+
+        // hole-punch can do alone. When the router doesn't speak NAT-PMP,
+        // this is a quiet no-op.
+        api_client::start_port_mapping(Arc::clone(&state.control), Arc::clone(&tunnel));
         api_client::start_api_registration(
             api_url,
             Arc::clone(&state.control),

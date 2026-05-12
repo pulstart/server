@@ -3,7 +3,12 @@ use st_protocol::tunnel::{CryptoContext, TunnelKeys};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Refresh STUN-derived candidates if they're older than this. UDP NAT
+/// mappings expire after ~30–120 s of silence, so 25 s gives margin to
+/// re-probe before the partner sees a dead public ip:port.
+const STUN_REFRESH_TTL: Duration = Duration::from_secs(25);
 
 /// Shared state produced by the API registration thread.
 /// The server runtime reads this to set up encrypted tunnels for incoming clients.
@@ -20,6 +25,13 @@ pub struct ApiTunnelState {
     punch_socket: Mutex<Option<UdpSocket>>,
     /// Local candidates advertised to the API server.
     local_candidates: Mutex<Vec<String>>,
+    /// Last time we refreshed `local_candidates` via STUN.
+    last_stun: Mutex<Option<Instant>>,
+    /// External `ip:port` granted by the router via NAT-PMP. Independent of
+    /// the STUN-discovered mapping: the router gives us a static forwarding
+    /// rule that survives idle periods AND works on symmetric NATs.
+    /// Refreshed periodically by `spawn_port_mapping_task`.
+    portmap_external: Mutex<Option<SocketAddr>>,
     /// Latest client punch-request nonce observed from the API server.
     pending_client_punch_nonce: AtomicU64,
     /// True while a punched session is active on the shared socket.
@@ -39,6 +51,8 @@ impl ApiTunnelState {
             partner_candidates: Mutex::new(Vec::new()),
             punch_socket: Mutex::new(None),
             local_candidates: Mutex::new(Vec::new()),
+            last_stun: Mutex::new(None),
+            portmap_external: Mutex::new(None),
             pending_client_punch_nonce: AtomicU64::new(0),
             punch_session_active: AtomicBool::new(false),
             hole_punch_ready: AtomicBool::new(false),
@@ -99,11 +113,16 @@ impl ApiTunnelState {
 
     pub fn ensure_punch_socket(&self, listen_port: u16) -> Result<Vec<String>, String> {
         let has_socket = self.punch_socket.lock().unwrap().is_some();
-        if has_socket {
-            let candidates = self.local_candidates.lock().unwrap().clone();
-            if !candidates.is_empty() {
-                return Ok(candidates);
-            }
+        let cached = self.local_candidates.lock().unwrap().clone();
+        let stun_fresh = match *self.last_stun.lock().unwrap() {
+            Some(t) => t.elapsed() < STUN_REFRESH_TTL,
+            None => false,
+        };
+        // Reuse cached candidates if they're fresh OR if a live punched
+        // session owns the socket (a STUN recv would steal its packets).
+        let session_active = self.is_punch_session_active();
+        if has_socket && !cached.is_empty() && (stun_fresh || session_active) {
+            return Ok(self.augment_with_portmap(cached));
         }
 
         let mut socket_guard = self.punch_socket.lock().unwrap();
@@ -124,8 +143,45 @@ impl ApiTunnelState {
         drop(socket_guard);
 
         *self.local_candidates.lock().unwrap() = candidates.clone();
+        *self.last_stun.lock().unwrap() = Some(Instant::now());
+        let augmented = self.augment_with_portmap(candidates);
         self.update_hole_punch_ready();
-        Ok(candidates)
+        Ok(augmented)
+    }
+
+    /// Append the NAT-PMP-granted external `ip:port` to the candidate list
+    /// (if any), de-duplicating against existing entries. We keep this
+    /// separate from STUN caching so the next `/api/candidates` upload
+    /// picks up a freshly-renewed mapping without re-running STUN.
+    fn augment_with_portmap(&self, mut candidates: Vec<String>) -> Vec<String> {
+        if let Some(addr) = *self.portmap_external.lock().unwrap() {
+            let c = addr.to_string();
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+        candidates
+    }
+
+    /// Record (or clear) the NAT-PMP-granted external address. Called by the
+    /// port-mapping renewal thread.
+    pub fn set_portmap_external(&self, addr: Option<SocketAddr>) {
+        let mut current = self.portmap_external.lock().unwrap();
+        if *current != addr {
+            *current = addr;
+            if let Some(a) = addr {
+                println!("[portmap] External mapping acquired: {a}");
+            } else {
+                println!("[portmap] External mapping cleared");
+            }
+        }
+    }
+
+    /// Local port that the punch socket is bound to, if known. Used by the
+    /// port-mapping renewal thread as the "internal" port to map.
+    pub fn punch_socket_port(&self) -> Option<u16> {
+        let guard = self.punch_socket.lock().unwrap();
+        guard.as_ref().and_then(|s| s.local_addr().ok().map(|a| a.port()))
     }
 
     pub fn public_key_b64(&self) -> String {
@@ -200,12 +256,17 @@ fn retry_secs(consecutive_failures: u32) -> u64 {
 
 /// Sleep for `secs` seconds, but wake early if shutdown is requested.
 fn interruptible_sleep(control: &ServerControl, secs: u64) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    interruptible_sleep_ms(control, secs.saturating_mul(1000))
+}
+
+/// Sleep for `millis` milliseconds, but wake early if shutdown is requested.
+fn interruptible_sleep_ms(control: &ServerControl, millis: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(millis);
     while std::time::Instant::now() < deadline {
         if control.shutdown_requested() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(50).min(Duration::from_millis(millis)));
     }
     false
 }
@@ -266,6 +327,80 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Spawn a background thread that registers with the API server,
 /// exchanges keys, polls session state, and retries with backoff on failure.
+/// Spawn a background thread that maintains a NAT-PMP UDP port mapping for
+/// the punch socket. Re-acquires the lease at lifetime/2 to keep it live;
+/// retries every 5 min when the gateway doesn't speak NAT-PMP. Clears the
+/// candidate on hard failure so we don't keep advertising a dead address.
+pub fn start_port_mapping(control: Arc<ServerControl>, tunnel_state: Arc<ApiTunnelState>) {
+    std::thread::spawn(move || {
+        // Wait until the punch socket exists.
+        let mut internal_port: u16;
+        loop {
+            if control.shutdown_requested() {
+                return;
+            }
+            if let Some(p) = tunnel_state.punch_socket_port() {
+                internal_port = p;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            if control.shutdown_requested() {
+                return;
+            }
+
+            // The punch socket can in principle be rebound to a different port
+            // over the process lifetime; re-read each cycle to stay accurate.
+            if let Some(p) = tunnel_state.punch_socket_port() {
+                internal_port = p;
+            }
+
+            let next_sleep = match st_protocol::portmap::try_acquire(internal_port) {
+                Some(mapping) => {
+                    println!(
+                        "[portmap] {:?} mapping {} (lease {}s)",
+                        mapping.method,
+                        mapping.external_addr,
+                        mapping.lifetime.as_secs()
+                    );
+                    tunnel_state.set_portmap_external(Some(mapping.external_addr));
+                    consecutive_failures = 0;
+                    // Renew at lifetime/2, clamped to [60s, 30min] so we don't
+                    // spin too fast on tiny leases or wait too long on huge ones.
+                    let half = mapping.lifetime / 2;
+                    half.clamp(Duration::from_secs(60), Duration::from_secs(1800))
+                }
+                None => {
+                    // Don't clobber a previously-good mapping just because one
+                    // probe timed out — wait until two consecutive failures.
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures >= 2 {
+                        tunnel_state.set_portmap_external(None);
+                    }
+                    // Back off: 1 min, then 5 min, then 15 min.
+                    match consecutive_failures {
+                        0..=1 => Duration::from_secs(60),
+                        2..=4 => Duration::from_secs(300),
+                        _ => Duration::from_secs(900),
+                    }
+                }
+            };
+
+            // Sleep but wake on shutdown.
+            let deadline = Instant::now() + next_sleep;
+            while Instant::now() < deadline {
+                if control.shutdown_requested() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200).min(next_sleep));
+            }
+        }
+    });
+}
+
 pub fn start_api_registration(
     api_url: String,
     control: Arc<ServerControl>,
@@ -397,14 +532,23 @@ pub fn start_api_registration(
                     Err(_) => tunnel_state.clear_partner_state(),
                 }
 
-                let secs = if client_joined {
-                    1
-                } else if tunnel_state.shared_key.lock().unwrap().is_some() {
-                    3
+                // Poll cadence:
+                //   - 250 ms while the client is joined and no session is
+                //     active yet — the client may post a /api/punch nonce at
+                //     any moment, and we need the hole-punch task to see it
+                //     fast so the host starts probing while the client is
+                //     still inside its 10 s hole_punch window.
+                //   - 1 s once a session is established (no urgency).
+                //   - 3 s when no client is joined (idle polling).
+                let session_active = tunnel_state.is_punch_session_active();
+                let sleep_ms = if session_active {
+                    1000
+                } else if client_joined {
+                    250
                 } else {
-                    3
+                    3000
                 };
-                if interruptible_sleep(&control, secs) {
+                if interruptible_sleep_ms(&control, sleep_ms) {
                     break;
                 }
             } else {
