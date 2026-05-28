@@ -610,12 +610,15 @@ impl InputRuntime {
             InputPacket::MouseAbsolute(packet) => {
                 inner.sync_buttons(packet.buttons);
                 inner.move_absolute(packet.x, packet.y);
-                inner.predict_cursor_absolute(packet.x, packet.y);
+                // Cursor position is no longer predicted from injected input.
+                // `CursorState` is sourced solely from the capture backend's
+                // real cursor metadata (PipeWire SPA_META_Cursor / XFixes), so
+                // there is a single source of truth and no feedback loop with
+                // the client's locally-drawn cursor.
             }
             InputPacket::MouseRelative(packet) => {
                 inner.sync_buttons(packet.buttons);
                 inner.move_relative(packet.dx, packet.dy);
-                inner.predict_cursor_relative(packet.dx, packet.dy);
             }
             InputPacket::MouseButtons(packet) => {
                 inner.sync_buttons(packet.buttons);
@@ -2420,15 +2423,16 @@ impl X11InputController {
         let height = self.height.max(1) as i64;
         let target_x = ((x as i64 * (width - 1).max(0) + 32767) / 65535) as i32;
         let target_y = ((y as i64 * (height - 1).max(0) + 32767) / 65535) as i32;
-        let dx = target_x - self.tracked_x;
-        let dy = target_y - self.tracked_y;
         self.tracked_x = target_x;
         self.tracked_y = target_y;
-        if dx != 0 || dy != 0 {
-            unsafe {
-                x11_ffi::XTestFakeRelativeMotionEvent(self.display, dx, dy, 0);
-                x11_ffi::XSync(self.display, 0);
-            }
+        // True absolute warp: the cursor lands exactly at the client position
+        // every time, with no accumulated drift. Desktop control sends absolute
+        // coordinates; game mouselook sends relative deltas through
+        // move_relative (XTestFakeRelativeMotionEvent), which is what produces
+        // the XI2 RawMotion events games read for camera rotation.
+        unsafe {
+            x11_ffi::XTestFakeMotionEvent(self.display, self._screen, target_x, target_y, 0);
+            x11_ffi::XSync(self.display, 0);
         }
     }
 
