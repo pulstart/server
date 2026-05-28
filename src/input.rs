@@ -1329,6 +1329,24 @@ fn select_linux_backend(
                 "uinput(rel)",
             )
         }),
+        // ext-image-copy-capture-v1 paints the cursor into the frame (no
+        // separate cursor metadata), so it behaves like wlroots screencopy:
+        // uinput relative injection, no absolute/hover, no separate cursor.
+        // Without this arm input falls through to Unavailable on compositors
+        // that land on the ext-image-copy fallback path.
+        "ext-image-copy" => UinputMouseController::new().map(|controller| {
+            (
+                InputBackend::Uinput(controller),
+                InputCapabilities {
+                    mouse_absolute: false,
+                    mouse_relative: true,
+                    keyboard: true,
+                    separate_cursor: false,
+                    hover_capture: false,
+                },
+                "uinput(rel)",
+            )
+        }),
         other => Err(format!("unsupported capture backend '{other}'")),
     }
 }
