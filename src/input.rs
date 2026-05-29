@@ -1302,31 +1302,33 @@ fn select_linux_backend(
                 ))
             } else {
                 UinputMouseController::new().map(|controller| {
+                    let absolute = controller.supports_absolute();
                     (
                         InputBackend::Uinput(controller),
                         InputCapabilities {
-                            mouse_absolute: false,
+                            mouse_absolute: absolute,
                             mouse_relative: true,
                             keyboard: true,
                             separate_cursor: true,
-                            hover_capture: false,
+                            hover_capture: absolute,
                         },
-                        "uinput(rel)",
+                        if absolute { "uinput(abs+rel)" } else { "uinput(rel)" },
                     )
                 })
             }
         }
         "kms" => UinputMouseController::new().map(|controller| {
+            let absolute = controller.supports_absolute();
             (
                 InputBackend::Uinput(controller),
                 InputCapabilities {
-                    mouse_absolute: false,
+                    mouse_absolute: absolute,
                     mouse_relative: true,
                     keyboard: true,
                     separate_cursor: true,
-                    hover_capture: false,
+                    hover_capture: absolute,
                 },
-                "uinput(rel)",
+                if absolute { "uinput(abs+rel)" } else { "uinput(rel)" },
             )
         }),
         // ext-image-copy-capture-v1 paints the cursor into the frame (no
@@ -1361,6 +1363,17 @@ const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 #[cfg(target_os = "linux")]
 const EV_REL: u16 = 0x02;
+#[cfg(target_os = "linux")]
+const EV_ABS: u16 = 0x03;
+#[cfg(target_os = "linux")]
+const ABS_X: u16 = 0x00;
+#[cfg(target_os = "linux")]
+const ABS_Y: u16 = 0x01;
+/// Range of the absolute pointer axes. The client sends absolute coordinates
+/// already normalized to 0..=u16::MAX across the captured output, so mapping
+/// the axis range to the same span makes injection a direct pass-through.
+#[cfg(target_os = "linux")]
+const ABS_AXIS_MAX: i32 = u16::MAX as i32;
 #[cfg(target_os = "linux")]
 const SYN_REPORT: u16 = 0;
 #[cfg(target_os = "linux")]
@@ -1569,6 +1582,26 @@ struct UinputSetup {
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
+struct InputAbsinfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+/// Mirrors the kernel `struct uinput_abs_setup` (UI_ABS_SETUP). `#[repr(C)]`
+/// reproduces the 2-byte pad after `code` before the i32-aligned `absinfo`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct UinputAbsSetup {
+    code: u16,
+    absinfo: InputAbsinfo,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
 struct LinuxInputEvent {
     time: libc::timeval,
     type_: u16,
@@ -1583,7 +1616,11 @@ nix::ioctl_write_int!(ui_set_keybit, b'U', 101);
 #[cfg(target_os = "linux")]
 nix::ioctl_write_int!(ui_set_relbit, b'U', 102);
 #[cfg(target_os = "linux")]
+nix::ioctl_write_int!(ui_set_absbit, b'U', 103);
+#[cfg(target_os = "linux")]
 nix::ioctl_write_ptr!(ui_dev_setup, b'U', 3, UinputSetup);
+#[cfg(target_os = "linux")]
+nix::ioctl_write_ptr!(ui_abs_setup, b'U', 4, UinputAbsSetup);
 #[cfg(target_os = "linux")]
 nix::ioctl_none!(ui_dev_create, b'U', 1);
 #[cfg(target_os = "linux")]
@@ -1592,6 +1629,10 @@ nix::ioctl_none!(ui_dev_destroy, b'U', 2);
 #[cfg(target_os = "linux")]
 struct UinputMouseController {
     file: File,
+    /// Optional absolute pointer device. Present only when `ST_UINPUT_ABSOLUTE`
+    /// is enabled and the device was created successfully; otherwise absolute
+    /// injection is unavailable and the backend advertises `mouse_absolute=false`.
+    abs_file: Option<File>,
     wheel_accumulator: WheelAccumulator,
 }
 
@@ -1655,13 +1696,53 @@ impl UinputMouseController {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
 
+        // Absolute positioning needs a second device with ABS axes; uinput
+        // relative motion goes through libinput acceleration and cannot land at
+        // an exact target. Default-on (validated live); ST_UINPUT_ABSOLUTE=0
+        // forces relative-only. On any failure fall back to relative-only,
+        // never breaking input.
+        let abs_file = if uinput_absolute_enabled() {
+            match create_uinput_abs_device() {
+                Ok(abs) => {
+                    println!("[input] uinput absolute pointer device enabled");
+                    Some(abs)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[input] uinput absolute device unavailable ({e}); relative-only"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             file,
+            abs_file,
             wheel_accumulator: WheelAccumulator::default(),
         })
     }
 
-    fn move_absolute(&mut self, _x: u16, _y: u16) {}
+    fn supports_absolute(&self) -> bool {
+        self.abs_file.is_some()
+    }
+
+    fn move_absolute(&mut self, x: u16, y: u16) {
+        let Some(abs_file) = self.abs_file.as_mut() else {
+            return;
+        };
+        // Client coordinates are already normalized to 0..=u16::MAX across the
+        // captured output and the axis range is the same span, so emit them
+        // directly. Buttons stay on the relative device: libinput merges every
+        // pointer in the seat into a single cursor, so a click from the relative
+        // device lands wherever this absolute motion put the cursor.
+        let _ = write_uinput_event(abs_file, EV_ABS, ABS_X, x as i32);
+        let _ = write_uinput_event(abs_file, EV_ABS, ABS_Y, y as i32);
+        let _ = write_uinput_event(abs_file, EV_SYN, SYN_REPORT, 0);
+        let _ = abs_file.flush();
+    }
 
     fn move_relative(&mut self, dx: i16, dy: i16) {
         if dx != 0 {
@@ -1714,24 +1795,7 @@ impl UinputMouseController {
     }
 
     fn emit(&mut self, type_: u16, code: u16, value: i32) -> Result<(), String> {
-        let event = LinuxInputEvent {
-            time: libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
-            type_,
-            code,
-            value,
-        };
-        let raw = unsafe {
-            std::slice::from_raw_parts(
-                &event as *const LinuxInputEvent as *const u8,
-                std::mem::size_of::<LinuxInputEvent>(),
-            )
-        };
-        self.file
-            .write_all(raw)
-            .map_err(|e| format!("uinput write: {e}"))
+        write_uinput_event(&mut self.file, type_, code, value)
     }
 
     fn sync(&mut self) -> Result<(), String> {
@@ -1746,8 +1810,114 @@ impl Drop for UinputMouseController {
         use std::os::fd::AsRawFd;
         unsafe {
             let _ = ui_dev_destroy(self.file.as_raw_fd());
+            if let Some(abs_file) = self.abs_file.as_ref() {
+                let _ = ui_dev_destroy(abs_file.as_raw_fd());
+            }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn write_uinput_event(
+    file: &mut File,
+    type_: u16,
+    code: u16,
+    value: i32,
+) -> Result<(), String> {
+    let event = LinuxInputEvent {
+        time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_,
+        code,
+        value,
+    };
+    let raw = unsafe {
+        std::slice::from_raw_parts(
+            &event as *const LinuxInputEvent as *const u8,
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    file.write_all(raw)
+        .map_err(|e| format!("uinput write: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn uinput_absolute_enabled() -> bool {
+    // Default-on after live validation (CLAUDE.md auto-enable rule). The env var
+    // is now an escape hatch to force the old relative-only behavior.
+    !matches!(
+        std::env::var("ST_UINPUT_ABSOLUTE").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+/// Create a second uinput device exposing absolute X/Y axes, so the server can
+/// position the cursor exactly (no libinput acceleration applied to ABS events).
+/// Declaring the standard mouse buttons makes libinput classify it as an
+/// absolute pointer rather than a touchscreen/tablet; the buttons themselves are
+/// never emitted here (clicks ride the relative device's single shared cursor).
+#[cfg(target_os = "linux")]
+fn create_uinput_abs_device() -> Result<File, String> {
+    use std::os::fd::AsRawFd;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/uinput")
+        .or_else(|_| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/input/uinput")
+        })
+        .map_err(|e| format!("open uinput: {e}"))?;
+
+    let fd = file.as_raw_fd();
+    unsafe {
+        ui_set_evbit(fd, EV_KEY as _).map_err(|e| format!("UI_SET_EVBIT key: {e}"))?;
+        ui_set_evbit(fd, EV_ABS as _).map_err(|e| format!("UI_SET_EVBIT abs: {e}"))?;
+        ui_set_keybit(fd, BTN_LEFT as _).map_err(|e| format!("UI_SET_KEYBIT left: {e}"))?;
+        ui_set_keybit(fd, BTN_RIGHT as _).map_err(|e| format!("UI_SET_KEYBIT right: {e}"))?;
+        ui_set_keybit(fd, BTN_MIDDLE as _).map_err(|e| format!("UI_SET_KEYBIT middle: {e}"))?;
+        ui_set_absbit(fd, ABS_X as _).map_err(|e| format!("UI_SET_ABSBIT x: {e}"))?;
+        ui_set_absbit(fd, ABS_Y as _).map_err(|e| format!("UI_SET_ABSBIT y: {e}"))?;
+    }
+
+    let mut setup = UinputSetup {
+        id: LinuxInputId {
+            bustype: BUS_USB,
+            vendor: 0x1209,
+            product: 0x5355,
+            version: 1,
+        },
+        name: [0u8; UINPUT_NAME_LEN],
+        ff_effects_max: 0,
+    };
+    let name = b"st-virtual-abs-mouse";
+    setup.name[..name.len()].copy_from_slice(name);
+
+    unsafe {
+        ui_dev_setup(fd, &setup).map_err(|e| format!("UI_DEV_SETUP: {e}"))?;
+        for code in [ABS_X, ABS_Y] {
+            let abs_setup = UinputAbsSetup {
+                code,
+                absinfo: InputAbsinfo {
+                    value: 0,
+                    minimum: 0,
+                    maximum: ABS_AXIS_MAX,
+                    fuzz: 0,
+                    flat: 0,
+                    resolution: 0,
+                },
+            };
+            ui_abs_setup(fd, &abs_setup).map_err(|e| format!("UI_ABS_SETUP {code}: {e}"))?;
+        }
+        ui_dev_create(fd).map_err(|e| format!("UI_DEV_CREATE: {e}"))?;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    Ok(file)
 }
 
 #[cfg(target_os = "linux")]

@@ -1299,10 +1299,12 @@ fn request_remote_desktop_screencast(
         opts.insert("types", Value::U32(1));
         opts.insert("cursor_mode", Value::U32(4));
         opts.insert("multiple", Value::Bool(false));
-        opts.insert("persist_mode", Value::U32(2));
-        if let Some(ref token) = restore_token {
-            opts.insert("restore_token", Value::from(token.as_str()));
-        }
+        // No persist_mode/restore_token here: this is a *combined* RemoteDesktop
+        // session, and xdg-desktop-portal-kde rejects ScreenCast persistence on
+        // remote-desktop sessions with InvalidArgument ("Remote desktop sessions
+        // cannot persist"), which aborts the request and drops us to
+        // screencast-only — i.e. no input/absolute injection. A recurring share
+        // dialog is the acceptable cost of keeping remote-desktop input working.
         let _reply: OwnedObjectPath = screen_cast
             .call("SelectSources", &(&session_obj, opts))
             .await
