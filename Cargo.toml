@@ -27,6 +27,14 @@ ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", 
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avcodec", "avformat", "swscale"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Pin bitflags: 2.12.0 added a `#[flag_name]` attribute, so the bitflags! macro
+# now scans every flag's attributes. dispatch2 0.3.x's `dispatch_block_flags_t`
+# carries giant per-flag doc comments, and that scan recurses past the default
+# recursion_limit=128, breaking macOS builds (`recursion limit reached while
+# expanding $crate::__bitflags_flag_name!`). 2.11.0 is the last good version and
+# satisfies ffmpeg-next's ^2.11, so it unifies the whole tree. Remove once a fixed
+# bitflags ships or dispatch2 raises its own recursion_limit.
+bitflags = "=2.11.0"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSBitmapImageRep", "NSCursor", "NSImage", "NSImageRep"] }
 screencapturekit = "1.5"
