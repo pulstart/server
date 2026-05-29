@@ -1,4 +1,5 @@
 use crossbeam_channel::Sender;
+use st_protocol::control::OutputInfo;
 
 #[cfg(target_os = "windows")]
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -295,6 +296,20 @@ pub fn composite_cursor_with_stride(
 pub trait CaptureBackend: Send {
     fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String>;
     fn stop(&mut self);
+
+    /// Displays this backend can capture. An empty list means the backend
+    /// cannot enumerate outputs (the caller then treats the single active
+    /// stream as the only "output" and hides the picker).
+    fn list_outputs(&self) -> Vec<OutputInfo> {
+        Vec::new()
+    }
+
+    /// Select which output to capture, by `OutputInfo::id`. Returns `true` when
+    /// the selection actually changed and the capture must be restarted
+    /// (`stop()` then `start()`) for it to take effect.
+    fn select_output(&mut self, _id: u32) -> bool {
+        false
+    }
 }
 
 pub fn set_target_fps(fps: u32) {

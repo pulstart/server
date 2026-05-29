@@ -9,8 +9,12 @@
 # One-liner:
 #     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash
 #
-# The only step that needs root is the /dev/uinput udev rule (input
-# injection). The script re-execs itself via sudo for that bit only.
+# The steps that need root are bundled into one sudo block: the /dev/uinput
+# udev rule (input injection) and granting cap_sys_admin to the binary so
+# Wayland KMS capture works without the XDG screen-share dialog. A small root
+# systemd path-unit re-applies the capability after self-updates replace the
+# binary, so upgrades stay dialog-free with no further prompts. Without the
+# cap (e.g. libcap missing) the server falls back to the PipeWire portal.
 #
 # Uninstall:
 #     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash -s -- --uninstall
@@ -159,12 +163,17 @@ NoDisplay=true
 EOF
 }
 
-# Install the uinput udev rule. This is the only step that needs root.
-# We re-exec ourselves via sudo with a narrow command so the user sees
-# exactly what's being elevated.
-ensure_udev_rule() {
+# Root-only setup, bundled into one sudo block (creds cache after the first
+# prompt): the uinput udev rule, cap_sys_admin on the binary for dialog-free
+# KMS capture, and a path-unit that re-applies the cap after self-updates.
+ensure_privileged_setup() {
+    local bin="${PREFIX}/st-server"
+    local run_user
+    run_user="$(id -un)"
+
+    # --- /dev/uinput udev rule (input injection) ---
     if [[ -f "$UDEV_PATH" ]] && grep -q "uinput" "$UDEV_PATH"; then
-        log "Udev rule $UDEV_PATH already present — skipping sudo step."
+        log "Udev rule $UDEV_PATH already present."
     else
         log "Installing udev rule for /dev/uinput (needs sudo)"
         sudo install -Dm0644 /dev/stdin "$UDEV_PATH" <<'EOF'
@@ -184,12 +193,57 @@ EOF
     # Make sure the running user is in the `input` group so the uaccess tag
     # applies. (Desktop logind usually grants uaccess to the local user, but
     # this guarantees it for remote/systemd-run sessions too.)
-    if id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
-        log "User '$USER' already in group 'input'."
+    if id -nG "$run_user" | tr ' ' '\n' | grep -qx input; then
+        log "User '$run_user' already in group 'input'."
     else
-        log "Adding user '$USER' to group 'input' (log out + back in for it to take effect)."
-        sudo usermod -aG input "$USER"
+        log "Adding user '$run_user' to group 'input' (log out + back in for it to take effect)."
+        sudo usermod -aG input "$run_user"
     fi
+
+    # --- Dialog-free KMS capture: cap_sys_admin on the binary ---
+    # On Wayland the server prefers KMS/DRM capture (no XDG share dialog, native
+    # multi-monitor). KWin holds DRM-master, so PRIME-exporting the scanout
+    # buffer needs CAP_SYS_ADMIN. This is best-effort: without it the server
+    # auto-falls-back to the PipeWire portal (with its dialog).
+    local setcap_bin
+    setcap_bin="$(command -v setcap || true)"
+    if [[ -z "$setcap_bin" ]]; then
+        warn "setcap not found (install libcap / libcap2-bin) — KMS dialog-free capture disabled; the server will use the PipeWire portal instead."
+        return
+    fi
+
+    log "Granting cap_sys_admin to ${bin} (dialog-free KMS capture; needs sudo)"
+    sudo "$setcap_bin" cap_sys_admin+ep "$bin"
+    log "  $(getcap "$bin" 2>/dev/null || echo 'getcap unavailable')"
+
+    # Self-update (updater.rs) replaces the binary in place, which DROPS the
+    # file capability. Install a tiny root path-unit that re-applies the cap
+    # whenever the binary changes, so upgrades stay dialog-free with no further
+    # prompts. (The just-relaunched post-update process may briefly use the
+    # portal until the next service start picks up the re-applied cap.)
+    local svc="st-server-setcap-${run_user}"
+    log "Installing ${svc}.path so auto-updates keep the capability"
+    sudo install -Dm0644 /dev/stdin "/etc/systemd/system/${svc}.service" <<EOF
+[Unit]
+Description=Re-apply cap_sys_admin to st-server after updates (${run_user})
+
+[Service]
+Type=oneshot
+ExecStart=${setcap_bin} cap_sys_admin+ep ${bin}
+EOF
+    sudo install -Dm0644 /dev/stdin "/etc/systemd/system/${svc}.path" <<EOF
+[Unit]
+Description=Watch st-server and re-apply cap_sys_admin on change (${run_user})
+
+[Path]
+PathChanged=${bin}
+Unit=${svc}.service
+
+[Install]
+WantedBy=paths.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now "${svc}.path"
 }
 
 maybe_enable_service() {
@@ -216,6 +270,9 @@ st-server is installed and running in your user session.
   Binary:   ${PREFIX}/st-server
   State:    ${HOME}/.local/state/st/
   Unit:     ${SYSTEMD_USER_DIR}/st-server.service
+  Capture:  Wayland uses KMS direct capture (no screen-share dialog) when
+            cap_sys_admin is set above; otherwise it falls back to the
+            PipeWire portal. Force with ST_CAPTURE=kms|pipewire.
 
 First-connect token (keep it secret — anyone with it can control this
 machine):
@@ -248,6 +305,17 @@ uninstall() {
     fi
 
     systemctl --user daemon-reload 2>/dev/null || true
+
+    local run_user setcap_svc
+    run_user="$(id -un)"
+    setcap_svc="st-server-setcap-${run_user}"
+    if [[ -f "/etc/systemd/system/${setcap_svc}.path" ]]; then
+        log "Removing cap_sys_admin re-apply units (needs sudo)"
+        sudo systemctl disable --now "${setcap_svc}.path" 2>/dev/null || true
+        sudo rm -f "/etc/systemd/system/${setcap_svc}.path" \
+                   "/etc/systemd/system/${setcap_svc}.service"
+        sudo systemctl daemon-reload 2>/dev/null || true
+    fi
 
     if [[ -f "$UDEV_PATH" ]] || [[ -f "$MODULES_LOAD_PATH" ]]; then
         log "Removing udev rule and modules-load drop-in (needs sudo)"
@@ -284,8 +352,9 @@ main() {
 Usage: install.sh [--uninstall]
 
   (no args)     Install the latest release as a user systemd service.
-  --uninstall   Remove the service, binary, desktop entry, and udev rule.
-                State at ~/.local/state/st/ is preserved.
+  --uninstall   Remove the service, binary, desktop entry, udev rule, and the
+                cap_sys_admin re-apply path-unit. State at ~/.local/state/st/
+                is preserved.
 EOF
                 return 0
                 ;;
@@ -304,7 +373,7 @@ EOF
     log "Installing st-server ${version} (${platform}) into ${PREFIX}"
 
     download_and_extract "$version" "$platform" "$PREFIX"
-    ensure_udev_rule
+    ensure_privileged_setup
     write_bin_symlink
     write_user_service
     write_desktop_entry

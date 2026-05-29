@@ -45,12 +45,13 @@ use transport::{EncodedVideoFrame, UdpSender};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use st_protocol::{
-    ClientDisplayInfo, ClockSyncPong, ControlMessage, ControllerState, InputSession,
-    SessionDebugInfo, StreamConfig, VideoChromaSampling, VideoCodec, VideoCodecSupport,
+    control::OutputInfo, ClientDisplayInfo, ClockSyncPong, ControlMessage, ControllerState,
+    InputSession, SessionDebugInfo, StreamConfig, VideoChromaSampling, VideoCodec,
+    VideoCodecSupport,
 };
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -74,6 +75,10 @@ const DISCOVERY_PORT: u16 = 28_481;
 const DISCOVERY_BEACON_INTERVAL: Duration = Duration::from_secs(2);
 const VIDEO_SUBSCRIBER_CAPACITY: usize = 120;
 const CAPTURE_QUEUE_CAPACITY: usize = 4;
+/// Max encoded video units a transport sender drains+sends in one wakeup.
+/// Bounds per-iteration work so audio drain / shutdown checks still get a turn
+/// under sustained overload; the broadcaster's oldest-eviction is the backstop.
+const MAX_VIDEO_SEND_BURST: usize = 16;
 static TRACE_ENCODE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ENCODED_VIDEO_UNIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -784,6 +789,62 @@ fn encoder_name(_encoder: &encode_vt::VTEncoder) -> &'static str {
 // broadcasting encoded data to all connected clients.
 // ---------------------------------------------------------------------------
 
+/// Commands sent from a per-client control handler into the shared pipeline
+/// thread. Capture is a single shared resource, so these affect every client.
+enum CaptureCommand {
+    /// Switch the captured monitor by `OutputInfo::id`.
+    SelectOutput(u32),
+}
+
+/// State shared between the pipeline thread (producer) and per-client control
+/// handlers (consumers): the enumerated outputs, the current selection, and the
+/// stream-config update an output switch produces.
+struct SharedCaptureState {
+    cmd_tx: Sender<CaptureCommand>,
+    available_outputs: Mutex<Vec<OutputInfo>>,
+    /// Currently captured output id (0 = unknown / primary).
+    selected_output: AtomicU32,
+    /// Stream config after the most recent output switch; `None` until one
+    /// occurs. Paired with `config_generation` so each client re-syncs once.
+    updated_config: Mutex<Option<StreamConfig>>,
+    config_generation: AtomicU64,
+}
+
+impl SharedCaptureState {
+    fn new(cmd_tx: Sender<CaptureCommand>) -> Self {
+        Self {
+            cmd_tx,
+            available_outputs: Mutex::new(Vec::new()),
+            selected_output: AtomicU32::new(0),
+            updated_config: Mutex::new(None),
+            config_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn outputs(&self) -> Vec<OutputInfo> {
+        self.available_outputs.lock().unwrap().clone()
+    }
+
+    fn selected(&self) -> u32 {
+        self.selected_output.load(Ordering::SeqCst)
+    }
+
+    fn generation(&self) -> u64 {
+        self.config_generation.load(Ordering::SeqCst)
+    }
+
+    fn updated_config(&self) -> Option<StreamConfig> {
+        self.updated_config.lock().unwrap().clone()
+    }
+
+    /// Record a post-switch stream config and bump the generation so connected
+    /// clients push the new `StreamConfig` to their viewers exactly once.
+    fn publish_config(&self, config: StreamConfig) {
+        *self.updated_config.lock().unwrap() = Some(config);
+        self.config_generation.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 struct SharedPipeline {
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -791,6 +852,7 @@ struct SharedPipeline {
     stream_config: StreamConfig,
     session_debug: SessionDebugInfo,
     rate_control: Arc<AdaptiveBitrateState>,
+    capture_state: Arc<SharedCaptureState>,
     shutdown_tx: Sender<()>,
     pipeline_handle: std::thread::JoinHandle<()>,
 }
@@ -814,10 +876,13 @@ impl SharedPipeline {
 
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (status_tx, status_rx) = bounded::<PipelineResult>(1);
+        let (capture_cmd_tx, capture_cmd_rx) = bounded::<CaptureCommand>(4);
+        let capture_state = Arc::new(SharedCaptureState::new(capture_cmd_tx));
 
         let vbc = Arc::clone(&video_bc);
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         let abc = Arc::clone(&audio_bc);
+        let cs = Arc::clone(&capture_state);
 
         let handle = std::thread::spawn(move || {
             run_shared_pipeline(
@@ -833,6 +898,8 @@ impl SharedPipeline {
                 vbc,
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 abc,
+                cs,
+                capture_cmd_rx,
             );
         });
 
@@ -845,6 +912,7 @@ impl SharedPipeline {
                     stream_config,
                     session_debug,
                     rate_control,
+                    capture_state,
                     shutdown_tx,
                     pipeline_handle: handle,
                 },
@@ -924,8 +992,14 @@ fn run_shared_pipeline(
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))] audio_bc: Arc<
         Broadcaster<Vec<u8>>,
     >,
+    capture_state: Arc<SharedCaptureState>,
+    capture_cmd_rx: Receiver<CaptureCommand>,
 ) {
-    let (frame_tx, frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
+    let (frame_tx, mut frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
+    // Capture-command processing (output switching) is only meaningful on the
+    // KMS path (Linux); on other platforms drain-suppress the unused channel.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let _ = &capture_cmd_rx;
     let trace = trace_enabled();
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let _ = client_hardware_codecs;
@@ -1102,6 +1176,23 @@ fn run_shared_pipeline(
         first_frame.width, first_frame.height, config.codec, config.dynamic_range, config.chroma,
     );
 
+    // Publish the capturable outputs so connecting clients can offer a monitor
+    // picker. Empty on backends that can't enumerate (portal fallback, macOS,
+    // Windows) — the client then hides the picker. Default the reported
+    // selection to the primary so the client highlights it without re-sending.
+    {
+        let outputs = capture_backend.list_outputs();
+        if let Some(primary) = outputs.iter().find(|o| o.is_primary) {
+            capture_state
+                .selected_output
+                .store(primary.id, Ordering::SeqCst);
+        }
+        if outputs.len() > 1 {
+            println!("[pipeline] {} capturable outputs available", outputs.len());
+        }
+        *capture_state.available_outputs.lock().unwrap() = outputs;
+    }
+
     // Tell the control plane we started OK
     let _ = status_tx.send(PipelineResult::Started(
         stream_config,
@@ -1125,9 +1216,78 @@ fn run_shared_pipeline(
     );
 
     // Main loop
-    loop {
+    'pipeline: loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
+        }
+
+        // Apply any pending capture/output switch. Rare, user-initiated, and
+        // global to the shared stream: stop+restart capture pinned to the new
+        // monitor, rebuild the encoder if the resolution changed, then publish
+        // the new StreamConfig so every client re-syncs and gets a keyframe.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        while let Ok(cmd) = capture_cmd_rx.try_recv() {
+            match cmd {
+                CaptureCommand::SelectOutput(id) => {
+                    if !capture_backend.select_output(id) {
+                        continue;
+                    }
+                    println!("[pipeline] switching capture to output id {id}");
+                    capture_backend.stop();
+                    let (new_tx, new_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
+                    if let Err(e) = capture_backend.start(new_tx) {
+                        eprintln!(
+                            "[pipeline] capture restart after output switch failed: {e}; stopping pipeline"
+                        );
+                        break 'pipeline;
+                    }
+                    frame_rx = new_rx;
+                    let switched_frame =
+                        match frame_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                            Ok(f) => f,
+                            Err(_) => {
+                                eprintln!(
+                                    "[pipeline] no frame within 5s after output switch; stopping pipeline"
+                                );
+                                break 'pipeline;
+                            }
+                        };
+                    if switched_frame.width != current_config.width
+                        || switched_frame.height != current_config.height
+                    {
+                        let mut new_config = current_config.clone();
+                        new_config.width = switched_frame.width;
+                        new_config.height = switched_frame.height;
+                        let backend = encoder_backend(&encoder);
+                        match create_encoder_for_backend(&new_config, backend) {
+                            Ok(mut new_encoder) => {
+                                request_next_keyframe(&mut new_encoder);
+                                encoder = new_encoder;
+                                current_config = new_config;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[pipeline] encoder rebuild for switched output failed: {e}; stopping pipeline"
+                                );
+                                break 'pipeline;
+                            }
+                        }
+                    }
+                    capture_state.selected_output.store(id, Ordering::SeqCst);
+                    capture_state.publish_config(current_config.to_stream_config(&audio_config));
+                    println!(
+                        "[pipeline] output switch complete: {}x{}",
+                        current_config.width, current_config.height
+                    );
+                    encode_and_broadcast(
+                        &mut encoder,
+                        &video_bc,
+                        input.as_ref(),
+                        &switched_frame,
+                        unix_time_micros(),
+                    );
+                }
+            }
         }
 
         let (frame, frame_captured_micros) =
@@ -1563,7 +1723,6 @@ fn run_transport(
     let trace = trace_enabled();
     let mut sent_video_units = 0usize;
     let mut last_video_activity = std::time::Instant::now();
-    let mut sent_startup_frame = false;
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
     let mut waiting_for_recovery_frame = false;
     let mut last_source_seq = None::<u64>;
@@ -1576,66 +1735,77 @@ fn run_transport(
         // Video: blocking recv with short timeout
         match vid_rx.recv_timeout(std::time::Duration::from_millis(5)) {
             Ok(frame) => {
-                let (frame, skipped_frames) = if sent_startup_frame {
-                    take_latest_video_frame(frame, &vid_rx)
-                } else {
-                    (frame, 0)
-                };
-                let source_gap = last_source_seq
-                    .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
-                    .unwrap_or(0);
-                last_source_seq = Some(frame.source_seq);
+                // Send every encoded unit in FIFO order. Drain transient backlog by
+                // SENDING it, never by collapsing to the newest unit: encoded units
+                // are inter-frame (P-frame) deltas, so dropping an intermediate unit
+                // breaks the decoder's reference chain and forces perpetual keyframe
+                // recovery — the "video refreshes every couple seconds" slideshow.
+                // Genuine overload is absorbed upstream by the broadcaster evicting
+                // the oldest queued unit, which surfaces here as a real source_seq
+                // gap and routes through the recovery-keyframe path below.
+                let mut pending = Some(frame);
+                let mut burst = 0usize;
+                while let Some(frame) = pending.take() {
+                    let source_gap = last_source_seq
+                        .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
+                        .unwrap_or(0);
+                    last_source_seq = Some(frame.source_seq);
 
-                if source_gap > 0 {
-                    waiting_for_recovery_frame = true;
-                    if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
-                        video_bc.request_keyframe();
-                        last_backlog_keyframe_request = Instant::now();
+                    if source_gap > 0 {
+                        waiting_for_recovery_frame = true;
+                        if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                            video_bc.request_keyframe();
+                            last_backlog_keyframe_request = Instant::now();
+                        }
+                        if trace {
+                            eprintln!(
+                                "[trace][server] detected {source_gap} dropped video unit(s) for {addr} (broadcaster eviction); requesting recovery keyframe"
+                            );
+                        }
                     }
-                    if trace {
-                        let skipped_before_transport =
-                            source_gap.saturating_sub(skipped_frames as u64);
-                        eprintln!(
-                            "[trace][server] detected {source_gap} locally dropped video unit(s) for {addr} (drained_now={skipped_frames}, evicted_before_transport={skipped_before_transport}); requesting recovery keyframe"
-                        );
-                    }
-                }
 
-                if waiting_for_recovery_frame && !frame.is_recovery {
-                    if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
-                        video_bc.request_keyframe();
-                        last_backlog_keyframe_request = Instant::now();
+                    if waiting_for_recovery_frame && !frame.is_recovery {
+                        // Discard P-frames until a fresh IDR arrives; keep nudging
+                        // the encoder for one (throttled).
+                        if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                            video_bc.request_keyframe();
+                            last_backlog_keyframe_request = Instant::now();
+                        }
+                        if trace {
+                            eprintln!(
+                                "[trace][server] holding non-recovery video unit source_seq={} for {addr} while waiting for recovery",
+                                frame.source_seq
+                            );
+                        }
+                    } else {
+                        if waiting_for_recovery_frame && frame.is_recovery {
+                            waiting_for_recovery_frame = false;
+                            if trace {
+                                eprintln!(
+                                    "[trace][server] resumed video for {addr} on recovery unit source_seq={}",
+                                    frame.source_seq
+                                );
+                            }
+                        }
+                        if trace && sent_video_units < 12 {
+                            eprintln!(
+                                "[trace][server] transport send video unit #{sent_video_units} to {addr}: bytes={} capture_ts={}",
+                                frame.data.len(),
+                                frame.capture_micros
+                            );
+                        }
+                        sent_video_units = sent_video_units.saturating_add(1);
+                        last_video_activity = std::time::Instant::now();
+                        if let Err(e) = sender.send_frame(&frame, unix_time_micros()) {
+                            eprintln!("[transport] video send error to {addr}: {e}");
+                        }
                     }
-                    if trace {
-                        eprintln!(
-                            "[trace][server] holding non-recovery video unit source_seq={} for {addr} while waiting for recovery",
-                            frame.source_seq
-                        );
-                    }
-                    continue;
-                }
 
-                if waiting_for_recovery_frame && frame.is_recovery {
-                    waiting_for_recovery_frame = false;
-                    if trace {
-                        eprintln!(
-                            "[trace][server] resumed video for {addr} on recovery unit source_seq={}",
-                            frame.source_seq
-                        );
+                    burst += 1;
+                    if burst >= MAX_VIDEO_SEND_BURST {
+                        break;
                     }
-                }
-                if trace && sent_video_units < 12 {
-                    eprintln!(
-                        "[trace][server] transport send video unit #{sent_video_units} to {addr}: bytes={} capture_ts={}",
-                        frame.data.len(),
-                        frame.capture_micros
-                    );
-                }
-                sent_video_units = sent_video_units.saturating_add(1);
-                last_video_activity = std::time::Instant::now();
-                match sender.send_frame(&frame, unix_time_micros()) {
-                    Ok(()) => sent_startup_frame = true,
-                    Err(e) => eprintln!("[transport] video send error to {addr}: {e}"),
+                    pending = vid_rx.try_recv().ok();
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1665,19 +1835,6 @@ fn run_transport(
             }
         }
     }
-}
-
-fn take_latest_video_frame(
-    first_frame: Arc<EncodedVideoFrame>,
-    vid_rx: &Receiver<Arc<EncodedVideoFrame>>,
-) -> (Arc<EncodedVideoFrame>, usize) {
-    let mut latest = first_frame;
-    let mut skipped = 0usize;
-    while let Ok(newer) = vid_rx.try_recv() {
-        latest = newer;
-        skipped = skipped.saturating_add(1);
-    }
-    (latest, skipped)
 }
 
 #[derive(Debug, Default)]
@@ -1946,6 +2103,7 @@ async fn handle_client(
                 StreamConfig,
                 Arc<AdaptiveBitrateState>,
                 SessionDebugInfo,
+                Arc<SharedCaptureState>,
             ),
             String,
         > {
@@ -1987,8 +2145,9 @@ async fn handle_client(
                 let stream_config = started.stream_config;
                 let rate_control = Arc::clone(&started.rate_control);
                 let session_debug = started.session_debug.clone();
+                let capture_state = Arc::clone(&started.capture_state);
                 *pipeline = Some(started);
-                return Ok((sub, stream_config, rate_control, session_debug));
+                return Ok((sub, stream_config, rate_control, session_debug, capture_state));
             }
             let p = pipeline.as_ref().unwrap();
             if !supported_codecs_for_setup.supports(p.stream_config.codec) {
@@ -2022,13 +2181,14 @@ async fn handle_client(
                 p.stream_config,
                 Arc::clone(&p.rate_control),
                 p.session_debug.clone(),
+                Arc::clone(&p.capture_state),
             ))
         },
     )
     .await
     .unwrap();
 
-    let (sub, stream_config, rate_control, session_debug) = match setup {
+    let (sub, stream_config, rate_control, session_debug, capture_state) = match setup {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Pipeline error for {addr}: {e}");
@@ -2053,6 +2213,9 @@ async fn handle_client(
     rate_control.register_client(sub.vid_sub_id);
     let mut bitrate_controller = ClientRateController::from_state(rate_control.as_ref());
     let controller_state = state.input.controller_state_for(client_id);
+    // A client joining after an output switch must get the post-switch config
+    // (the pipeline's stored config is the pre-switch one).
+    let stream_config = capture_state.updated_config().unwrap_or(stream_config);
     if let Some(requested_fps) = client_requested_fps {
         if stream_config.framerate as u32 != requested_fps {
             println!(
@@ -2073,6 +2236,17 @@ async fn handle_client(
         &ControlMessage::InputCapabilities(state.input.capabilities()).serialize(),
     );
     control_buf.extend_from_slice(&ControlMessage::ControllerState(controller_state).serialize());
+    let available_outputs = capture_state.outputs();
+    if available_outputs.len() > 1 {
+        control_buf.extend_from_slice(
+            &ControlMessage::AvailableOutputs(available_outputs).serialize(),
+        );
+        // Tell the client which output is currently captured so it can
+        // highlight it (server→client `SelectOutput` means "current selection").
+        control_buf.extend_from_slice(
+            &ControlMessage::SelectOutput(capture_state.selected()).serialize(),
+        );
+    }
     if let Err(e) = stream.write_all(&control_buf).await {
         eprintln!("Failed to send stream config to {addr}: {e}");
     } else if trace_enabled() {
@@ -2188,6 +2362,7 @@ async fn handle_client(
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     let mut last_controller_state = controller_state;
+    let mut last_config_generation = capture_state.generation();
     loop {
         if registered_client.disconnect_requested() {
             break;
@@ -2202,6 +2377,21 @@ async fn handle_client(
                 break;
             }
             last_controller_state = controller_state;
+        }
+        // An output switch (any client) reconfigures the shared stream — push
+        // the new StreamConfig so this client re-inits its decoder for the new
+        // resolution. The rebuilt encoder already starts with a keyframe.
+        if capture_state.generation() != last_config_generation {
+            last_config_generation = capture_state.generation();
+            if let Some(new_config) = capture_state.updated_config() {
+                let mut buf = ControlMessage::StreamConfig(new_config).serialize();
+                buf.extend_from_slice(
+                    &ControlMessage::SelectOutput(capture_state.selected()).serialize(),
+                );
+                if stream.write_all(&buf).await.is_err() {
+                    break;
+                }
+            }
         }
         let mut clipboard_write_failed = false;
         while let Ok(message) = clipboard_control_rx.try_recv() {
@@ -2302,6 +2492,12 @@ async fn handle_client(
                         }
                         ControlMessage::RequestKeyframe => {
                             sub.video_bc.request_keyframe();
+                        }
+                        ControlMessage::SelectOutput(id) => {
+                            println!("[client {addr}] requested capture output {id}");
+                            let _ = capture_state
+                                .cmd_tx
+                                .try_send(CaptureCommand::SelectOutput(id));
                         }
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
@@ -2807,6 +3003,7 @@ fn handle_punched_client(
             StreamConfig,
             Arc<AdaptiveBitrateState>,
             SessionDebugInfo,
+            Arc<SharedCaptureState>,
         ),
         String,
     > = (|| {
@@ -2834,8 +3031,9 @@ fn handle_punched_client(
                     let sc = started.stream_config;
                     let rc = Arc::clone(&started.rate_control);
                     let sd = started.session_debug.clone();
+                    let cs = Arc::clone(&started.capture_state);
                     *pipeline = Some(started);
-                    Ok((sub, sc, rc, sd))
+                    Ok((sub, sc, rc, sd, cs))
                 }
                 Err(e) => Err(e),
             }
@@ -2879,12 +3077,13 @@ fn handle_punched_client(
                     p.stream_config,
                     Arc::clone(&p.rate_control),
                     p.session_debug.clone(),
+                    Arc::clone(&p.capture_state),
                 ))
             }
         }
     })();
 
-    let (sub, stream_config, rate_control, session_debug) = match setup {
+    let (sub, stream_config, rate_control, session_debug, capture_state) = match setup {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[punched] Pipeline error for {peer}: {e}");
@@ -2895,6 +3094,8 @@ fn handle_punched_client(
 
     rate_control.register_client(sub.vid_sub_id);
     let controller_state = state.input.controller_state_for(client_id);
+    // Late joiners after an output switch need the post-switch config.
+    let stream_config = capture_state.updated_config().unwrap_or(stream_config);
 
     // --- Send startup control bundle ---
     let mut control_buf = ControlMessage::StreamConfig(stream_config).serialize();
@@ -2905,6 +3106,13 @@ fn handle_punched_client(
         &ControlMessage::InputCapabilities(state.input.capabilities()).serialize(),
     );
     control_buf.extend_from_slice(&ControlMessage::ControllerState(controller_state).serialize());
+    let available_outputs = capture_state.outputs();
+    if available_outputs.len() > 1 {
+        control_buf
+            .extend_from_slice(&ControlMessage::AvailableOutputs(available_outputs).serialize());
+        control_buf
+            .extend_from_slice(&ControlMessage::SelectOutput(capture_state.selected()).serialize());
+    }
     let _ = punched.send_control(&control_buf);
 
     // Wait for ClientReadyForMedia.
@@ -2990,6 +3198,7 @@ fn handle_punched_client(
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     let mut last_controller_state = controller_state;
+    let mut last_config_generation = capture_state.generation();
     let _ = punched.set_nonblocking(false);
     let _ = punched.set_read_timeout(Some(Duration::from_millis(50)));
 
@@ -3019,6 +3228,16 @@ fn handle_punched_client(
             let _ = punched
                 .send_control(&ControlMessage::ControllerState(controller_state).serialize());
             last_controller_state = controller_state;
+        }
+        // Re-sync this client's decoder after an output switch reconfigured the
+        // shared stream (see direct-path handler for rationale).
+        if capture_state.generation() != last_config_generation {
+            last_config_generation = capture_state.generation();
+            if let Some(new_config) = capture_state.updated_config() {
+                let _ = punched.send_control(&ControlMessage::StreamConfig(new_config).serialize());
+                let _ =
+                    punched.send_control(&ControlMessage::SelectOutput(capture_state.selected()).serialize());
+            }
         }
         while let Ok(message) = clipboard_control_rx.try_recv() {
             let _ = punched.send_control(&message.serialize());
@@ -3069,6 +3288,11 @@ fn handle_punched_client(
                         }
                         ControlMessage::RequestKeyframe => {
                             sub.video_bc.request_keyframe();
+                        }
+                        ControlMessage::SelectOutput(id) => {
+                            let _ = capture_state
+                                .cmd_tx
+                                .try_send(CaptureCommand::SelectOutput(id));
                         }
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
@@ -3187,64 +3411,69 @@ fn run_punched_transport(
 ) {
     let mut sender = UdpSender::from_punched(punched);
     let trace = trace_enabled();
-    let mut sent_startup_frame = false;
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
     let mut waiting_for_recovery_frame = false;
     let mut last_source_seq = None::<u64>;
     while running.load(Ordering::SeqCst) {
         match vid_rx.recv_timeout(Duration::from_millis(5)) {
             Ok(frame) => {
-                let (frame, skipped_frames) = if sent_startup_frame {
-                    take_latest_video_frame(frame, &vid_rx)
-                } else {
-                    (frame, 0)
-                };
-                let source_gap = last_source_seq
-                    .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
-                    .unwrap_or(0);
-                last_source_seq = Some(frame.source_seq);
+                // FIFO drain — send every encoded unit in order, never collapse to
+                // newest. See run_client_transport for the rationale: dropping an
+                // intermediate P-frame unit breaks the decode chain and traps the
+                // stream in keyframe-only recovery. Overload is handled by
+                // broadcaster eviction → source gap → recovery path below.
+                let mut pending = Some(frame);
+                let mut burst = 0usize;
+                while let Some(frame) = pending.take() {
+                    let source_gap = last_source_seq
+                        .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
+                        .unwrap_or(0);
+                    last_source_seq = Some(frame.source_seq);
 
-                if source_gap > 0 {
-                    waiting_for_recovery_frame = true;
-                    if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
-                        video_bc.request_keyframe();
-                        last_backlog_keyframe_request = Instant::now();
+                    if source_gap > 0 {
+                        waiting_for_recovery_frame = true;
+                        if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                            video_bc.request_keyframe();
+                            last_backlog_keyframe_request = Instant::now();
+                        }
+                        if trace {
+                            eprintln!(
+                                "[trace][server] detected {source_gap} dropped punched video unit(s) (broadcaster eviction); requesting recovery keyframe"
+                            );
+                        }
                     }
-                    if trace {
-                        let skipped_before_transport =
-                            source_gap.saturating_sub(skipped_frames as u64);
-                        eprintln!(
-                            "[trace][server] detected {source_gap} locally dropped punched video unit(s) (drained_now={skipped_frames}, evicted_before_transport={skipped_before_transport}); requesting recovery keyframe"
-                        );
-                    }
-                }
 
-                if waiting_for_recovery_frame && !frame.is_recovery {
-                    if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
-                        video_bc.request_keyframe();
-                        last_backlog_keyframe_request = Instant::now();
+                    if waiting_for_recovery_frame && !frame.is_recovery {
+                        if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                            video_bc.request_keyframe();
+                            last_backlog_keyframe_request = Instant::now();
+                        }
+                        if trace {
+                            eprintln!(
+                                "[trace][server] holding punched non-recovery video unit source_seq={} while waiting for recovery",
+                                frame.source_seq
+                            );
+                        }
+                    } else {
+                        if waiting_for_recovery_frame && frame.is_recovery {
+                            waiting_for_recovery_frame = false;
+                            if trace {
+                                eprintln!(
+                                    "[trace][server] resumed punched video on recovery unit source_seq={}",
+                                    frame.source_seq
+                                );
+                            }
+                        }
+                        if let Err(e) = sender.send_frame(&frame, unix_time_micros()) {
+                            eprintln!("[punched-transport] video send error: {e}");
+                        }
                     }
-                    if trace {
-                        eprintln!(
-                            "[trace][server] holding punched non-recovery video unit source_seq={} while waiting for recovery",
-                            frame.source_seq
-                        );
-                    }
-                    continue;
-                }
 
-                if waiting_for_recovery_frame && frame.is_recovery {
-                    waiting_for_recovery_frame = false;
-                    if trace {
-                        eprintln!(
-                            "[trace][server] resumed punched video on recovery unit source_seq={}",
-                            frame.source_seq
-                        );
+                    burst += 1;
+                    if burst >= MAX_VIDEO_SEND_BURST {
+                        break;
                     }
-                }
-                match sender.send_frame(&frame, unix_time_micros()) {
-                    Ok(()) => sent_startup_frame = true,
-                    Err(e) => eprintln!("[punched-transport] video send error: {e}"),
+                    pending = vid_rx.try_recv().ok();
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}

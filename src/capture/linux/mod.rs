@@ -12,6 +12,7 @@
 
 use super::{CaptureBackend, CapturedFrame};
 use crossbeam_channel::Sender;
+use st_protocol::control::OutputInfo;
 use std::time::Duration;
 
 pub mod ext_image_copy;
@@ -150,11 +151,31 @@ impl PlatformCapture {
                 Backend::NvFbc(nvfbc_capture::NvfbcCapture::new())
             }
             DisplayServer::Wayland => {
-                // Prefer PipeWire on Wayland because it can expose cursor metadata
-                // and DMA-BUF-backed frames without embedding the cursor into video.
-                println!("[capture] Wayland detected — trying PipeWire portal first");
+                // Prefer KMS direct capture on Wayland: it has no portal
+                // "select what to share" dialog (which KDE re-prompts on every
+                // session) and natively enumerates every monitor for output
+                // selection. But KWin holds DRM-master, so PRIME-exporting the
+                // scanout buffer needs cap_sys_admin — probe a *real frame* and
+                // fall back to the PipeWire portal when the capability is
+                // missing. (`ST_CAPTURE=pipewire` forces the portal path.)
                 let _ = wl_ok;
-                Backend::PipeWire(pipewire_capture::PipeWireCapture::new())
+                match kms_capture::probe_can_capture() {
+                    Ok(()) => {
+                        println!(
+                            "[capture] Wayland detected — KMS probe succeeded; using KMS direct capture (no portal dialog)"
+                        );
+                        Backend::Kms(kms_capture::KmsCapture::new())
+                    }
+                    Err(e) => {
+                        println!(
+                            "[capture] Wayland detected — KMS unavailable ({e}); falling back to PipeWire portal"
+                        );
+                        println!(
+                            "[capture] For dialog-free capture + multi-monitor selection, grant: sudo setcap cap_sys_admin+ep <st-server binary>"
+                        );
+                        Backend::PipeWire(pipewire_capture::PipeWireCapture::new())
+                    }
+                }
             }
             DisplayServer::Unknown => {
                 // Headless/Unknown: KMS > PipeWire
@@ -488,6 +509,28 @@ impl CaptureBackend for PlatformCapture {
             Backend::Kms(b) => b.stop(),
             Backend::X11(b) => b.stop(),
             Backend::PipeWire(b) => b.stop(),
+        }
+    }
+
+    fn list_outputs(&self) -> Vec<OutputInfo> {
+        match &self.backend {
+            Backend::NvFbc(b) => b.list_outputs(),
+            Backend::ExtImageCopy(b) => b.list_outputs(),
+            Backend::Wayland(b) => b.list_outputs(),
+            Backend::Kms(b) => b.list_outputs(),
+            Backend::X11(b) => b.list_outputs(),
+            Backend::PipeWire(b) => b.list_outputs(),
+        }
+    }
+
+    fn select_output(&mut self, id: u32) -> bool {
+        match &mut self.backend {
+            Backend::NvFbc(b) => b.select_output(id),
+            Backend::ExtImageCopy(b) => b.select_output(id),
+            Backend::Wayland(b) => b.select_output(id),
+            Backend::Kms(b) => b.select_output(id),
+            Backend::X11(b) => b.select_output(id),
+            Backend::PipeWire(b) => b.select_output(id),
         }
     }
 }
