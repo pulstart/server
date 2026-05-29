@@ -260,7 +260,11 @@ fn enumerate_outputs(card: &Card) -> Vec<KmsOutput> {
             None => continue,
         };
         let (x, y) = crtc.position();
-        let name = format!("{}-{}", interface_name(conn.interface()), conn.interface_id());
+        let name = format!(
+            "{}-{}",
+            interface_name(conn.interface()),
+            conn.interface_id()
+        );
         let id = fnv1a_u32(name.as_bytes());
         outputs.push(KmsOutput {
             id,
@@ -285,10 +289,7 @@ fn enumerate_outputs(card: &Card) -> Vec<KmsOutput> {
 }
 
 /// Find the primary (non-cursor) plane currently bound to a specific CRTC.
-fn find_plane_for_crtc(
-    card: &Card,
-    crtc: control::crtc::Handle,
-) -> Option<control::plane::Handle> {
+fn find_plane_for_crtc(card: &Card, crtc: control::crtc::Handle) -> Option<control::plane::Handle> {
     let planes = card.plane_handles().ok()?;
     for &handle in planes.iter() {
         if let Ok(plane) = card.get_plane(handle) {
@@ -521,9 +522,9 @@ fn capture_frame(
     // Export each plane's GEM handle as a DMA-BUF fd
     let mut planes = Vec::new();
     let gem_buffers = fb2.buffers();
-    for i in 0..4 {
-        let gem_handle = match gem_buffers[i] {
-            Some(h) => h,
+    for (i, gem) in gem_buffers.iter().enumerate() {
+        let gem_handle = match gem {
+            Some(h) => *h,
             None => break,
         };
         // DRM_RDWR = 0x02

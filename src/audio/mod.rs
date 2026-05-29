@@ -126,7 +126,7 @@ impl AudioPipeline {
             eprintln!("[audio] apply_auto_detect called before start()");
             return;
         };
-        let Some(sample_tx) = self.sample_tx.as_ref().map(Sender::clone) else {
+        let Some(sample_tx) = self.sample_tx.clone() else {
             eprintln!("[audio] apply_auto_detect called without active sample_tx");
             return;
         };

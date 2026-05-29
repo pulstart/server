@@ -1,7 +1,7 @@
-/// Colorspace definitions for encoder backends.
-///
-/// Defines RGB-to-YUV conversion parameters for SDR and HDR.
-/// Used by encoder backends to set AVFrame colorspace metadata.
+//! Colorspace definitions for encoder backends.
+//!
+//! Defines RGB-to-YUV conversion parameters for SDR and HDR.
+//! Used by encoder backends to set AVFrame colorspace metadata.
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 extern crate ffmpeg_sys_next as ffi;

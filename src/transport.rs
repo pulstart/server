@@ -1,6 +1,6 @@
 use st_protocol::packet::{
-    audio_redundancy_header_size, serialize_audio_redundancy_header,
-    AUDIO_REDUNDANCY_MAX_DEPTH, HEADER_SIZE,
+    audio_redundancy_header_size, serialize_audio_redundancy_header, AUDIO_REDUNDANCY_MAX_DEPTH,
+    HEADER_SIZE,
 };
 use st_protocol::reliable_udp::PunchedSocket;
 use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
@@ -174,7 +174,7 @@ mod linux_send {
                 }
                 let sent = ret as usize;
                 if sent == 0 {
-                    return Err(io::Error::new(io::ErrorKind::Other, "sendmmsg returned 0"));
+                    return Err(io::Error::other("sendmmsg returned 0"));
                 }
                 cursor += sent;
             }
@@ -402,10 +402,10 @@ impl UdpSender {
 /// as supported but corrupts stitched datagrams on real paths.
 #[cfg(target_os = "linux")]
 fn gso_allowed() -> bool {
-    match std::env::var("ST_UDP_GSO").ok().as_deref() {
-        Some("0") | Some("false") | Some("no") | Some("off") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("ST_UDP_GSO").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -596,7 +596,7 @@ impl UdpSender {
                         }
                     }
                     let _ = encrypt_buf;
-                    return Ok(());
+                    Ok(())
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -656,12 +656,9 @@ impl UdpSender {
         let mut chunks_byte_total: usize = 0;
         let max_depth = self.audio_redundancy_depth.min(available_audio.len());
         for k in 1..=max_depth {
-            let candidate_bytes: usize =
-                available_audio[available_audio.len() - k..].iter().sum();
-            let total = HEADER_SIZE
-                + audio_redundancy_header_size(k)
-                + primary_len
-                + candidate_bytes;
+            let candidate_bytes: usize = available_audio[available_audio.len() - k..].iter().sum();
+            let total =
+                HEADER_SIZE + audio_redundancy_header_size(k) + primary_len + candidate_bytes;
             if total > self.max_datagram_size {
                 break;
             }
@@ -670,8 +667,7 @@ impl UdpSender {
         }
 
         let redundancy_header_bytes = audio_redundancy_header_size(chunks_to_attach);
-        let total_size =
-            HEADER_SIZE + redundancy_header_bytes + primary_len + chunks_byte_total;
+        let total_size = HEADER_SIZE + redundancy_header_bytes + primary_len + chunks_byte_total;
         self.audio_buf.clear();
         self.audio_buf.resize(total_size, 0);
         header.serialize(&mut self.audio_buf[..HEADER_SIZE]);

@@ -43,7 +43,7 @@ static PORTAL_ERROR_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 fn log_portal_error(method: &str, err: impl std::fmt::Display) {
     let n = PORTAL_ERROR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 3 || n % 100 == 0 {
+    if n < 3 || n.is_multiple_of(100) {
         eprintln!("[input] Portal {method} failed (count={n}): {err}");
     }
 }
@@ -161,15 +161,10 @@ enum InputBackend {
     Macos(MacosMouseController),
 }
 
+#[derive(Default)]
 pub struct CursorVersionCursor {
     pub shape: u64,
     pub state: u64,
-}
-
-impl Default for CursorVersionCursor {
-    fn default() -> Self {
-        Self { shape: 0, state: 0 }
-    }
 }
 
 impl InputRuntime {
@@ -296,7 +291,6 @@ impl InputRuntime {
                     inner.capabilities = InputCapabilities::default();
                 }
             }
-            return;
         }
 
         #[cfg(target_os = "macos")]
@@ -669,6 +663,7 @@ impl InputRuntimeInner {
         self.sync_keyboard([0u8; KEYBOARD_STATE_BYTES]);
     }
 
+    #[cfg(test)]
     fn predict_cursor_absolute(&mut self, x: u16, y: u16) {
         if !self.cursor_prediction_active() {
             return;
@@ -686,6 +681,7 @@ impl InputRuntimeInner {
         self.set_predicted_cursor_state(next_state);
     }
 
+    #[cfg(test)]
     fn predict_cursor_relative(&mut self, dx: i16, dy: i16) {
         if !self.cursor_prediction_active() {
             return;
@@ -709,6 +705,7 @@ impl InputRuntimeInner {
         self.set_predicted_cursor_state(next_state);
     }
 
+    #[cfg(test)]
     fn cursor_prediction_active(&self) -> bool {
         self.capabilities.separate_cursor
             && self.cursor_state.visible
@@ -716,6 +713,7 @@ impl InputRuntimeInner {
             && self.stream_height > 0
     }
 
+    #[cfg(test)]
     fn cursor_hotspot(&self) -> (i32, i32) {
         self.cursor_shape
             .as_ref()
@@ -723,6 +721,7 @@ impl InputRuntimeInner {
             .unwrap_or((0, 0))
     }
 
+    #[cfg(test)]
     fn set_predicted_cursor_state(&mut self, next_state: CursorState) {
         if self.cursor_state == next_state {
             return;
@@ -876,6 +875,7 @@ fn input_seq_is_newer(seq: u16, last_seq: u16) -> bool {
     delta != 0 && delta < 0x8000
 }
 
+#[cfg(test)]
 fn normalized_to_stream_coord(value: u16, span: u32) -> i32 {
     if span <= 1 {
         0
@@ -884,6 +884,7 @@ fn normalized_to_stream_coord(value: u16, span: u32) -> i32 {
     }
 }
 
+#[cfg(test)]
 fn clamp_stream_coord(value: i64, span: u32) -> i32 {
     if span <= 1 {
         0
@@ -1312,7 +1313,11 @@ fn select_linux_backend(
                             separate_cursor: true,
                             hover_capture: absolute,
                         },
-                        if absolute { "uinput(abs+rel)" } else { "uinput(rel)" },
+                        if absolute {
+                            "uinput(abs+rel)"
+                        } else {
+                            "uinput(rel)"
+                        },
                     )
                 })
             }
@@ -1328,7 +1333,11 @@ fn select_linux_backend(
                     separate_cursor: true,
                     hover_capture: absolute,
                 },
-                if absolute { "uinput(abs+rel)" } else { "uinput(rel)" },
+                if absolute {
+                    "uinput(abs+rel)"
+                } else {
+                    "uinput(rel)"
+                },
             )
         }),
         // ext-image-copy-capture-v1 paints the cursor into the frame (no
@@ -1708,9 +1717,7 @@ impl UinputMouseController {
                     Some(abs)
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[input] uinput absolute device unavailable ({e}); relative-only"
-                    );
+                    eprintln!("[input] uinput absolute device unavailable ({e}); relative-only");
                     None
                 }
             }
@@ -1818,12 +1825,7 @@ impl Drop for UinputMouseController {
 }
 
 #[cfg(target_os = "linux")]
-fn write_uinput_event(
-    file: &mut File,
-    type_: u16,
-    code: u16,
-    value: i32,
-) -> Result<(), String> {
+fn write_uinput_event(file: &mut File, type_: u16, code: u16, value: i32) -> Result<(), String> {
     let event = LinuxInputEvent {
         time: libc::timeval {
             tv_sec: 0,

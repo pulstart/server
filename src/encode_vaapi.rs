@@ -471,7 +471,7 @@ impl VaapiEncoder {
             for (i, plane) in planes.iter().enumerate() {
                 desc.objects[i].fd = plane.fd.as_raw_fd();
                 desc.objects[i].size = 0;
-                desc.objects[i].format_modifier = plane.modifier as u64;
+                desc.objects[i].format_modifier = plane.modifier;
             }
             desc.nb_layers = 1;
             desc.layers[0].format = _drm_format;

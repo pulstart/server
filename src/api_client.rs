@@ -181,7 +181,9 @@ impl ApiTunnelState {
     /// port-mapping renewal thread as the "internal" port to map.
     pub fn punch_socket_port(&self) -> Option<u16> {
         let guard = self.punch_socket.lock().unwrap();
-        guard.as_ref().and_then(|s| s.local_addr().ok().map(|a| a.port()))
+        guard
+            .as_ref()
+            .and_then(|s| s.local_addr().ok().map(|a| a.port()))
     }
 
     pub fn public_key_b64(&self) -> String {
@@ -273,7 +275,7 @@ fn interruptible_sleep_ms(control: &ServerControl, millis: u64) -> bool {
 
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;

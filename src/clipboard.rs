@@ -215,29 +215,26 @@ fn run_clipboard_loop(
             thread::sleep(CLIPBOARD_POLL_INTERVAL);
             continue;
         }
-        match clipboard.as_mut().unwrap().get_text() {
-            Ok(text) => {
-                let text = clamp_clipboard_text(&text);
-                let changed = last_synced_text.as_deref() != Some(text.as_str());
-                let rate_ok = last_sent.elapsed() >= CLIPBOARD_SEND_MIN_INTERVAL;
-                if changed && rate_ok {
-                    if outbound_tx
-                        .send(ControlMessage::ClipboardText(text.clone()))
-                        .is_err()
-                    {
-                        break;
-                    }
-                    if trace_enabled() {
-                        eprintln!(
-                            "[clipboard] {label}: sent local text ({} bytes)",
-                            text.len()
-                        );
-                    }
-                    last_synced_text = Some(text);
-                    last_sent = Instant::now();
+        if let Ok(text) = clipboard.as_mut().unwrap().get_text() {
+            let text = clamp_clipboard_text(&text);
+            let changed = last_synced_text.as_deref() != Some(text.as_str());
+            let rate_ok = last_sent.elapsed() >= CLIPBOARD_SEND_MIN_INTERVAL;
+            if changed && rate_ok {
+                if outbound_tx
+                    .send(ControlMessage::ClipboardText(text.clone()))
+                    .is_err()
+                {
+                    break;
                 }
+                if trace_enabled() {
+                    eprintln!(
+                        "[clipboard] {label}: sent local text ({} bytes)",
+                        text.len()
+                    );
+                }
+                last_synced_text = Some(text);
+                last_sent = Instant::now();
             }
-            Err(_) => {}
         }
         thread::sleep(CLIPBOARD_POLL_INTERVAL);
     }
@@ -384,11 +381,8 @@ fn parse_file_uris(text: &str) -> Vec<PathBuf> {
         .filter(|line| !line.starts_with('#'))
         .filter_map(|line| {
             let line = line.trim();
-            if let Some(path) = line.strip_prefix("file://") {
-                Some(PathBuf::from(url_decode(path)))
-            } else {
-                None
-            }
+            line.strip_prefix("file://")
+                .map(|path| PathBuf::from(url_decode(path)))
         })
         .collect()
 }
@@ -400,8 +394,8 @@ fn url_decode(s: &str) -> String {
     let mut chars = s.bytes();
     while let Some(b) = chars.next() {
         if b == b'%' {
-            let hi = chars.next().and_then(|c| hex_val(c));
-            let lo = chars.next().and_then(|c| hex_val(c));
+            let hi = chars.next().and_then(hex_val);
+            let lo = chars.next().and_then(hex_val);
             if let (Some(h), Some(l)) = (hi, lo) {
                 result.push((h << 4 | l) as char);
             }

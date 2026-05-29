@@ -140,9 +140,18 @@ impl EncoderConfig {
     const DEFAULT_FRAMERATE: u32 = 60;
     const MAX_NEGOTIATED_FPS: u32 = 360;
     const SVTAV1_MIN_BUFFER_MS: i64 = 20;
+    /// Effectively-infinite GOP. Keyframes are emitted on demand only
+    /// (subscriber join, loss recovery, output switch) via `reset_for_keyframe`,
+    /// never on a fixed periodic interval. A periodic IDR every `framerate`
+    /// frames combined with the 1-frame VBV (`vbv_buffer_size`) forces the rate
+    /// controller to either crush IDR quality or burst past the pacing budget
+    /// once per second — the visible "periodic refresh"/pulsing artifact.
+    pub const INFINITE_GOP: u32 = i32::MAX as u32;
 
-    fn default_gop_size(framerate: u32) -> u32 {
-        framerate.clamp(30, 120)
+    fn default_gop_size(_framerate: u32) -> u32 {
+        // Infinite GOP is the documented design ("infinite GOP, IDR on demand").
+        // Keyframes are forced on demand; no fixed periodic IDR.
+        Self::INFINITE_GOP
     }
 
     /// Build config for the given resolution, reading overrides from env vars.
@@ -197,9 +206,13 @@ impl EncoderConfig {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(Self::DEFAULT_BITRATE_KBPS)
             .clamp(min_bitrate_kbps, max_bitrate_kbps);
+        // ST_GOP overrides the keyframe interval in frames. `0` means infinite
+        // GOP (on-demand keyframes only), matching the default. Any positive
+        // value forces a periodic IDR every N frames (debugging / lossy paths).
         let gop_size = std::env::var("ST_GOP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| if v == 0 { Self::INFINITE_GOP } else { v })
             .unwrap_or_else(|| Self::default_gop_size(framerate));
 
         Self {

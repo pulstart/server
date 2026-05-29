@@ -86,15 +86,19 @@ impl SoftwareEncoder {
                 num: config.framerate as i32,
                 den: 1,
             };
-            // gop_size=0 means all-intra in libx264/libx265; use 250 as fallback
+            // gop_size=0 means all-intra in libx264/libx265 — the config layer
+            // already maps "infinite" to EncoderConfig::INFINITE_GOP (i32::MAX),
+            // so a literal 0 here would be an unintended all-intra request; guard
+            // it back to infinite. libx264/libx265/SVT-AV1 all treat a very large
+            // keyint as effectively infinite (keyframes come on demand only).
             (*ctx).gop_size = if config.gop_size == 0 {
-                250
+                EncoderConfig::INFINITE_GOP as i32
             } else {
                 config.gop_size as i32
             };
             (*ctx).max_b_frames = config.max_b_frames as i32;
             (*ctx).bit_rate = config.bitrate_bps();
-            (*ctx).rc_buffer_size = config.vbv_buffer_size(true) as i32;
+            (*ctx).rc_buffer_size = config.vbv_buffer_size(true);
 
             if config.low_delay {
                 (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
@@ -551,7 +555,7 @@ impl SoftwareEncoder {
             (*self.codec_ctx).bit_rate = bitrate_bps;
             (*self.codec_ctx).rc_min_rate = bitrate_bps;
             (*self.codec_ctx).rc_max_rate = bitrate_bps;
-            (*self.codec_ctx).rc_buffer_size = config.vbv_buffer_size(true) as i32;
+            (*self.codec_ctx).rc_buffer_size = config.vbv_buffer_size(true);
 
             set_int_opt(self.codec_ctx.cast(), "b", bitrate_bps)?;
             set_int_opt(self.codec_ctx.cast(), "minrate", bitrate_bps)?;
@@ -614,5 +618,114 @@ unsafe fn set_int_opt(target: *mut std::ffi::c_void, name: &str, value: i64) -> 
         Ok(())
     } else {
         Err(format!("{name}: {}", ffmpeg_err(ret)))
+    }
+}
+
+#[cfg(test)]
+mod inplace_bitrate_tests {
+    use super::*;
+
+    // Encode `count` frames of changing content and return the average packet
+    // size in bytes. Mirrors what update_bitrate's av_opt_set path relies on.
+    unsafe fn avg_packet_bytes(
+        ctx: *mut ffi::AVCodecContext,
+        frame: *mut ffi::AVFrame,
+        start_pts: i64,
+        count: i64,
+    ) -> f64 {
+        let mut total: u64 = 0;
+        let mut packets: u64 = 0;
+        let pkt = ffi::av_packet_alloc();
+        for i in 0..count {
+            let y = (*frame).data[0];
+            let ls = (*frame).linesize[0] as usize;
+            let h = (*frame).height as usize;
+            let iu = i as usize;
+            for row in 0..h {
+                let base = y.add(row * ls);
+                for x in 0..ls {
+                    *base.add(x) = (((iu * 7 + row * 3 + x) & 0xff) as u8).wrapping_mul(3);
+                }
+            }
+            (*frame).pts = start_pts + i;
+            ffi::avcodec_send_frame(ctx, frame);
+            loop {
+                let r = ffi::avcodec_receive_packet(ctx, pkt);
+                if r == ffi::AVERROR(ffi::EAGAIN) || r == ffi::AVERROR_EOF || r < 0 {
+                    break;
+                }
+                total += (*pkt).size as u64;
+                packets += 1;
+                ffi::av_packet_unref(pkt);
+            }
+        }
+        ffi::av_packet_free(&mut { pkt });
+        if packets == 0 {
+            0.0
+        } else {
+            total as f64 / packets as f64
+        }
+    }
+
+    // Regression guard: libx264 must honor a runtime bitrate change through the
+    // same av_opt_set("b"/"maxrate"/"bufsize") mechanism update_bitrate uses. If
+    // a future ffmpeg/option change silently breaks this, ABR would stop working
+    // on the software path and this test fails loudly. (The BitrateVerifier in
+    // main.rs is the runtime safety net for backends that DON'T honor it.)
+    #[test]
+    fn libx264_honors_runtime_bitrate_change() {
+        unsafe {
+            let codec = ffi::avcodec_find_encoder_by_name(c"libx264".as_ptr());
+            if codec.is_null() {
+                eprintln!("libx264 not available; skipping");
+                return;
+            }
+            let ctx = ffi::avcodec_alloc_context3(codec);
+            (*ctx).width = 640;
+            (*ctx).height = 360;
+            (*ctx).time_base = ffi::AVRational { num: 1, den: 60 };
+            (*ctx).framerate = ffi::AVRational { num: 60, den: 1 };
+            (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
+            (*ctx).gop_size = i32::MAX;
+            (*ctx).max_b_frames = 0;
+            let low_bps: i64 = 1_000_000;
+            let high_bps: i64 = 20_000_000;
+            (*ctx).bit_rate = low_bps;
+            (*ctx).rc_max_rate = low_bps;
+            (*ctx).rc_buffer_size = (low_bps / 60) as i32;
+            let preset = CString::new("ultrafast").unwrap();
+            let tune = CString::new("zerolatency").unwrap();
+            ffi::av_opt_set((*ctx).priv_data, c"preset".as_ptr(), preset.as_ptr(), 0);
+            ffi::av_opt_set((*ctx).priv_data, c"tune".as_ptr(), tune.as_ptr(), 0);
+            assert!(
+                ffi::avcodec_open2(ctx, codec, ptr::null_mut()) >= 0,
+                "open libx264"
+            );
+
+            let frame = ffi::av_frame_alloc();
+            (*frame).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            (*frame).width = 640;
+            (*frame).height = 360;
+            ffi::av_frame_get_buffer(frame, 32);
+
+            let before = avg_packet_bytes(ctx, frame, 0, 90);
+
+            (*ctx).bit_rate = high_bps;
+            (*ctx).rc_max_rate = high_bps;
+            (*ctx).rc_buffer_size = (high_bps / 60) as i32;
+            set_int_opt(ctx.cast(), "b", high_bps).unwrap();
+            set_int_opt(ctx.cast(), "maxrate", high_bps).unwrap();
+            set_int_opt(ctx.cast(), "bufsize", high_bps / 60).unwrap();
+
+            let after = avg_packet_bytes(ctx, frame, 1000, 90);
+
+            ffi::av_frame_free(&mut { frame });
+            ffi::avcodec_free_context(&mut { ctx });
+
+            assert!(
+                after > before * 1.5,
+                "libx264 ignored runtime bitrate change: {before:.0} -> {after:.0} bytes/pkt"
+            );
+        }
     }
 }

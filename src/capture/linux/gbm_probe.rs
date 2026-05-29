@@ -83,8 +83,11 @@ fn lib() -> Option<&'static GbmLib> {
     LIB.get_or_init(GbmLib::load).as_ref()
 }
 
-fn cache() -> &'static Mutex<HashMap<(String, u32), Vec<u64>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, u32), Vec<u64>>>> = OnceLock::new();
+/// Cached DMA-BUF format modifiers keyed by (device node, fourcc).
+type ModifierCache = HashMap<(String, u32), Vec<u64>>;
+
+fn cache() -> &'static Mutex<ModifierCache> {
+    static CACHE: OnceLock<Mutex<ModifierCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

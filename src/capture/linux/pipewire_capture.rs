@@ -647,8 +647,7 @@ fn extract_cursor_from_meta(
             let height = bitmap.size.height as usize;
             let stride = bitmap.stride.max(0) as usize;
             let total_bytes = stride.checked_mul(height)?;
-            let data_ptr =
-                unsafe { (bitmap_ptr as *const u8).add(bitmap.offset as usize) as *const u8 };
+            let data_ptr = unsafe { (bitmap_ptr as *const u8).add(bitmap.offset as usize) };
             let src = unsafe { std::slice::from_raw_parts(data_ptr, total_bytes) };
             let pixels = convert_cursor_bitmap_to_bgra(bitmap.format, src, stride, width, height)?;
             cache.pixels = pixels;
@@ -1228,7 +1227,7 @@ fn request_remote_desktop_screencast(
 
         let session_path = results
             .get("session_handle")
-            .and_then(|v| try_extract_string(v))
+            .and_then(try_extract_string)
             .unwrap_or_else(|| {
                 format!("/org/freedesktop/portal/desktop/session/{unique_name}/{session_token}")
             });
@@ -1361,7 +1360,7 @@ fn request_remote_desktop_screencast(
 
         if let Some(token) = start_results
             .get("restore_token")
-            .and_then(|v| try_extract_string(v))
+            .and_then(try_extract_string)
         {
             save_restore_token(&token);
         }
@@ -1499,7 +1498,7 @@ fn request_screencast() -> Result<PortalSession, String> {
         // Extract session_handle from results (or construct from token)
         let session_path = results
             .get("session_handle")
-            .and_then(|v| try_extract_string(v))
+            .and_then(try_extract_string)
             .unwrap_or_else(|| {
                 format!("/org/freedesktop/portal/desktop/session/{unique_name}/{session_token}")
             });
@@ -1602,7 +1601,7 @@ fn request_screencast() -> Result<PortalSession, String> {
         // Extract restore_token from Start response
         if let Some(token) = start_results
             .get("restore_token")
-            .and_then(|v| try_extract_string(v))
+            .and_then(try_extract_string)
         {
             save_restore_token(&token);
         } else {
@@ -1659,10 +1658,8 @@ fn try_extract_string(v: &zvariant::OwnedValue) -> Option<String> {
     if let Ok(s) = <&str>::try_from(v) {
         return Some(s.to_string());
     }
-    if let Ok(val) = zvariant::Value::try_from(v) {
-        if let zvariant::Value::Str(s) = val {
-            return Some(s.to_string());
-        }
+    if let Ok(zvariant::Value::Str(s)) = zvariant::Value::try_from(v) {
+        return Some(s.to_string());
     }
     None
 }
@@ -1676,7 +1673,7 @@ fn extract_first_stream_info(
         .try_into()
         .map_err(|e| format!("streams value: {e}"))?;
 
-    for (node_id, props) in streams {
+    if let Some((node_id, props)) = streams.into_iter().next() {
         let mut logical_width = 0.0;
         let mut logical_height = 0.0;
         if let Some(size) = props.get("size") {

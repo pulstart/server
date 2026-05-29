@@ -31,10 +31,10 @@ pub fn wake_display() {
 }
 
 fn enabled() -> bool {
-    match std::env::var("ST_WAKE_ON_CONNECT").ok().as_deref() {
-        Some("0") | Some("false") | Some("no") | Some("off") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("ST_WAKE_ON_CONNECT").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -123,11 +123,7 @@ mod linux {
         for bin in ["dbus-send", "gdbus", "busctl"] {
             let cmd = build_dbus_cmd(bin);
             let output = match cmd {
-                Some(mut c) => c
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .ok(),
+                Some(mut c) => c.stdout(Stdio::null()).stderr(Stdio::piped()).output().ok(),
                 None => continue,
             };
             let Some(output) = output else { continue };
@@ -181,7 +177,10 @@ mod linux {
 
     fn compositor_cli_wake() -> Result<String, String> {
         let attempts: &[(&str, &[&str])] = &[
-            ("hyprctl dispatch dpms on", &["hyprctl", "dispatch", "dpms", "on"]),
+            (
+                "hyprctl dispatch dpms on",
+                &["hyprctl", "dispatch", "dpms", "on"],
+            ),
             (
                 "swaymsg output * power on",
                 &["swaymsg", "output", "*", "power", "on"],

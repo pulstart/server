@@ -140,10 +140,10 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
             ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
                 state.size = Some((width, height));
             }
-            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => {
-                if let WEnum::Value(fmt) = format {
-                    state.shm_formats.push(fmt);
-                }
+            ext_image_copy_capture_session_v1::Event::ShmFormat {
+                format: WEnum::Value(fmt),
+            } => {
+                state.shm_formats.push(fmt);
             }
             ext_image_copy_capture_session_v1::Event::DmabufFormat { .. }
             | ext_image_copy_capture_session_v1::Event::DmabufDevice { .. } => {
@@ -170,10 +170,10 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
         _: &QueueHandle<Self>,
     ) {
         match event {
-            ext_image_copy_capture_frame_v1::Event::Transform { transform } => {
-                if let WEnum::Value(t) = transform {
-                    state.transform = t;
-                }
+            ext_image_copy_capture_frame_v1::Event::Transform {
+                transform: WEnum::Value(t),
+            } => {
+                state.transform = t;
             }
             ext_image_copy_capture_frame_v1::Event::Ready => {
                 state.frame_state = FrameState::Ready;

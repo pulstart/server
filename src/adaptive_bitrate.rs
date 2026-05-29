@@ -286,7 +286,9 @@ impl ClientRateController {
         }
 
         if self.clean_intervals > 0
-            && self.clean_intervals % Self::STABLE_INTERVALS_FOR_PROMOTION == 0
+            && self
+                .clean_intervals
+                .is_multiple_of(Self::STABLE_INTERVALS_FOR_PROMOTION)
         {
             self.stable_kbps = self.stable_kbps.max(self.recommended_kbps);
             self.probe_failures = self.probe_failures.saturating_sub(1);

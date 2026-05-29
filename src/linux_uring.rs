@@ -16,10 +16,10 @@ use io_uring::{opcode, types, IoUring};
 /// the default-on bar; the server side stays symmetric with the client so
 /// both halves of a session take the same path.
 pub fn io_uring_requested() -> bool {
-    match std::env::var("ST_IO_URING").ok().as_deref() {
-        Some("0") | Some("false") | Some("no") | Some("off") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("ST_IO_URING").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
 }
 
 pub struct UringSend {
@@ -94,7 +94,7 @@ impl UringSend {
             {
                 let mut sq = self.ring.submission();
                 for i in submitted..chunk_end {
-                    let hdr_ptr = self.hdrs.as_ptr().wrapping_add(i) as *const libc::msghdr;
+                    let hdr_ptr = self.hdrs.as_ptr().wrapping_add(i);
                     let sqe = opcode::SendMsg::new(types::Fd(fd), hdr_ptr)
                         .build()
                         .user_data(i as u64);
@@ -105,15 +105,14 @@ impl UringSend {
                 }
             }
             if pushed == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "uring SQ full; could not push any SendMsg SQE",
                 ));
             }
 
             self.ring
                 .submit_and_wait(pushed)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("uring submit: {e}")))?;
+                .map_err(|e| io::Error::other(format!("uring submit: {e}")))?;
 
             // Drain CQEs for this chunk. `submit_and_wait(pushed)` guarantees
             // at least `pushed` completions; we drain everything the ring has.
@@ -122,7 +121,7 @@ impl UringSend {
             {
                 let mut cq = self.ring.completion();
                 cq.sync();
-                while let Some(cqe) = cq.next() {
+                for cqe in cq {
                     got += 1;
                     let result = cqe.result();
                     if result < 0 && first_err.is_none() {
@@ -134,10 +133,9 @@ impl UringSend {
                 return Err(err);
             }
             if got < pushed {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("uring got {got} CQEs, expected at least {pushed}"),
-                ));
+                return Err(io::Error::other(format!(
+                    "uring got {got} CQEs, expected at least {pushed}"
+                )));
             }
             submitted += pushed;
         }

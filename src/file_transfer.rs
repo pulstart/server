@@ -916,7 +916,7 @@ pub fn set_clipboard_file(path: &Path) {
             .and_then(|mut child| {
                 if let Some(ref mut stdin) = child.stdin {
                     use std::io::Write;
-                    let _ = write!(stdin, "{uri}\n");
+                    let _ = writeln!(stdin, "{uri}");
                 }
                 child.wait()
             });
@@ -928,7 +928,7 @@ pub fn set_clipboard_file(path: &Path) {
             .and_then(|mut child| {
                 if let Some(ref mut stdin) = child.stdin {
                     use std::io::Write;
-                    let _ = write!(stdin, "{uri}\n");
+                    let _ = writeln!(stdin, "{uri}");
                 }
                 child.wait()
             });

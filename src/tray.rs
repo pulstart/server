@@ -1154,10 +1154,8 @@ fn show_token_input_dialog(current: &str) -> Option<String> {
         .map(|d| d.contains("KDE"))
         .unwrap_or(false);
 
-    let (first, second): (
-        fn(&str) -> Result<Option<String>, String>,
-        fn(&str) -> Result<Option<String>, String>,
-    ) = if prefer_kde {
+    type DialogFn = fn(&str) -> Result<Option<String>, String>;
+    let (first, second): (DialogFn, DialogFn) = if prefer_kde {
         (try_kdialog, try_zenity)
     } else {
         (try_zenity, try_kdialog)

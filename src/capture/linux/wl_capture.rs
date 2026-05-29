@@ -143,34 +143,32 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for WaylandSt
     ) {
         match event {
             zwlr_screencopy_frame_v1::Event::Buffer {
-                format,
+                format: WEnum::Value(fmt),
                 width,
                 height,
                 stride,
             } => {
                 // Accept XRGB8888 or ARGB8888 (both are BGRX/BGRA in memory on LE).
                 // Prefer formats our encoders handle natively.
-                if let WEnum::Value(fmt) = format {
-                    let dominated = state.buffer_info.as_ref().map_or(false, |existing| {
-                        // Prefer Argb8888 over Xrgb8888 (keeps alpha for cursor)
-                        existing.format == wl_shm::Format::Argb8888
+                let dominated = state.buffer_info.as_ref().is_some_and(|existing| {
+                    // Prefer Argb8888 over Xrgb8888 (keeps alpha for cursor)
+                    existing.format == wl_shm::Format::Argb8888
+                });
+                let dominated = dominated
+                    || (fmt != wl_shm::Format::Xrgb8888 && fmt != wl_shm::Format::Argb8888);
+                if !dominated {
+                    state.buffer_info = Some(ShmBufferInfo {
+                        format: fmt,
+                        width,
+                        height,
+                        stride,
                     });
-                    let dominated = dominated
-                        || (fmt != wl_shm::Format::Xrgb8888 && fmt != wl_shm::Format::Argb8888);
-                    if !dominated {
-                        state.buffer_info = Some(ShmBufferInfo {
-                            format: fmt,
-                            width,
-                            height,
-                            stride,
-                        });
-                    }
                 }
             }
-            zwlr_screencopy_frame_v1::Event::Flags { flags } => {
-                if let WEnum::Value(f) = flags {
-                    state.y_invert = f.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
-                }
+            zwlr_screencopy_frame_v1::Event::Flags {
+                flags: WEnum::Value(f),
+            } => {
+                state.y_invert = f.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 state.frame_state = FrameState::Ready;

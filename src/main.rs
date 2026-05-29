@@ -390,7 +390,23 @@ fn log_selected_linux_encoder(
     );
 }
 
+/// Result of the pipeline start/subscribe handshake: the client subscription,
+/// negotiated stream config, shared bitrate state, debug info, and the shared
+/// capture handle.
+type PipelineSetup = (
+    ClientSubscription,
+    StreamConfig,
+    Arc<AdaptiveBitrateState>,
+    SessionDebugInfo,
+    Arc<SharedCaptureState>,
+);
+
+/// A candidate encoder selection: (config, opened encoder, backend, pixel-format quad).
 #[cfg(target_os = "linux")]
+type LinuxEncoderChoice = (EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8, u8));
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn select_linux_encoder(
     width: u32,
     height: u32,
@@ -407,7 +423,7 @@ fn select_linux_encoder(
     let prefer_first_success =
         forced_codec.is_some() || EncoderConfig::preferred_codec_from_env().is_some();
     let mut failures = Vec::new();
-    let mut selected: Option<(EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8, u8))> = None;
+    let mut selected: Option<LinuxEncoderChoice> = None;
 
     let codec_order = if let Some(codec) = forced_codec {
         encode_config::Codec::preferred_order(Some(codec))
@@ -429,12 +445,7 @@ fn select_linux_encoder(
             base_config.quality = quality;
         }
 
-        let mut best_for_codec: Option<(
-            EncoderConfig,
-            EncoderKind,
-            EncoderBackend,
-            (u8, u8, u8, u8),
-        )> = None;
+        let mut best_for_codec: Option<LinuxEncoderChoice> = None;
 
         for chroma in linux_chroma_candidates(
             codec,
@@ -756,6 +767,108 @@ fn update_encoder_bitrate(encoder: &mut EncoderKind, config: &EncoderConfig) -> 
     }
 }
 
+/// Verifies that an in-place bitrate change actually took effect by measuring
+/// the encoder's real output rate.
+///
+/// libx264 honors a runtime `av_opt_set` bitrate change (verified empirically),
+/// but some encoder wrappers can accept a runtime change without applying it.
+/// If that happened silently the server would think it lowered the bitrate
+/// during congestion while the encoder kept blasting the old rate — the stream
+/// would never recover. This verifier closes that loop: after a *downward*
+/// change, it measures the actual output over a grace window; if the encoder is
+/// still emitting near the old (much higher) rate, the change clearly did not
+/// apply and the ABR loop escalates to an encoder rebuild. After repeated
+/// contradictions it marks in-place as ineffective so future changes rebuild
+/// directly.
+///
+/// Only downward changes are checked: an encoder legitimately produces far less
+/// than the target ceiling on low-motion content, so a low measured rate after
+/// an *upward* change is not evidence of failure. A downward cap, by contrast,
+/// the encoder must honor — making it the verifiable (and stability-critical)
+/// direction. Never trips when in-place works, so it is inert on good backends.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct BitrateVerifier {
+    fps: u32,
+    window_bytes: u64,
+    window_frames: u32,
+    window_start: Instant,
+    pending: Option<(u32, Instant)>, // (target_kbps, deadline)
+    consecutive_failures: u32,
+    inplace_ineffective: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl BitrateVerifier {
+    const GRACE: Duration = Duration::from_millis(1500);
+    // Trip only when the measured rate is far above the requested ceiling, so
+    // normal VBV overshoot / content bursts never cause a false rebuild.
+    const OVERSHOOT_TRIP_RATIO: f64 = 1.8;
+    const FAILURES_TO_DISABLE_INPLACE: u32 = 2;
+
+    fn new(fps: u32, now: Instant) -> Self {
+        Self {
+            fps: fps.max(1),
+            window_bytes: 0,
+            window_frames: 0,
+            window_start: now,
+            pending: None,
+            consecutive_failures: 0,
+            inplace_ineffective: false,
+        }
+    }
+
+    fn record(&mut self, bytes: usize) {
+        self.window_bytes = self.window_bytes.saturating_add(bytes as u64);
+        self.window_frames = self.window_frames.saturating_add(1);
+    }
+
+    /// Arm verification for a downward in-place change to `target_kbps`.
+    fn arm_downward(&mut self, target_kbps: u32, now: Instant) {
+        self.pending = Some((target_kbps, now + Self::GRACE));
+        self.window_bytes = 0;
+        self.window_frames = 0;
+        self.window_start = now;
+    }
+
+    fn measured_kbps(&self, now: Instant) -> Option<u32> {
+        let elapsed = now.duration_since(self.window_start).as_secs_f64();
+        // Need a real time span and enough frames (~half a second) to be stable.
+        if elapsed < 0.5 || self.window_frames < self.fps / 2 {
+            return None;
+        }
+        Some(((self.window_bytes as f64 * 8.0) / elapsed / 1000.0) as u32)
+    }
+
+    /// If a pending downward change has reached its deadline, decide whether it
+    /// took effect. Returns `true` when the change clearly did NOT apply and the
+    /// caller should escalate to an encoder rebuild.
+    fn check_and_take_failure(&mut self, now: Instant) -> bool {
+        let Some((target_kbps, deadline)) = self.pending else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        let Some(measured) = self.measured_kbps(now) else {
+            // Not enough data yet — extend the window a little rather than guess.
+            self.pending = Some((target_kbps, now + Duration::from_millis(500)));
+            return false;
+        };
+        self.pending = None;
+        if measured as f64 > target_kbps as f64 * Self::OVERSHOOT_TRIP_RATIO {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            if self.consecutive_failures >= Self::FAILURES_TO_DISABLE_INPLACE {
+                self.inplace_ineffective = true;
+            }
+            true
+        } else {
+            // In-place worked: output tracked the new ceiling.
+            self.consecutive_failures = 0;
+            false
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn should_schedule_bitrate_reconfigure(
     current_kbps: u32,
@@ -834,7 +947,7 @@ impl SharedCaptureState {
     }
 
     fn updated_config(&self) -> Option<StreamConfig> {
-        self.updated_config.lock().unwrap().clone()
+        *self.updated_config.lock().unwrap()
     }
 
     /// Record a post-switch stream config and bump the generation so connected
@@ -974,10 +1087,29 @@ struct PendingEncoderRebuild {
     rx: Receiver<Result<EncoderKind, String>>,
 }
 
+/// Build a new encoder for `config`/`backend` on a background thread (so the
+/// capture/encode loop never blocks on encoder open) and return the handle the
+/// loop polls. The rebuilt encoder is swapped in — and starts with a keyframe —
+/// once it is ready.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn spawn_encoder_rebuild(config: EncoderConfig, backend: EncoderBackend) -> PendingEncoderRebuild {
+    let (rebuild_tx, rebuild_rx) = bounded(1);
+    let rebuild_config = config.clone();
+    std::thread::spawn(move || {
+        let _ = rebuild_tx.send(create_encoder_for_backend(&rebuild_config, backend));
+    });
+    PendingEncoderRebuild {
+        config,
+        backend,
+        rx: rebuild_rx,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared pipeline thread
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run_shared_pipeline(
     shutdown_rx: Receiver<()>,
     status_tx: Sender<PipelineResult>,
@@ -1207,6 +1339,8 @@ fn run_shared_pipeline(
     let mut pending_encoder_rebuild: Option<PendingEncoderRebuild> = None;
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let mut last_encoder_reconfigure = Instant::now();
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut bitrate_verifier = BitrateVerifier::new(current_config.framerate, Instant::now());
     encode_and_broadcast(
         &mut encoder,
         &video_bc,
@@ -1242,16 +1376,17 @@ fn run_shared_pipeline(
                         break 'pipeline;
                     }
                     frame_rx = new_rx;
-                    let switched_frame =
-                        match frame_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                            Ok(f) => f,
-                            Err(_) => {
-                                eprintln!(
+                    let switched_frame = match frame_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                    {
+                        Ok(f) => f,
+                        Err(_) => {
+                            eprintln!(
                                     "[pipeline] no frame within 5s after output switch; stopping pipeline"
                                 );
-                                break 'pipeline;
-                            }
-                        };
+                            break 'pipeline;
+                        }
+                    };
                     if switched_frame.width != current_config.width
                         || switched_frame.height != current_config.height
                     {
@@ -1422,6 +1557,27 @@ fn run_shared_pipeline(
                     }
                 }
 
+                // A prior in-place *downward* change that the encoder silently
+                // ignored is detected here by measured output rate; escalate it
+                // to a rebuild so the bitrate actually drops during congestion.
+                if pending_encoder_rebuild.is_none()
+                    && bitrate_verifier.check_and_take_failure(Instant::now())
+                {
+                    let backend = encoder_backend(&encoder);
+                    eprintln!(
+                        "[abr] {} ignored in-place bitrate change; rebuilding at {} kbps{}",
+                        encoder_backend_name(backend),
+                        current_config.bitrate_kbps,
+                        if bitrate_verifier.inplace_ineffective {
+                            " (in-place disabled for this encoder)"
+                        } else {
+                            ""
+                        }
+                    );
+                    pending_encoder_rebuild =
+                        Some(spawn_encoder_rebuild(current_config.clone(), backend));
+                }
+
                 let forced_br = control.forced_bitrate_kbps();
                 let target_bitrate = if forced_br > 0 {
                     forced_br
@@ -1443,54 +1599,61 @@ fn run_shared_pipeline(
                         current_config.with_bitrate_kbps(target_bitrate)
                     };
                     let backend = encoder_backend(&encoder);
-                    match update_encoder_bitrate(&mut encoder, &next_config) {
-                        Ok(()) => {
-                            println!(
-                                "[abr] {} bitrate {} -> {} kbps (in-place)",
+                    let old_kbps = current_config.bitrate_kbps;
+                    let downward = next_config.bitrate_kbps < old_kbps;
+
+                    // Skip the in-place attempt entirely once this encoder has
+                    // proven it ignores runtime bitrate changes — rebuild straight
+                    // away so ABR stays effective.
+                    if bitrate_verifier.inplace_ineffective {
+                        if trace {
+                            eprintln!(
+                                "[trace][server] scheduling {} bitrate rebuild {old_kbps} -> {} kbps (in-place known ineffective)",
                                 encoder_backend_name(backend),
-                                current_config.bitrate_kbps,
                                 next_config.bitrate_kbps
                             );
-                            current_config = next_config;
-                            last_encoder_reconfigure = Instant::now();
                         }
-                        Err(err) => {
-                            if trace {
-                                eprintln!(
-                                    "[trace][server] {} in-place bitrate update failed: {err}",
-                                    encoder_backend_name(backend)
-                                );
-                            }
-                            let (rebuild_tx, rebuild_rx) = bounded(1);
-                            let rebuild_config = next_config.clone();
-                            std::thread::spawn(move || {
-                                let result = create_encoder_for_backend(&rebuild_config, backend);
-                                let _ = rebuild_tx.send(result);
-                            });
-                            if trace {
-                                eprintln!(
-                                    "[trace][server] scheduling {} bitrate rebuild {} -> {} kbps",
+                        pending_encoder_rebuild = Some(spawn_encoder_rebuild(next_config, backend));
+                    } else {
+                        match update_encoder_bitrate(&mut encoder, &next_config) {
+                            Ok(()) => {
+                                println!(
+                                    "[abr] {} bitrate {old_kbps} -> {} kbps (in-place)",
                                     encoder_backend_name(backend),
-                                    current_config.bitrate_kbps,
                                     next_config.bitrate_kbps
                                 );
+                                current_config = next_config;
+                                last_encoder_reconfigure = Instant::now();
+                                // Verify downward changes actually took effect.
+                                if downward {
+                                    bitrate_verifier
+                                        .arm_downward(current_config.bitrate_kbps, Instant::now());
+                                }
                             }
-                            pending_encoder_rebuild = Some(PendingEncoderRebuild {
-                                config: next_config,
-                                backend,
-                                rx: rebuild_rx,
-                            });
+                            Err(err) => {
+                                if trace {
+                                    eprintln!(
+                                        "[trace][server] {} in-place bitrate update failed: {err}; scheduling rebuild {old_kbps} -> {} kbps",
+                                        encoder_backend_name(backend),
+                                        next_config.bitrate_kbps
+                                    );
+                                }
+                                pending_encoder_rebuild =
+                                    Some(spawn_encoder_rebuild(next_config, backend));
+                            }
                         }
                     }
                 }
             }
-            encode_and_broadcast(
+            let _encoded_bytes = encode_and_broadcast(
                 &mut encoder,
                 &video_bc,
                 input.as_ref(),
                 &frame,
                 frame_captured_micros,
             );
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            bitrate_verifier.record(_encoded_bytes);
         } else {
             // Release frame resources without encoding
             #[cfg(target_os = "macos")]
@@ -1535,13 +1698,16 @@ fn run_shared_pipeline(
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
+/// Encode one captured frame, broadcast the resulting access unit(s), and
+/// return the total encoded bytes produced (used by ABR to verify the encoder
+/// actually tracked a requested bitrate change). Returns 0 on encode error.
 fn encode_and_broadcast(
     encoder: &mut encode_vt::VTEncoder,
     broadcaster: &Broadcaster<EncodedVideoFrame>,
     input: &InputRuntime,
     frame: &capture::CapturedFrame,
     captured_micros: u64,
-) {
+) -> usize {
     input.update_cursor(frame.cursor.as_ref());
 
     if !input.control_active() {
@@ -1579,7 +1745,9 @@ fn encode_and_broadcast(
         CVPixelBufferRelease(frame.pixel_buffer_ptr);
     }
 
+    let mut encoded_bytes = 0usize;
     for nal in encoder.receive_nals() {
+        encoded_bytes += nal.data.len();
         broadcaster.broadcast(EncodedVideoFrame {
             data: nal.data,
             capture_micros: captured_micros,
@@ -1587,6 +1755,7 @@ fn encode_and_broadcast(
             is_recovery: nal.is_recovery,
         });
     }
+    encoded_bytes
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1596,7 +1765,7 @@ fn encode_and_broadcast(
     input: &InputRuntime,
     frame: &capture::CapturedFrame,
     captured_micros: u64,
-) {
+) -> usize {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     input.update_cursor(frame.cursor.as_ref());
 
@@ -1686,7 +1855,9 @@ fn encode_and_broadcast(
                     );
                 }
             }
+            let mut encoded_bytes = 0usize;
             for nal in nals {
+                encoded_bytes += nal.data.len();
                 broadcaster.broadcast(EncodedVideoFrame {
                     data: nal.data,
                     capture_micros: captured_micros,
@@ -1694,8 +1865,12 @@ fn encode_and_broadcast(
                     is_recovery: nal.is_recovery,
                 });
             }
+            encoded_bytes
         }
-        Err(e) => eprintln!("encode error: {e}"),
+        Err(e) => {
+            eprintln!("encode error: {e}");
+            0
+        }
     }
 }
 
@@ -2096,95 +2271,90 @@ async fn handle_client(
     let hardware_codecs_for_setup = client_hardware_codecs;
     let supported_yuv444_codecs_for_setup = client_supported_yuv444_codecs;
     let hardware_yuv444_codecs_for_setup = client_hardware_yuv444_codecs;
-    let setup = tokio::task::spawn_blocking(
-        move || -> Result<
-            (
-                ClientSubscription,
-                StreamConfig,
-                Arc<AdaptiveBitrateState>,
-                SessionDebugInfo,
-                Arc<SharedCaptureState>,
-            ),
-            String,
-        > {
-            // Wait for any previous pipeline stop to finish before starting a new one.
-            // Without this, the new capture backend may fail because the old one still
-            // holds exclusive resources (PipeWire portal session, KMS, etc.).
-            if let Some(handle) = state2.pending_pipeline_stop.lock().unwrap().take() {
-                println!("[pipeline] Waiting for previous pipeline to finish stopping...");
-                let _ = handle.join();
-                println!("[pipeline] Previous pipeline stopped.");
-            }
+    let setup = tokio::task::spawn_blocking(move || -> Result<PipelineSetup, String> {
+        // Wait for any previous pipeline stop to finish before starting a new one.
+        // Without this, the new capture backend may fail because the old one still
+        // holds exclusive resources (PipeWire portal session, KMS, etc.).
+        if let Some(handle) = state2.pending_pipeline_stop.lock().unwrap().take() {
+            println!("[pipeline] Waiting for previous pipeline to finish stopping...");
+            let _ = handle.join();
+            println!("[pipeline] Previous pipeline stopped.");
+        }
 
-            let mut pipeline = state2.pipeline.lock().unwrap();
-            // Remove dead pipeline (capture died, portal closed, etc.)
-            if let Some(p) = pipeline.as_ref() {
-                if p.pipeline_handle.is_finished() {
-                    println!("[pipeline] Pipeline thread died, will restart...");
-                    let p = pipeline.take().unwrap();
-                    p.stop();
-                }
+        let mut pipeline = state2.pipeline.lock().unwrap();
+        // Remove dead pipeline (capture died, portal closed, etc.)
+        if let Some(p) = pipeline.as_ref() {
+            if p.pipeline_handle.is_finished() {
+                println!("[pipeline] Pipeline thread died, will restart...");
+                let p = pipeline.take().unwrap();
+                p.stop();
             }
-            if pipeline.is_none() {
-                // Wake the local display before capture's first-frame wait.
-                // On Wayland (PipeWire / wlroots) and KMS, the compositor /
-                // kernel stops driving frames when the monitor is in DPMS off,
-                // which would stall `frame_rx.recv()` until the 30s timeout.
-                // Disable with `ST_WAKE_ON_CONNECT=0`.
-                screen_wake::wake_display();
-                println!("[pipeline] Starting shared pipeline...");
-                let (started, sub) = SharedPipeline::start(
-                    requested_fps_for_setup,
-                    supported_codecs_for_setup,
-                    hardware_codecs_for_setup,
-                    supported_yuv444_codecs_for_setup,
-                    hardware_yuv444_codecs_for_setup,
-                    Arc::clone(&state2.input),
-                    Arc::clone(&state2.control),
-                )?;
-                let stream_config = started.stream_config;
-                let rate_control = Arc::clone(&started.rate_control);
-                let session_debug = started.session_debug.clone();
-                let capture_state = Arc::clone(&started.capture_state);
-                *pipeline = Some(started);
-                return Ok((sub, stream_config, rate_control, session_debug, capture_state));
-            }
-            let p = pipeline.as_ref().unwrap();
-            if !supported_codecs_for_setup.supports(p.stream_config.codec) {
-                return Err(format!(
-                    "Active stream codec '{}' is not supported by this client",
-                    codec_name(p.stream_config.codec)
-                ));
-            }
-            if p.stream_config.chroma == VideoChromaSampling::Yuv444
-                && !supported_yuv444_codecs_for_setup.supports(p.stream_config.codec)
-            {
-                return Err(format!(
-                    "Active stream chroma '{}' is not supported by this client for codec '{}'",
-                    stream_chroma_name(p.stream_config.chroma),
-                    codec_name(p.stream_config.codec)
-                ));
-            }
-            let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            let (aud_id, aud_rx) = p.audio_bc.subscribe(30)?;
-            Ok((
-                ClientSubscription {
-                    vid_sub_id: vid_id,
-                    vid_rx,
-                    video_bc: Arc::clone(&p.video_bc),
-                    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                    aud_sub_id: aud_id,
-                    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                    aud_rx,
-                },
-                p.stream_config,
-                Arc::clone(&p.rate_control),
-                p.session_debug.clone(),
-                Arc::clone(&p.capture_state),
-            ))
-        },
-    )
+        }
+        if pipeline.is_none() {
+            // Wake the local display before capture's first-frame wait.
+            // On Wayland (PipeWire / wlroots) and KMS, the compositor /
+            // kernel stops driving frames when the monitor is in DPMS off,
+            // which would stall `frame_rx.recv()` until the 30s timeout.
+            // Disable with `ST_WAKE_ON_CONNECT=0`.
+            screen_wake::wake_display();
+            println!("[pipeline] Starting shared pipeline...");
+            let (started, sub) = SharedPipeline::start(
+                requested_fps_for_setup,
+                supported_codecs_for_setup,
+                hardware_codecs_for_setup,
+                supported_yuv444_codecs_for_setup,
+                hardware_yuv444_codecs_for_setup,
+                Arc::clone(&state2.input),
+                Arc::clone(&state2.control),
+            )?;
+            let stream_config = started.stream_config;
+            let rate_control = Arc::clone(&started.rate_control);
+            let session_debug = started.session_debug.clone();
+            let capture_state = Arc::clone(&started.capture_state);
+            *pipeline = Some(started);
+            return Ok((
+                sub,
+                stream_config,
+                rate_control,
+                session_debug,
+                capture_state,
+            ));
+        }
+        let p = pipeline.as_ref().unwrap();
+        if !supported_codecs_for_setup.supports(p.stream_config.codec) {
+            return Err(format!(
+                "Active stream codec '{}' is not supported by this client",
+                codec_name(p.stream_config.codec)
+            ));
+        }
+        if p.stream_config.chroma == VideoChromaSampling::Yuv444
+            && !supported_yuv444_codecs_for_setup.supports(p.stream_config.codec)
+        {
+            return Err(format!(
+                "Active stream chroma '{}' is not supported by this client for codec '{}'",
+                stream_chroma_name(p.stream_config.chroma),
+                codec_name(p.stream_config.codec)
+            ));
+        }
+        let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        let (aud_id, aud_rx) = p.audio_bc.subscribe(30)?;
+        Ok((
+            ClientSubscription {
+                vid_sub_id: vid_id,
+                vid_rx,
+                video_bc: Arc::clone(&p.video_bc),
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                aud_sub_id: aud_id,
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                aud_rx,
+            },
+            p.stream_config,
+            Arc::clone(&p.rate_control),
+            p.session_debug.clone(),
+            Arc::clone(&p.capture_state),
+        ))
+    })
     .await
     .unwrap();
 
@@ -2238,14 +2408,12 @@ async fn handle_client(
     control_buf.extend_from_slice(&ControlMessage::ControllerState(controller_state).serialize());
     let available_outputs = capture_state.outputs();
     if available_outputs.len() > 1 {
-        control_buf.extend_from_slice(
-            &ControlMessage::AvailableOutputs(available_outputs).serialize(),
-        );
+        control_buf
+            .extend_from_slice(&ControlMessage::AvailableOutputs(available_outputs).serialize());
         // Tell the client which output is currently captured so it can
         // highlight it (server→client `SelectOutput` means "current selection").
-        control_buf.extend_from_slice(
-            &ControlMessage::SelectOutput(capture_state.selected()).serialize(),
-        );
+        control_buf
+            .extend_from_slice(&ControlMessage::SelectOutput(capture_state.selected()).serialize());
     }
     if let Err(e) = stream.write_all(&control_buf).await {
         eprintln!("Failed to send stream config to {addr}: {e}");
@@ -2934,22 +3102,20 @@ fn handle_punched_client(
     let mut authenticated = false;
     while Instant::now() < deadline {
         punched.tick();
-        if let Some(msg) = punched.try_recv() {
-            if let PunchedMessage::Control(data) = msg {
-                if let Some((ControlMessage::Authenticate(client_token), _)) =
-                    ControlMessage::deserialize(&data)
-                {
-                    if constant_time_eq(client_token.as_bytes(), token.as_bytes()) {
-                        authenticated = true;
-                        let resp = ControlMessage::AuthResult(true).serialize();
-                        let _ = punched.send_control(&resp);
-                        break;
-                    } else {
-                        let resp = ControlMessage::AuthResult(false).serialize();
-                        let _ = punched.send_control(&resp);
-                        eprintln!("[punched] Auth failed from {peer}");
-                        return;
-                    }
+        if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
+            if let Some((ControlMessage::Authenticate(client_token), _)) =
+                ControlMessage::deserialize(&data)
+            {
+                if constant_time_eq(client_token.as_bytes(), token.as_bytes()) {
+                    authenticated = true;
+                    let resp = ControlMessage::AuthResult(true).serialize();
+                    let _ = punched.send_control(&resp);
+                    break;
+                } else {
+                    let resp = ControlMessage::AuthResult(false).serialize();
+                    let _ = punched.send_control(&resp);
+                    eprintln!("[punched] Auth failed from {peer}");
+                    return;
                 }
             }
         }
@@ -2997,16 +3163,7 @@ fn handle_punched_client(
 
     // --- Start/subscribe to pipeline ---
     let state2 = Arc::clone(&state);
-    let setup: Result<
-        (
-            ClientSubscription,
-            StreamConfig,
-            Arc<AdaptiveBitrateState>,
-            SessionDebugInfo,
-            Arc<SharedCaptureState>,
-        ),
-        String,
-    > = (|| {
+    let setup: Result<PipelineSetup, String> = (|| {
         if let Some(handle) = state2.pending_pipeline_stop.lock().unwrap().take() {
             let _ = handle.join();
         }
@@ -3235,8 +3392,9 @@ fn handle_punched_client(
             last_config_generation = capture_state.generation();
             if let Some(new_config) = capture_state.updated_config() {
                 let _ = punched.send_control(&ControlMessage::StreamConfig(new_config).serialize());
-                let _ =
-                    punched.send_control(&ControlMessage::SelectOutput(capture_state.selected()).serialize());
+                let _ = punched.send_control(
+                    &ControlMessage::SelectOutput(capture_state.selected()).serialize(),
+                );
             }
         }
         while let Ok(message) = clipboard_control_rx.try_recv() {
@@ -3535,7 +3693,9 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
     // Handle Ctrl+C so the API thread can unregister cleanly.
     {
         let ctrl = Arc::clone(&state.control);
-        let _ = tokio::spawn(async move {
+        // Detached fire-and-forget handler; the JoinHandle is intentionally
+        // dropped (the task runs until the process exits).
+        let _ctrl_c_task = tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             println!("\n[server] Shutting down...");
             ctrl.request_shutdown();
@@ -3655,5 +3815,67 @@ fn main() {
     if let Err(err) = run_server_runtime(state) {
         eprintln!("{err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod bitrate_verifier_tests {
+    use super::*;
+
+    fn feed(verifier: &mut BitrateVerifier, kbps: u32, fps: u32, secs: u32) {
+        // Feed `secs` seconds of frames whose sizes correspond to `kbps`.
+        let bytes_per_frame = (kbps as u64 * 1000 / 8 / fps as u64) as usize;
+        for _ in 0..(fps * secs) {
+            verifier.record(bytes_per_frame);
+        }
+    }
+
+    #[test]
+    fn does_not_trip_when_output_tracks_lowered_bitrate() {
+        let t0 = Instant::now();
+        let mut v = BitrateVerifier::new(60, t0);
+        // Asked encoder to drop to 5000 kbps; encoder complies and emits ~5000.
+        v.arm_downward(5_000, t0);
+        feed(&mut v, 5_000, 60, 2);
+        let failed = v.check_and_take_failure(t0 + Duration::from_millis(1600));
+        assert!(!failed, "in-place change that took effect must not trip");
+        assert!(!v.inplace_ineffective);
+    }
+
+    #[test]
+    fn trips_when_encoder_ignores_downward_change() {
+        let t0 = Instant::now();
+        let mut v = BitrateVerifier::new(60, t0);
+        // Asked for 5000 kbps but encoder keeps blasting ~20000 kbps.
+        v.arm_downward(5_000, t0);
+        feed(&mut v, 20_000, 60, 2);
+        let failed = v.check_and_take_failure(t0 + Duration::from_millis(1600));
+        assert!(failed, "encoder ignoring the cap must trigger a rebuild");
+    }
+
+    #[test]
+    fn disables_inplace_after_repeated_failures() {
+        let t0 = Instant::now();
+        let mut v = BitrateVerifier::new(60, t0);
+        for i in 0..BitrateVerifier::FAILURES_TO_DISABLE_INPLACE {
+            let base = t0 + Duration::from_secs(i as u64 * 3);
+            v.arm_downward(5_000, base);
+            feed(&mut v, 20_000, 60, 2);
+            assert!(v.check_and_take_failure(base + Duration::from_millis(1600)));
+        }
+        assert!(
+            v.inplace_ineffective,
+            "after repeated contradictions, in-place must be marked ineffective"
+        );
+    }
+
+    #[test]
+    fn waits_for_grace_window_before_judging() {
+        let t0 = Instant::now();
+        let mut v = BitrateVerifier::new(60, t0);
+        v.arm_downward(5_000, t0);
+        feed(&mut v, 20_000, 60, 1);
+        // Before the grace deadline, no verdict yet.
+        assert!(!v.check_and_take_failure(t0 + Duration::from_millis(500)));
     }
 }
