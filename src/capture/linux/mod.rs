@@ -18,6 +18,7 @@ use std::time::Duration;
 pub mod ext_image_copy;
 pub mod gbm_probe;
 pub mod kms_capture;
+pub mod kms_gpu_copy;
 mod nvfbc_capture;
 mod pipewire_capture;
 pub mod wl_capture;

@@ -1,4 +1,5 @@
 use super::super::{CaptureBackend, CapturedCursor, CapturedFrame, DmaBufPlane, FrameData};
+use super::kms_gpu_copy::KmsStabilizer;
 use super::target_frame_interval;
 use crossbeam_channel::{Sender, TrySendError};
 use std::fs::{File, OpenOptions};
@@ -493,6 +494,41 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
 }
 
 /// Capture a single frame from the given plane, returning a CapturedFrame with DMA-BUF planes.
+/// Whether to route captured scanout buffers through the GPU stabilizing copy
+/// (see [`KmsStabilizer`]). Default-on: validated live to fix the tearing +
+/// frame-jumping caused by handing the compositor's recycled scanout buffer to
+/// the async encoder. `ST_KMS_COPY=0` (also `false`/`no`/`off`) is the escape
+/// hatch back to the direct (tearing-prone) path, per CLAUDE.md's auto-enable
+/// rule. Init failure also falls back to direct automatically.
+fn kms_copy_enabled() -> bool {
+    !matches!(
+        std::env::var("ST_KMS_COPY").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    )
+}
+
+/// Replace a captured scanout `FrameData::DmaBuf` with a private, stable copy.
+/// Borrows the source planes (the stabilizer imports + `glFinish`-copies them),
+/// so the original `frame` can be dropped by the caller afterwards. Non-DMA-BUF
+/// frames pass through unchanged.
+fn stabilize_frame(
+    stab: &mut KmsStabilizer,
+    frame: &CapturedFrame,
+) -> Result<CapturedFrame, String> {
+    let data = match &frame.data {
+        FrameData::DmaBuf {
+            planes, drm_format, ..
+        } => stab.stabilize(planes, *drm_format, frame.width, frame.height)?,
+        FrameData::Ram(_) => return Err("stabilizer expects DMA-BUF frames".into()),
+    };
+    Ok(CapturedFrame {
+        data,
+        width: frame.width,
+        height: frame.height,
+        cursor: frame.cursor.clone(),
+    })
+}
+
 fn capture_frame(
     card: &Card,
     plane_handle: control::plane::Handle,
@@ -628,11 +664,47 @@ impl CaptureBackend for KmsCapture {
 
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
+        let copy_render_node = self.render_node.clone();
+        let copy_enabled = kms_copy_enabled();
 
         let handle = thread::spawn(move || {
             let target_interval = target_frame_interval();
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;
+            // Consecutive stabilize failures before we give up on the GPU copy.
+            // Transient failures (all ring slots momentarily in-flight) just
+            // drop a frame; only a sustained streak means a real GL/EGL fault.
+            let mut stab_fail_streak = 0usize;
+            const STAB_FAIL_LIMIT: usize = 30;
+
+            // Optional GPU stabilizing copy: decouples the encoder from KWin's
+            // live scanout buffer cycle (fixes tearing + frame jumping). Built
+            // on the capture thread so its EGL/GL context stays single-threaded.
+            // Any failure logs once and falls back to the direct path.
+            let mut stabilizer = if copy_enabled {
+                match copy_render_node.as_deref() {
+                    Some(node) => match KmsStabilizer::new(node) {
+                        Ok(s) => {
+                            println!("[kms] GPU stabilizing copy enabled ({node})");
+                            Some(s)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[kms] stabilizer init failed ({e}); using direct scanout \
+                                 (may tear). Set ST_CAPTURE=pipewire if tearing appears."
+                            );
+                            None
+                        }
+                    },
+                    None => {
+                        eprintln!("[kms] render node unknown; using direct scanout (may tear)");
+                        None
+                    }
+                }
+            } else {
+                println!("[kms] ST_KMS_COPY=0: GPU stabilizing copy disabled (direct scanout)");
+                None
+            };
 
             // Prefer a kernel timerfd pacer so the capture cadence doesn't drift
             // under load the way `thread::sleep(remainder)` does. If the kernel
@@ -663,18 +735,56 @@ impl CaptureBackend for KmsCapture {
                 };
 
                 match capture_frame(&card, current_plane, cursor_handle) {
-                    Ok(frame) => match tx.try_send(frame) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            if trace && dropped_frames < 8 {
-                                eprintln!(
-                                        "[trace][kms] dropped captured frame because capture channel is full"
-                                    );
+                    Ok(frame) => {
+                        // Route through the GPU stabilizing copy when active. On
+                        // success the original scanout frame is dropped here (its
+                        // exported FDs close). A transient failure (e.g. all ring
+                        // slots in-flight) just drops this frame; only a sustained
+                        // failure streak disables the copy and falls back to the
+                        // direct (tearing) scanout.
+                        let to_send = if let Some(stab) = stabilizer.as_mut() {
+                            match stabilize_frame(stab, &frame) {
+                                Ok(stable) => {
+                                    stab_fail_streak = 0;
+                                    Some(stable)
+                                }
+                                Err(e) => {
+                                    stab_fail_streak += 1;
+                                    if stab_fail_streak >= STAB_FAIL_LIMIT {
+                                        eprintln!(
+                                            "[kms] stabilizing copy failed {stab_fail_streak}x \
+                                             ({e}); disabling it and falling back to direct \
+                                             scanout (may tear)"
+                                        );
+                                        stabilizer = None;
+                                        Some(frame)
+                                    } else {
+                                        if trace {
+                                            eprintln!("[trace][kms] stabilize skipped frame: {e}");
+                                        }
+                                        None
+                                    }
+                                }
                             }
-                            dropped_frames = dropped_frames.saturating_add(1);
+                        } else {
+                            Some(frame)
+                        };
+
+                        if let Some(frame) = to_send {
+                            match tx.try_send(frame) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    if trace && dropped_frames < 8 {
+                                        eprintln!(
+                                            "[trace][kms] dropped captured frame because capture channel is full"
+                                        );
+                                    }
+                                    dropped_frames = dropped_frames.saturating_add(1);
+                                }
+                                Err(TrySendError::Disconnected(_)) => break,
+                            }
                         }
-                        Err(TrySendError::Disconnected(_)) => break,
-                    },
+                    }
                     Err(e) => {
                         eprintln!("[kms] capture_frame error: {e}");
                         thread::sleep(Duration::from_millis(16));
