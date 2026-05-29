@@ -1480,7 +1480,9 @@ fn run_shared_pipeline(
             // KDE scale change, monitor hotplug). Rebuild the encoder on the same
             // backend, re-publish StreamConfig so every client re-fits the video
             // and remaps cursor coordinates against the new dimensions, and force
-            // a keyframe so the post-change bitstream is decodable.
+            // a keyframe so the post-change bitstream is decodable. Gated to the
+            // backends with the rebuild helpers (macOS VT manages this itself).
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             if frame.width != current_config.width || frame.height != current_config.height {
                 println!(
                     "[pipeline] capture resolution changed {}x{} -> {}x{}; reconfiguring stream",
