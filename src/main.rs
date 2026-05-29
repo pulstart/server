@@ -11,6 +11,8 @@ mod broadcast;
 mod capture;
 mod clipboard;
 mod colorspace;
+#[cfg(unix)]
+mod control_ipc;
 #[cfg(target_os = "linux")]
 mod encode;
 mod encode_config;
@@ -30,6 +32,8 @@ mod linux_uring;
 mod macos_display;
 mod screen_wake;
 mod server_control;
+#[cfg(target_os = "linux")]
+mod session_follow;
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod tray;
@@ -1279,6 +1283,10 @@ fn run_shared_pipeline(
         ap.apply_auto_detect();
         Arc::new(std::sync::Mutex::new(ap))
     };
+    // System-wide mode: follow the active seat's user so audio re-attaches to
+    // whoever is logged in. No-op in per-user mode (already in the session).
+    #[cfg(target_os = "linux")]
+    session_follow::maybe_spawn(Arc::clone(&audio_pipeline_shared));
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let audio_pipeline = Arc::clone(&audio_pipeline_shared);
 
@@ -1449,24 +1457,70 @@ fn run_shared_pipeline(
         let (frame, frame_captured_micros) = {
             let mut latest = frame;
             let mut latest_captured_micros = frame_captured_micros;
+            // A capture-requested keyframe (e.g. KMS seat/session switch) must
+            // survive frame-dropping — OR it across every drained frame.
+            let mut force_keyframe = latest.force_keyframe;
             while let Ok(newer) = frame_rx.try_recv() {
                 #[cfg(target_os = "macos")]
                 unsafe {
                     CVPixelBufferRelease(latest.pixel_buffer_ptr);
                 }
+                force_keyframe |= newer.force_keyframe;
                 latest = newer;
                 latest_captured_micros = unix_time_micros();
             }
+            latest.force_keyframe = force_keyframe;
             (latest, latest_captured_micros)
         };
 
         // Only encode when there are subscribers (save GPU/CPU when idle)
         if video_bc.subscriber_count() > 0 {
+            // Live resolution change *not* driven by SelectOutput: the active
+            // scanout started delivering a different size (remote display mode /
+            // KDE scale change, monitor hotplug). Rebuild the encoder on the same
+            // backend, re-publish StreamConfig so every client re-fits the video
+            // and remaps cursor coordinates against the new dimensions, and force
+            // a keyframe so the post-change bitstream is decodable.
+            if frame.width != current_config.width || frame.height != current_config.height {
+                println!(
+                    "[pipeline] capture resolution changed {}x{} -> {}x{}; reconfiguring stream",
+                    current_config.width, current_config.height, frame.width, frame.height
+                );
+                let mut new_config = current_config.clone();
+                new_config.width = frame.width;
+                new_config.height = frame.height;
+                let backend = encoder_backend(&encoder);
+                match create_encoder_for_backend(&new_config, backend) {
+                    Ok(mut new_encoder) => {
+                        request_next_keyframe(&mut new_encoder);
+                        encoder = new_encoder;
+                        current_config = new_config;
+                        capture_state
+                            .publish_config(current_config.to_stream_config(&audio_config));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[pipeline] encoder rebuild for resolution change failed: {e}; stopping pipeline"
+                        );
+                        break 'pipeline;
+                    }
+                }
+            }
             // Force IDR when a new subscriber just joined (so it can start decoding)
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             if video_bc.take_keyframe_request() {
                 if trace {
                     eprintln!("[trace][server] taking pending keyframe request");
+                }
+                request_next_keyframe(&mut encoder);
+            }
+            // A capture backend can demand a keyframe for a content discontinuity
+            // the encoder can't infer from dimensions (KMS seat/user switch at the
+            // same resolution).
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            if frame.force_keyframe {
+                if trace {
+                    eprintln!("[trace][server] capture demanded keyframe (seat/session switch)");
                 }
                 request_next_keyframe(&mut encoder);
             }
@@ -1794,6 +1848,7 @@ fn encode_and_broadcast(
                         height: frame.height,
                         #[cfg(any(target_os = "linux", target_os = "windows"))]
                         cursor: None,
+                        force_keyframe: frame.force_keyframe,
                     };
                     &frame_with_cursor
                 }
@@ -1815,6 +1870,7 @@ fn encode_and_broadcast(
                                 height: frame.height,
                                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                                 cursor: None,
+                                force_keyframe: frame.force_keyframe,
                             };
                             &frame_with_cursor
                         }
@@ -3775,6 +3831,58 @@ fn join_server_thread(handle: std::thread::JoinHandle<Result<(), String>>) -> ! 
     }
 }
 
+/// How this process was launched.
+///
+/// - `Normal`: default per-user behavior — full pipeline plus an in-process tray.
+/// - `System`: system-wide service — full pipeline, no tray, state under
+///   `/var/lib/st-server`, control socket hosted for a per-user tray agent.
+/// - `Tray`: the per-user tray agent — connects to a system service's control
+///   socket and shows the tray only (Linux).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum RunMode {
+    Normal,
+    System,
+    Tray,
+}
+
+fn parse_run_mode() -> RunMode {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--system" => return RunMode::System,
+            "--tray" => return RunMode::Tray,
+            _ => {}
+        }
+    }
+    match std::env::var("ST_MODE").as_deref() {
+        Ok("system") => RunMode::System,
+        Ok("tray") => RunMode::Tray,
+        _ => RunMode::Normal,
+    }
+}
+
+/// Set the environment defaults for system-wide mode before any subsystem reads
+/// them. KMS is the only capture backend that works at the login screen and
+/// follows the active seat across user switches; the tray lives in a separate
+/// per-user agent; state goes to a root-owned dir. Each is only set if the user
+/// hasn't already overridden it, preserving the escape hatches.
+#[cfg(target_os = "linux")]
+fn apply_system_mode_env() {
+    if std::env::var_os("ST_CAPTURE").is_none() {
+        std::env::set_var("ST_CAPTURE", "kms");
+    }
+    std::env::set_var("ST_SERVER_NO_TRAY", "1");
+    std::env::set_var("ST_SYSTEM_MODE", "1");
+    if std::env::var_os("ST_STATE_DIR").is_none() {
+        std::env::set_var("ST_STATE_DIR", "/var/lib/st-server");
+    }
+    println!(
+        "[system] system-wide mode: capture={}, tray disabled, state={}, control socket={}",
+        std::env::var("ST_CAPTURE").unwrap_or_else(|_| "kms".into()),
+        std::env::var("ST_STATE_DIR").unwrap_or_else(|_| "/var/lib/st-server".into()),
+        control_ipc::default_socket_path().display(),
+    );
+}
+
 fn main() {
     match updater::maybe_run_apply_update_from_args() {
         Ok(true) => return,
@@ -3783,6 +3891,32 @@ fn main() {
             eprintln!("[updater] {err}");
             std::process::exit(1);
         }
+    }
+
+    let mode = parse_run_mode();
+
+    // Per-user tray agent: connect to the system service's control socket and
+    // run the tray only. No pipeline in this process.
+    #[cfg(target_os = "linux")]
+    if mode == RunMode::Tray {
+        let socket = control_ipc::default_socket_path();
+        match tray::run_tray_agent(&socket) {
+            Ok(()) => return,
+            Err(err) => {
+                eprintln!("[tray] {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if mode == RunMode::Tray {
+        eprintln!("[tray] --tray agent mode is Linux-only");
+        std::process::exit(1);
+    }
+
+    #[cfg(target_os = "linux")]
+    if mode == RunMode::System {
+        apply_system_mode_env();
     }
 
     #[cfg(target_os = "linux")]
@@ -3794,8 +3928,23 @@ fn main() {
     let tunnel_state = Some(Arc::new(api_client::ApiTunnelState::new()));
     let state = build_server_state(Arc::clone(&control), listen_port, tunnel_state.clone());
 
+    // System-wide mode: no tray in this process. Host the control socket so a
+    // per-user `st-server --tray` agent can drive it, then run headless.
+    #[cfg(unix)]
+    if mode == RunMode::System {
+        control.start_automatic_update_checks();
+        let ipc_control = Arc::clone(&control);
+        let ipc_tunnel = tunnel_state.clone();
+        std::thread::spawn(move || {
+            let path = control_ipc::default_socket_path();
+            if let Err(err) = control_ipc::serve(ipc_control, ipc_tunnel, &path) {
+                eprintln!("[control-ipc] serve failed: {err}");
+            }
+        });
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    if tray::should_run_tray() {
+    if mode == RunMode::Normal && tray::should_run_tray() {
         control.start_automatic_update_checks();
         let server_state = Arc::clone(&state);
         let server_handle = std::thread::spawn(move || run_server_runtime(server_state));

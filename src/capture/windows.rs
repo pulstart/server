@@ -234,6 +234,7 @@ fn run_dxgi_capture_loop(
                 width: session.width,
                 height: session.height,
                 cursor,
+                force_keyframe: false,
             };
             match tx.try_send(frame) {
                 Ok(()) => {}
@@ -726,6 +727,7 @@ impl GdiCaptureSession {
                 width: self.width as u32,
                 height: self.height as u32,
                 cursor,
+                force_keyframe: false,
             })
         }
     }

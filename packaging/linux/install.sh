@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
-# st-server Linux installer (user-session mode).
+# st-server Linux installer.
 #
-# Installs st-server into the invoking user's home as a systemd user service
-# that starts on desktop login. Because it runs under the user's session bus,
-# it reaches PipeWire, PulseAudio, xdg-desktop-portal, and the compositor
-# natively — no cross-user permission juggling.
+# DEFAULT (no args): SYSTEM-WIDE. Installs a root systemd service that starts at
+# the login screen and follows whichever user logs in — KMS video + uinput input
+# work at the greeter and across user switches, audio follows the active user via
+# logind, and a per-user tray agent (`st-server --tray`) drives the service over a
+# control socket. This grants token holders root-level remote control of the
+# machine from the login screen onward (see --system section in README).
 #
-# One-liner:
 #     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash
 #
-# The steps that need root are bundled into one sudo block: the /dev/uinput
-# udev rule (input injection) and granting cap_sys_admin to the binary so
-# Wayland KMS capture works without the XDG screen-share dialog. A small root
-# systemd path-unit re-applies the capability after self-updates replace the
-# binary, so upgrades stay dialog-free with no further prompts. Without the
-# cap (e.g. libcap missing) the server falls back to the PipeWire portal.
+# --user: per-user mode instead — a systemd *user* service in the invoking user's
+# session. No root service; reaches PipeWire/PulseAudio/portal/compositor
+# natively. Smallest blast radius. The root steps (uinput udev rule, cap_sys_admin
+# on the binary for dialog-free KMS, and a path-unit re-applying the cap after
+# self-updates) are bundled into one sudo block.
 #
-# Uninstall:
-#     curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash -s -- --uninstall
+#     curl -fsSL .../install.sh | bash -s -- --user
+#
+# Uninstall (match the install scope):
+#     curl -fsSL .../install.sh | bash -s -- --uninstall          # system-wide
+#     curl -fsSL .../install.sh | bash -s -- --user --uninstall   # per-user
 #
 # Environment knobs:
 #     ST_SERVER_VERSION=v0.4.6    Pin a specific release (default: latest).
@@ -34,6 +37,16 @@ DESKTOP_DIR="${HOME}/.local/share/applications"
 ICON_DIR="${HOME}/.local/share/icons/hicolor/256x256/apps"
 UDEV_PATH="/etc/udev/rules.d/99-st-server.rules"
 MODULES_LOAD_PATH="/etc/modules-load.d/st-server.conf"
+
+# --- System-wide mode paths (install.sh --system) ---
+SYSTEM_PREFIX="${ST_SYSTEM_PREFIX:-/opt/st-server}"
+SYSTEM_BIN="/usr/local/bin/st-server"
+SYSTEM_SERVICE_PATH="/etc/systemd/system/st-server.service"
+GLOBAL_TRAY_PATH="/etc/systemd/user/st-server-tray.service"
+TMPFILES_PATH="/etc/tmpfiles.d/st-server.conf"
+SYSTEM_STATE_DIR="/var/lib/st-server"
+SOCKET_DIR="/run/st-server"
+SYSTEM_GROUP="st-server"
 
 log()  { printf '\033[1;34m[st-install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[st-install]\033[0m %s\n' "$*" >&2; }
@@ -339,28 +352,259 @@ Reinstall anytime with:
 EOF
 }
 
+# =====================================================================
+# System-wide mode (install.sh --system)
+#
+# Installs st-server as a ROOT system service that starts at the login
+# screen and follows whichever user logs in:
+#   - video: KMS captures the active scanout (greeter, then any user)
+#   - input: uinput injects at the kernel level
+#   - audio: a logind watcher repoints PULSE_SERVER at the active user
+# The tray is a separate per-user agent (`st-server --tray`) that reaches
+# the service over a control socket. This is a meaningful privilege
+# escalation over per-user mode: anyone with the token gets root-level
+# remote control of this machine from the login screen onward.
+# =====================================================================
+
+ensure_system_group() {
+    if getent group "$SYSTEM_GROUP" >/dev/null 2>&1; then
+        log "Group '$SYSTEM_GROUP' already exists."
+    else
+        log "Creating system group '$SYSTEM_GROUP' (needs sudo)"
+        sudo groupadd --system "$SYSTEM_GROUP"
+    fi
+    local run_user
+    run_user="$(id -un)"
+    if id -nG "$run_user" | tr ' ' '\n' | grep -qx "$SYSTEM_GROUP"; then
+        log "User '$run_user' already in group '$SYSTEM_GROUP'."
+    else
+        log "Adding '$run_user' to '$SYSTEM_GROUP' so the tray can reach the control socket (log out + back in to apply)."
+        sudo usermod -aG "$SYSTEM_GROUP" "$run_user"
+    fi
+}
+
+# /dev/uinput must exist for input injection. The root service can open it
+# directly, so (unlike per-user mode) no input-group ACL is needed here.
+ensure_uinput_node() {
+    if [[ -f "$MODULES_LOAD_PATH" ]]; then
+        log "uinput modules-load drop-in already present."
+    else
+        log "Ensuring uinput kernel module loads at boot (needs sudo)"
+        echo "uinput" | sudo tee "$MODULES_LOAD_PATH" >/dev/null
+    fi
+    sudo modprobe uinput 2>/dev/null || true
+}
+
+write_tmpfiles() {
+    log "Writing $TMPFILES_PATH (control-socket dir)"
+    # setgid (2750) so the socket the root service creates inherits the
+    # st-server group, letting tray-agent users connect via the 0660 socket.
+    sudo install -Dm0644 /dev/stdin "$TMPFILES_PATH" <<EOF
+# Created by packaging/linux/install.sh --system.
+d ${SOCKET_DIR} 2750 root ${SYSTEM_GROUP} -
+EOF
+    sudo systemd-tmpfiles --create "$TMPFILES_PATH" >/dev/null 2>&1 || true
+}
+
+write_system_service() {
+    log "Writing $SYSTEM_SERVICE_PATH"
+    sudo install -Dm0644 /dev/stdin "$SYSTEM_SERVICE_PATH" <<EOF
+[Unit]
+Description=st low-latency game-streaming server (system-wide)
+Documentation=https://github.com/${REPO}
+# Start once the graphical login screen is up so there is an active scanout
+# (the greeter holds DRM-master) to capture.
+After=display-manager.service systemd-logind.service
+Wants=graphical.target
+
+[Service]
+Type=simple
+ExecStart=${SYSTEM_PREFIX}/st-server --system
+Restart=on-failure
+RestartSec=2
+User=root
+# KMS PRIME-export of a compositor-owned scanout needs CAP_SYS_ADMIN. root
+# already holds it; declaring it documents the requirement and survives a
+# future switch to a non-root User=.
+AmbientCapabilities=CAP_SYS_ADMIN
+SupplementaryGroups=video render input
+# Force a specific backend only for debugging, e.g.:
+#   Environment=ST_CAPTURE=kms
+#   Environment=ST_AUDIO_FOLLOW=0
+
+[Install]
+WantedBy=graphical.target
+EOF
+}
+
+write_global_tray_unit() {
+    log "Writing $GLOBAL_TRAY_PATH (per-user tray agent, all users)"
+    sudo install -Dm0644 /dev/stdin "$GLOBAL_TRAY_PATH" <<EOF
+[Unit]
+Description=st-server tray agent
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=${SYSTEM_BIN} --tray
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+}
+
+enable_system_services() {
+    sudo systemctl daemon-reload
+    if [[ -n "${ST_SERVER_NO_ENABLE:-}" ]]; then
+        log "ST_SERVER_NO_ENABLE is set — not enabling the system service."
+        log "Enable manually: sudo systemctl enable --now st-server && systemctl --global enable st-server-tray"
+        return
+    fi
+    log "Enabling and starting the system service"
+    sudo systemctl enable --now st-server.service
+    # --global enables the tray unit for every user's session (applies on
+    # their next login; start it now for the current user if a session exists).
+    log "Enabling the per-user tray agent for all users"
+    sudo systemctl --global enable st-server-tray.service
+    systemctl --user start st-server-tray.service 2>/dev/null || true
+}
+
+install_system() {
+    local platform version tmp
+    platform="$(detect_platform)"
+    version="$(resolve_version)"
+    log "Installing st-server ${version} (${platform}) system-wide into ${SYSTEM_PREFIX}"
+
+    tmp="$(mktemp -d)"
+    download_and_extract "$version" "$platform" "$tmp/st-server"
+
+    log "Installing binary + assets into ${SYSTEM_PREFIX} (needs sudo)"
+    sudo rm -rf "$SYSTEM_PREFIX"
+    sudo mkdir -p "$SYSTEM_PREFIX"
+    sudo cp -a "$tmp/st-server/." "$SYSTEM_PREFIX/"
+    rm -rf "$tmp"
+    sudo ln -sf "$SYSTEM_PREFIX/st-server" "$SYSTEM_BIN"
+    sudo install -d -m0700 "$SYSTEM_STATE_DIR"
+
+    ensure_system_group
+    ensure_uinput_node
+    write_tmpfiles
+    write_system_service
+    write_global_tray_unit
+    enable_system_services
+    print_system_hint
+}
+
+print_system_hint() {
+    cat <<EOF
+
+-------------------------------------------------------------------
+st-server is installed SYSTEM-WIDE and starts at the login screen.
+
+  Status:   systemctl status st-server
+  Logs:     journalctl -u st-server -f
+  Binary:   ${SYSTEM_PREFIX}/st-server
+  State:    ${SYSTEM_STATE_DIR}/  (root-owned)
+  Service:  ${SYSTEM_SERVICE_PATH}  (root, --system)
+  Tray:     ${GLOBAL_TRAY_PATH}  (per-user 'st-server --tray')
+  Socket:   ${SOCKET_DIR}/control.sock  (group ${SYSTEM_GROUP})
+
+Video + input work at the greeter and follow whichever user logs in.
+Audio follows the active user (ST_AUDIO_FOLLOW=0 to disable).
+
+The tray icon appears in each user's session and reaches the service
+over the control socket. You were added to the '${SYSTEM_GROUP}' group —
+log out and back in for the tray to connect.
+
+First-connect token (keep it secret — root-level control):
+
+  sudo cat ${SYSTEM_STATE_DIR}/st-server-config.json
+
+Or click the tray icon and pick "Copy Token". Override with
+ST_TOKEN=<hex> via: sudo systemctl edit st-server
+
+Uninstall:
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/packaging/linux/install.sh | bash -s -- --system --uninstall
+-------------------------------------------------------------------
+EOF
+}
+
+uninstall_system() {
+    log "Stopping and disabling the system service"
+    sudo systemctl disable --now st-server.service 2>/dev/null || true
+    sudo systemctl --global disable st-server-tray.service 2>/dev/null || true
+    systemctl --user stop st-server-tray.service 2>/dev/null || true
+
+    log "Removing system units, tmpfiles, binary symlink (needs sudo)"
+    sudo rm -f "$SYSTEM_SERVICE_PATH" "$GLOBAL_TRAY_PATH" "$TMPFILES_PATH" "$SYSTEM_BIN"
+    sudo systemctl daemon-reload 2>/dev/null || true
+
+    if [[ -d "$SYSTEM_PREFIX" ]]; then
+        log "Removing install prefix $SYSTEM_PREFIX"
+        sudo rm -rf "$SYSTEM_PREFIX"
+    fi
+    sudo rm -rf "$SOCKET_DIR" 2>/dev/null || true
+
+    cat <<EOF
+
+-------------------------------------------------------------------
+st-server (system-wide) is uninstalled.
+
+State at ${SYSTEM_STATE_DIR}/ is kept so the token survives a reinstall.
+Remove it by hand for a clean slate:
+
+  sudo rm -rf ${SYSTEM_STATE_DIR}
+
+The '${SYSTEM_GROUP}' group and the uinput modules-load drop-in are left in
+place (harmless). Remove them manually if you want:
+
+  sudo groupdel ${SYSTEM_GROUP}
+  sudo rm -f ${MODULES_LOAD_PATH}
+-------------------------------------------------------------------
+EOF
+}
+
 main() {
     require_user
     require_cmds
 
-    local mode="install"
+    local mode="install" scope="system"
     for arg in "$@"; do
         case "$arg" in
             --uninstall) mode="uninstall" ;;
+            --system) scope="system" ;;
+            --user) scope="user" ;;
             -h|--help)
                 cat <<EOF
-Usage: install.sh [--uninstall]
+Usage: install.sh [--user] [--uninstall]
 
-  (no args)     Install the latest release as a user systemd service.
-  --uninstall   Remove the service, binary, desktop entry, udev rule, and the
-                cap_sys_admin re-apply path-unit. State at ~/.local/state/st/
-                is preserved.
+  (no args)            Install SYSTEM-WIDE (default): a root service that starts
+                       at the login screen and follows whichever user logs in
+                       (KMS video + uinput input + logind audio-follow), plus a
+                       per-user tray agent. Grants token holders root-level
+                       remote control from the greeter onward.
+  --user               Install as a per-user systemd service that starts on
+                       desktop login (no root service, smallest blast radius).
+  --uninstall          Remove the system-wide install (state preserved).
+  --user --uninstall   Remove the per-user install (state preserved).
 EOF
                 return 0
                 ;;
             *) die "Unknown argument: $arg (try --help)" ;;
         esac
     done
+
+    if [[ "$scope" == "system" ]]; then
+        if [[ "$mode" == "uninstall" ]]; then
+            uninstall_system
+        else
+            install_system
+        fi
+        return
+    fi
 
     if [[ "$mode" == "uninstall" ]]; then
         uninstall

@@ -535,6 +535,7 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
             width: buf.width,
             height: buf.height,
             cursor: None, // wlr-screencopy embeds cursor via overlay_cursor=1
+            force_keyframe: false,
         };
 
         match tx.try_send(captured) {

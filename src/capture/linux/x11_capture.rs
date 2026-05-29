@@ -379,6 +379,7 @@ impl CaptureBackend for X11Capture {
                         width: state.width,
                         height: state.height,
                         cursor,
+                        force_keyframe: false,
                     };
 
                     match tx.try_send(frame) {

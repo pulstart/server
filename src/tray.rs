@@ -7,6 +7,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+// System-wide mode: the tray runs as a separate per-user agent and reaches the
+// root service over the control socket instead of holding an Arc<ServerControl>.
+#[cfg(target_os = "linux")]
+use crate::control_ipc::{ClientSnapshot, IpcClient, StateSnapshot, UpdateStateWire};
+#[cfg(target_os = "linux")]
+use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::time::UNIX_EPOCH;
+
 #[cfg(target_os = "linux")]
 use ksni::blocking::TrayMethods as _;
 #[cfg(target_os = "linux")]
@@ -113,7 +124,10 @@ pub fn run_tray(
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        run_linux_tray(control, tunnel_state)
+        run_linux_tray(ControlHandle::Local {
+            control,
+            tunnel: tunnel_state,
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -127,24 +141,36 @@ pub fn run_tray(
     }
 }
 
+/// Run the per-user tray agent (`st-server --tray`) against the system service's
+/// control socket. Same ksni menu as the in-process tray; the data comes over
+/// the socket instead of from an `Arc<ServerControl>`.
 #[cfg(target_os = "linux")]
-fn run_linux_tray(
-    control: Arc<ServerControl>,
-    tunnel_state: Option<Arc<ApiTunnelState>>,
-) -> Result<(), String> {
+pub fn run_tray_agent(socket: &std::path::Path) -> Result<(), String> {
+    let remote = RemoteControl::connect(socket).map_err(|err| {
+        format!(
+            "Failed to connect to control socket {}: {err}",
+            socket.display()
+        )
+    })?;
+    run_linux_tray(ControlHandle::Remote(remote))
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
     let mut last_version = control.ui_version();
-    let mut last_api_connected = tunnel_state.as_ref().map(|ts| ts.is_connected());
+    let mut last_api_connected = control.api_connected();
     let handle = LinuxTray {
-        control: Arc::clone(&control),
-        tunnel_state: tunnel_state.clone(),
+        control: control.clone(),
     }
     .assume_sni_available(true)
     .spawn()
     .map_err(|err| format!("Failed to create Linux tray: {err}"))?;
 
     while !control.shutdown_requested() && !handle.is_closed() {
+        // Remote handles pull a fresh snapshot here; Local is a no-op.
+        control.refresh();
         let version = control.ui_version();
-        let api_connected = tunnel_state.as_ref().map(|ts| ts.is_connected());
+        let api_connected = control.api_connected();
         if version != last_version || api_connected != last_api_connected {
             last_version = version;
             last_api_connected = api_connected;
@@ -157,10 +183,299 @@ fn run_linux_tray(
     Ok(())
 }
 
+/// Source of control state for the Linux tray: either the in-process
+/// `ServerControl` (default per-user mode) or a remote service over the control
+/// socket (system-wide mode). Both expose the same accessor/mutator surface so
+/// the tray menu code is identical.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+enum ControlHandle {
+    Local {
+        control: Arc<ServerControl>,
+        tunnel: Option<Arc<ApiTunnelState>>,
+    },
+    Remote(Arc<RemoteControl>),
+}
+
+#[cfg(target_os = "linux")]
+impl ControlHandle {
+    fn refresh(&self) {
+        if let ControlHandle::Remote(r) = self {
+            r.refresh();
+        }
+    }
+
+    fn ui_version(&self) -> usize {
+        match self {
+            ControlHandle::Local { control, .. } => control.ui_version(),
+            ControlHandle::Remote(r) => r.cache().version,
+        }
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        match self {
+            ControlHandle::Local { control, .. } => control.shutdown_requested(),
+            ControlHandle::Remote(r) => r.cache().shutdown_requested,
+        }
+    }
+
+    fn token(&self) -> String {
+        match self {
+            ControlHandle::Local { control, .. } => control.token(),
+            ControlHandle::Remote(r) => r.cache().token,
+        }
+    }
+
+    fn api_connected(&self) -> Option<bool> {
+        match self {
+            ControlHandle::Local { tunnel, .. } => tunnel.as_ref().map(|t| t.is_connected()),
+            ControlHandle::Remote(r) => r.cache().api_connected,
+        }
+    }
+
+    fn connected_clients(&self) -> Vec<ConnectedClientSnapshot> {
+        match self {
+            ControlHandle::Local { control, .. } => control.connected_clients(),
+            ControlHandle::Remote(r) => r
+                .cache()
+                .clients
+                .into_iter()
+                .map(wire_client_to_snapshot)
+                .collect(),
+        }
+    }
+
+    fn update_state(&self) -> UpdateStateSnapshot {
+        match self {
+            ControlHandle::Local { control, .. } => control.update_state(),
+            ControlHandle::Remote(r) => wire_update_to_snapshot(r.cache().update_state),
+        }
+    }
+
+    fn allow_new_connections(&self) -> bool {
+        match self {
+            ControlHandle::Local { control, .. } => control.allow_new_connections(),
+            ControlHandle::Remote(r) => r.cache().allow_new_connections,
+        }
+    }
+
+    fn forced_codec(&self) -> Option<Codec> {
+        match self {
+            ControlHandle::Local { control, .. } => control.forced_codec(),
+            ControlHandle::Remote(r) => codec_from_u8(r.cache().forced_codec),
+        }
+    }
+
+    fn forced_bitrate_kbps(&self) -> u32 {
+        match self {
+            ControlHandle::Local { control, .. } => control.forced_bitrate_kbps(),
+            ControlHandle::Remote(r) => r.cache().forced_bitrate_kbps,
+        }
+    }
+
+    fn forced_quality(&self) -> Option<QualityPreset> {
+        match self {
+            ControlHandle::Local { control, .. } => control.forced_quality(),
+            ControlHandle::Remote(r) => quality_from_u8(r.cache().forced_quality),
+        }
+    }
+
+    fn set_token(&self, token: String) {
+        match self {
+            ControlHandle::Local { control, .. } => control.set_token(token),
+            ControlHandle::Remote(r) => r.with_client(|c| c.set_token(token)),
+        }
+    }
+
+    fn set_allow_new_connections(&self, allow: bool) {
+        match self {
+            ControlHandle::Local { control, .. } => control.set_allow_new_connections(allow),
+            ControlHandle::Remote(r) => r.with_client(|c| c.set_allow_new_connections(allow)),
+        }
+    }
+
+    fn set_forced_codec(&self, codec: Option<Codec>) {
+        match self {
+            ControlHandle::Local { control, .. } => control.set_forced_codec(codec),
+            ControlHandle::Remote(r) => r.with_client(|c| c.set_forced_codec(codec_to_u8(codec))),
+        }
+    }
+
+    fn set_forced_bitrate_kbps(&self, kbps: u32) {
+        match self {
+            ControlHandle::Local { control, .. } => control.set_forced_bitrate_kbps(kbps),
+            ControlHandle::Remote(r) => r.with_client(|c| c.set_forced_bitrate_kbps(kbps)),
+        }
+    }
+
+    fn set_forced_quality(&self, quality: Option<QualityPreset>) {
+        match self {
+            ControlHandle::Local { control, .. } => control.set_forced_quality(quality),
+            ControlHandle::Remote(r) => {
+                r.with_client(|c| c.set_forced_quality(quality_to_u8(quality)))
+            }
+        }
+    }
+
+    fn begin_update_check(&self) {
+        match self {
+            ControlHandle::Local { control, .. } => control.begin_update_check(),
+            ControlHandle::Remote(r) => r.with_client(|c| c.begin_update_check()),
+        }
+    }
+
+    fn begin_update_install(&self) {
+        match self {
+            ControlHandle::Local { control, .. } => control.begin_update_install(),
+            ControlHandle::Remote(r) => r.with_client(|c| c.begin_update_install()),
+        }
+    }
+
+    fn request_shutdown(&self) {
+        match self {
+            ControlHandle::Local { control, .. } => control.request_shutdown(),
+            ControlHandle::Remote(r) => r.with_client(|c| c.request_shutdown()),
+        }
+    }
+
+    fn request_disconnect(&self, id: usize) -> bool {
+        match self {
+            ControlHandle::Local { control, .. } => control.request_disconnect(id),
+            ControlHandle::Remote(r) => {
+                let res = r
+                    .client
+                    .lock()
+                    .ok()
+                    .and_then(|mut c| c.request_disconnect(id).ok())
+                    .unwrap_or(false);
+                r.refresh();
+                res
+            }
+        }
+    }
+}
+
+/// Client-side cache over the control socket. Reads serve from the last
+/// snapshot; mutators send a request and then refresh the snapshot.
+#[cfg(target_os = "linux")]
+struct RemoteControl {
+    client: Mutex<IpcClient>,
+    cache: Mutex<StateSnapshot>,
+}
+
+#[cfg(target_os = "linux")]
+impl RemoteControl {
+    fn connect(path: &std::path::Path) -> std::io::Result<Arc<Self>> {
+        let mut client = IpcClient::connect(path)?;
+        let snapshot = client.snapshot()?;
+        Ok(Arc::new(Self {
+            client: Mutex::new(client),
+            cache: Mutex::new(snapshot),
+        }))
+    }
+
+    fn cache(&self) -> StateSnapshot {
+        self.cache.lock().unwrap().clone()
+    }
+
+    fn refresh(&self) {
+        let fetched = self.client.lock().ok().and_then(|mut c| c.snapshot().ok());
+        if let Some(snapshot) = fetched {
+            if let Ok(mut cache) = self.cache.lock() {
+                *cache = snapshot;
+            }
+        }
+    }
+
+    fn with_client(&self, f: impl FnOnce(&mut IpcClient) -> std::io::Result<()>) {
+        if let Ok(mut client) = self.client.lock() {
+            if let Err(err) = f(&mut client) {
+                eprintln!("[tray] control request failed: {err}");
+            }
+        }
+        self.refresh();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wire_client_to_snapshot(c: ClientSnapshot) -> ConnectedClientSnapshot {
+    ConnectedClientSnapshot {
+        id: c.id,
+        addr: c
+            .addr
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
+        connected_at: UNIX_EPOCH + Duration::from_secs(c.connected_at_unix),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wire_update_to_snapshot(w: UpdateStateWire) -> UpdateStateSnapshot {
+    match w {
+        UpdateStateWire::Unsupported(m) => UpdateStateSnapshot::Unsupported(m),
+        UpdateStateWire::Idle => UpdateStateSnapshot::Idle,
+        UpdateStateWire::Checking => UpdateStateSnapshot::Checking,
+        UpdateStateWire::UpToDate { version } => UpdateStateSnapshot::UpToDate { version },
+        UpdateStateWire::UpdateAvailable {
+            version,
+            asset_name,
+            download_url,
+        } => UpdateStateSnapshot::UpdateAvailable(updater::ReleaseInfo {
+            version,
+            asset_name,
+            download_url,
+        }),
+        UpdateStateWire::Installing { version } => UpdateStateSnapshot::Installing { version },
+        UpdateStateWire::ClosingForUpdate { version } => {
+            UpdateStateSnapshot::ClosingForUpdate { version }
+        }
+        UpdateStateWire::Error(m) => UpdateStateSnapshot::Error(m),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn codec_from_u8(v: u8) -> Option<Codec> {
+    match v {
+        1 => Some(Codec::H264),
+        2 => Some(Codec::Hevc),
+        3 => Some(Codec::Av1),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn codec_to_u8(c: Option<Codec>) -> u8 {
+    match c {
+        None => 0,
+        Some(Codec::H264) => 1,
+        Some(Codec::Hevc) => 2,
+        Some(Codec::Av1) => 3,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn quality_from_u8(v: u8) -> Option<QualityPreset> {
+    match v {
+        1 => Some(QualityPreset::LowLatency),
+        2 => Some(QualityPreset::Balanced),
+        3 => Some(QualityPreset::HighQuality),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn quality_to_u8(q: Option<QualityPreset>) -> u8 {
+    match q {
+        None => 0,
+        Some(QualityPreset::LowLatency) => 1,
+        Some(QualityPreset::Balanced) => 2,
+        Some(QualityPreset::HighQuality) => 3,
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct LinuxTray {
-    control: Arc<ServerControl>,
-    tunnel_state: Option<Arc<ApiTunnelState>>,
+    control: ControlHandle,
 }
 
 #[cfg(target_os = "linux")]
@@ -181,10 +496,15 @@ impl ksni::Tray for LinuxTray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
-        let connected = !self.control.connected_clients().is_empty();
+        let clients = self.control.connected_clients();
+        let connected = !clients.is_empty();
         ksni::ToolTip {
             title: tray_app_title(),
-            description: tray_tooltip_text(&self.control),
+            description: tray_tooltip_text(
+                clients.len(),
+                self.control.allow_new_connections(),
+                &self.control.update_state(),
+            ),
             icon_pixmap: vec![linux_icon(connected)],
             icon_name: String::new(),
         }
@@ -193,14 +513,17 @@ impl ksni::Tray for LinuxTray {
     fn menu(&self) -> Vec<LinuxMenuItem<Self>> {
         let clients = self.control.connected_clients();
         let update_state = self.control.update_state();
-        let api_status = match &self.tunnel_state {
-            Some(ts) if ts.is_connected() => "API: Connected",
-            Some(_) => "API: Disconnected",
+        let api_status = match self.control.api_connected() {
+            Some(true) => "API: Connected",
+            Some(false) => "API: Disconnected",
             None => "API: Not configured",
         };
         vec![
             disabled_linux_item(tray_app_title()),
-            disabled_linux_item(tray_status_text(&self.control)),
+            disabled_linux_item(tray_status_text(
+                clients.len(),
+                self.control.allow_new_connections(),
+            )),
             disabled_linux_item(api_status.to_string()),
             LinuxStandardItem {
                 label: format!("Token: {} (click to copy)", self.control.token()),
@@ -213,7 +536,7 @@ impl ksni::Tray for LinuxTray {
             LinuxStandardItem {
                 label: "Set Token...".into(),
                 activate: Box::new(|tray: &mut LinuxTray| {
-                    let control = Arc::clone(&tray.control);
+                    let control = tray.control.clone();
                     thread::spawn(move || {
                         if let Some(new_token) = show_token_input_dialog(&control.token()) {
                             if !new_token.is_empty() {
@@ -347,7 +670,7 @@ fn linux_client_menu_items(clients: &[ConnectedClientSnapshot]) -> Vec<LinuxMenu
 }
 
 #[cfg(target_os = "linux")]
-fn linux_codec_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<LinuxTray>> {
+fn linux_codec_menu_items(control: &ControlHandle) -> Vec<LinuxMenuItem<LinuxTray>> {
     let current = control.forced_codec();
     let options: [(Option<Codec>, &str); 4] = [
         (None, "Best Available (Default)"),
@@ -372,7 +695,7 @@ fn linux_codec_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<Lin
 }
 
 #[cfg(target_os = "linux")]
-fn linux_bitrate_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<LinuxTray>> {
+fn linux_bitrate_menu_items(control: &ControlHandle) -> Vec<LinuxMenuItem<LinuxTray>> {
     let current = control.forced_bitrate_kbps();
     let options: [(u32, &str); 11] = [
         (0, "Adaptive (Default)"),
@@ -404,7 +727,7 @@ fn linux_bitrate_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<L
 }
 
 #[cfg(target_os = "linux")]
-fn linux_quality_menu_items(control: &Arc<ServerControl>) -> Vec<LinuxMenuItem<LinuxTray>> {
+fn linux_quality_menu_items(control: &ControlHandle) -> Vec<LinuxMenuItem<LinuxTray>> {
     let current = control.forced_quality();
     let options: [(Option<QualityPreset>, &str); 4] = [
         (None, "Balanced (Default)"),
@@ -727,7 +1050,7 @@ impl TrayApp {
 
         let clients = self.control.connected_clients();
         let update_state = self.control.update_state();
-        let status_text = tray_status_text(&self.control);
+        let status_text = tray_status_text(clients.len(), self.control.allow_new_connections());
 
         if let Some(version_item) = &self.version_item {
             version_item.set_text(tray_app_title());
@@ -753,7 +1076,11 @@ impl TrayApp {
         }
         let connected = !clients.is_empty();
         if let Some(tray) = &self.tray {
-            let _ = tray.set_tooltip(Some(tray_tooltip_text(&self.control)));
+            let _ = tray.set_tooltip(Some(tray_tooltip_text(
+                clients.len(),
+                self.control.allow_new_connections(),
+                &update_state,
+            )));
             if connected != self.last_connected {
                 self.last_connected = connected;
                 if let Ok(icon) = desktop_tray_icon(connected) {
@@ -961,18 +1288,20 @@ fn tray_app_title() -> String {
     format!("st-server v{}", updater::current_version())
 }
 
-fn tray_tooltip_text(control: &ServerControl) -> String {
+fn tray_tooltip_text(
+    client_count: usize,
+    allow_connections: bool,
+    update_state: &UpdateStateSnapshot,
+) -> String {
     format!(
         "{}\n{}",
-        tray_status_text(control),
-        tray_update_status_text(&control.update_state())
+        tray_status_text(client_count, allow_connections),
+        tray_update_status_text(update_state)
     )
 }
 
-fn tray_status_text(control: &ServerControl) -> String {
-    let clients = control.connected_clients();
-    let allow_connections = control.allow_new_connections();
-    if clients.is_empty() {
+fn tray_status_text(client_count: usize, allow_connections: bool) -> String {
+    if client_count == 0 {
         if allow_connections {
             "Ready: no connected clients".to_string()
         } else {
@@ -981,8 +1310,8 @@ fn tray_status_text(control: &ServerControl) -> String {
     } else {
         format!(
             "{} connected client{}{}",
-            clients.len(),
-            if clients.len() == 1 { "" } else { "s" },
+            client_count,
+            if client_count == 1 { "" } else { "s" },
             if allow_connections {
                 ""
             } else {

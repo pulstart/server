@@ -571,6 +571,7 @@ impl CaptureBackend for NvfbcCapture {
                             width: frame_info.width,
                             height: frame_info.height,
                             cursor: None,
+                            force_keyframe: false,
                         };
                         match tx.try_send(frame) {
                             Ok(()) => {}

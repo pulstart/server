@@ -2061,6 +2061,7 @@ fn run_pipewire_stream(
                                 width: info.width,
                                 height: info.height,
                                 cursor,
+                                force_keyframe: false,
                             })
                         }
                         Err(err) => {
@@ -2092,6 +2093,7 @@ fn run_pipewire_stream(
                                 width: info.width,
                                 height: info.height,
                                 cursor,
+                                force_keyframe: false,
                             }),
                             Err(err) => {
                                 eprintln!("[capture] PipeWire dmabuf RAM fallback failed: {err}");
@@ -2113,6 +2115,7 @@ fn run_pipewire_stream(
                             width: info.width,
                             height: info.height,
                             cursor,
+                            force_keyframe: false,
                         }),
                         Err(err) => {
                             eprintln!("[capture] PipeWire shared-memory copy failed: {err}");

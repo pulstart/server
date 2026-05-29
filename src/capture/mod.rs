@@ -105,6 +105,12 @@ pub struct CapturedFrame {
     /// `None` when cursor is already embedded in the frame or currently hidden.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     pub cursor: Option<CapturedCursor>,
+    /// Set by a capture backend to demand the encoder emit a keyframe for this
+    /// frame — used when the captured content discontinuously jumps (e.g. KMS
+    /// active-seat / user switch at the same resolution, where a dimension
+    /// change wouldn't otherwise trigger a rebuild+IDR). The encode loop ORs
+    /// this across drained frames so the request survives frame-dropping.
+    pub force_keyframe: bool,
 }
 
 // SAFETY: The CVPixelBufferRef is retained and owned by this struct.

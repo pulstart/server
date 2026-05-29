@@ -53,6 +53,14 @@ impl PersistedSettings {
 }
 
 fn config_path() -> Option<PathBuf> {
+    // System-wide mode points this at /var/lib/st-server (the service runs as
+    // root with no XDG/HOME). Unlike XDG_STATE_HOME this is the final dir, not
+    // a base to which "st" is appended.
+    if let Some(state_dir) = std::env::var_os("ST_STATE_DIR") {
+        let dir = PathBuf::from(state_dir);
+        let _ = std::fs::create_dir_all(&dir);
+        return Some(dir.join(CONFIG_FILENAME));
+    }
     // Prefer XDG state directory for stable persistence across rebuilds.
     if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME") {
         let dir = PathBuf::from(state_dir).join("st");

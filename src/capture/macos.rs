@@ -70,6 +70,7 @@ impl SCStreamOutputTrait for OutputHandler {
             width,
             height,
             cursor,
+            force_keyframe: false,
         }) {
             Ok(()) => {}
             Err(TrySendError::Full(frame)) | Err(TrySendError::Disconnected(frame)) => unsafe {

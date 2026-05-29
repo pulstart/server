@@ -526,6 +526,8 @@ fn stabilize_frame(
         width: frame.width,
         height: frame.height,
         cursor: frame.cursor.clone(),
+        // Preserve a keyframe demand set on the source frame by the loop.
+        force_keyframe: frame.force_keyframe,
     })
 }
 
@@ -592,6 +594,7 @@ fn capture_frame(
         width,
         height,
         cursor,
+        force_keyframe: false,
     })
 }
 
@@ -671,6 +674,15 @@ impl CaptureBackend for KmsCapture {
             let target_interval = target_frame_interval();
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;
+            // Active-session switch tracking. On a VT / fast-user switch the
+            // foreground compositor changes DRM-master; with cap_sys_admin we
+            // keep exporting the new active scanout, but there's a brief window
+            // where the framebuffer handle is unreadable. Throttle that error
+            // (it used to spam every 16ms and look like a wedge) and announce
+            // the recovery + any resolution change once.
+            let mut capture_err_streak = 0usize;
+            let mut last_err_log: Option<Instant> = None;
+            let mut last_dims: Option<(u32, u32)> = None;
             // Consecutive stabilize failures before we give up on the GPU copy.
             // Transient failures (all ring slots momentarily in-flight) just
             // drop a frame; only a sustained streak means a real GL/EGL fault.
@@ -735,7 +747,34 @@ impl CaptureBackend for KmsCapture {
                 };
 
                 match capture_frame(&card, current_plane, cursor_handle) {
-                    Ok(frame) => {
+                    Ok(mut frame) => {
+                        let dims = (frame.width, frame.height);
+                        let recovered = capture_err_streak > 0;
+                        let dims_changed = last_dims.is_some() && last_dims != Some(dims);
+                        if recovered {
+                            println!(
+                                "[kms] capture recovered after {capture_err_streak} stalled \
+                                 frame(s) (active session resumed)"
+                            );
+                            capture_err_streak = 0;
+                            last_err_log = None;
+                        }
+                        if last_dims != Some(dims) {
+                            if dims_changed {
+                                println!(
+                                    "[kms] scanout changed to {}x{} (output or user switch)",
+                                    dims.0, dims.1
+                                );
+                            }
+                            last_dims = Some(dims);
+                        }
+                        // A seat/user switch jumps content discontinuously; demand a
+                        // keyframe so the client doesn't decode garbage inter-frames
+                        // until the next on-demand IDR. Same-resolution switches
+                        // wouldn't otherwise trigger an encoder rebuild + keyframe.
+                        if recovered || dims_changed {
+                            frame.force_keyframe = true;
+                        }
                         // Route through the GPU stabilizing copy when active. On
                         // success the original scanout frame is dropped here (its
                         // exported FDs close). A transient failure (e.g. all ring
@@ -786,7 +825,18 @@ impl CaptureBackend for KmsCapture {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[kms] capture_frame error: {e}");
+                        capture_err_streak += 1;
+                        let now = Instant::now();
+                        let should_log = capture_err_streak == 1
+                            || last_err_log
+                                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2));
+                        if should_log {
+                            eprintln!(
+                                "[kms] capture stalled ({e}); active session may be switching \
+                                 (lost DRM scanout access) — retrying"
+                            );
+                            last_err_log = Some(now);
+                        }
                         thread::sleep(Duration::from_millis(16));
                         continue;
                     }

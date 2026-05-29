@@ -1,19 +1,28 @@
-# st-server Linux packaging (user-session mode)
+# st-server Linux packaging
 
-These files install st-server as a **systemd user service** that starts on
-desktop login. The server runs inside the user's own session, so PipeWire,
-PulseAudio, xdg-desktop-portal, and the compositor are all reachable
-natively — no cross-user permission bridging.
+Two install modes:
 
-Pre-login streaming (at SDDM/GDM) is intentionally out of scope: it's a
-different feature and a different architecture. Start a session first.
+- **System-wide (default)** — a **root system service** that starts at the login
+  screen (SDDM/GDM) and follows whichever user logs in. This is what a no-arg
+  install gives you. See [System-wide mode](#system-wide-mode) below.
+- **Per-user (`--user`)** — a **systemd user service** that starts on desktop
+  login and runs inside the user's own session. PipeWire, PulseAudio,
+  xdg-desktop-portal, and the compositor are all reachable natively. No root
+  service, smallest blast radius.
 
 ## One-liner install (recommended)
 
-Downloads the latest GitHub release and wires it up:
+Downloads the latest GitHub release and wires it up **system-wide** (root service
+at the login screen — see the security note in [System-wide mode](#system-wide-mode)):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash
+```
+
+Per-user instead (no root service):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash -s -- --user
 ```
 
 Do **not** run this as root. The script calls `sudo` only for the root
@@ -77,6 +86,47 @@ systemctl --user enable --now st-server
 sed "s|@BIN@|$HOME/.local/bin/st-server|" packaging/linux/st-server.desktop \
   > ~/.local/share/applications/st-server.desktop
 ```
+
+## System-wide mode
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linux/install.sh | bash -s -- --system
+```
+
+Installs a **root** service that starts at the login screen and follows the
+active seat:
+
+- **Video** — KMS captures the active scanout (the greeter first, then any user
+  who logs in). No portal dialog, native multi-monitor.
+- **Input** — uinput injects at the kernel level (session-independent).
+- **Audio** — a logind watcher repoints `PULSE_SERVER`/`XDG_RUNTIME_DIR` at the
+  active user and re-attaches the pipeline on every user switch
+  (`ST_AUDIO_FOLLOW=0` to disable). No audio at the greeter (none exists there).
+- **Tray** — a per-user agent (`st-server --tray`, installed as a global user
+  unit) shows the full tray menu in each user's session and drives the service
+  over a control socket at `/run/st-server/control.sock` (group `st-server`).
+
+What it lays down: binary in `/opt/st-server`, `/usr/local/bin/st-server`
+symlink, `st-server.service` (root, `--system`, `WantedBy=graphical.target`),
+`/etc/systemd/user/st-server-tray.service` (enabled `--global`),
+`/etc/tmpfiles.d/st-server.conf` (the `2750 root:st-server` socket dir), the
+`st-server` group (your user is added to it — log out/in to apply), and a
+uinput modules-load drop-in. State lives in `/var/lib/st-server` (root-owned).
+
+> **Security:** this is a real privilege escalation over per-user mode. Anyone
+> holding the token gets **root-level remote control of this machine from the
+> login screen onward**, before any human logs in. Only enable it where that is
+> the intended capability, and treat the token accordingly.
+
+Manage it with the normal system units:
+
+```sh
+systemctl status st-server
+journalctl -u st-server -f
+sudo cat /var/lib/st-server/st-server-config.json   # the token
+```
+
+Uninstall: `... install.sh | bash -s -- --system --uninstall` (state preserved).
 
 ## First connect
 
