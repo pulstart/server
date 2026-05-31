@@ -355,7 +355,7 @@ impl ControlHandle {
                     .client
                     .lock()
                     .ok()
-                    .and_then(|mut c| c.request_disconnect(id).ok())
+                    .and_then(|mut guard| guard.as_mut().and_then(|c| c.request_disconnect(id).ok()))
                     .unwrap_or(false);
                 r.refresh();
                 res
@@ -368,8 +368,9 @@ impl ControlHandle {
 /// snapshot; mutators send a request and then refresh the snapshot.
 #[cfg(target_os = "linux")]
 struct RemoteControl {
-    client: Mutex<IpcClient>,
+    client: Mutex<Option<IpcClient>>,
     cache: Mutex<StateSnapshot>,
+    socket_path: std::path::PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -378,8 +379,9 @@ impl RemoteControl {
         let mut client = IpcClient::connect(path)?;
         let snapshot = client.snapshot()?;
         Ok(Arc::new(Self {
-            client: Mutex::new(client),
+            client: Mutex::new(Some(client)),
             cache: Mutex::new(snapshot),
+            socket_path: path.to_path_buf(),
         }))
     }
 
@@ -387,19 +389,50 @@ impl RemoteControl {
         self.cache.lock().unwrap().clone()
     }
 
+    /// Pull a fresh snapshot, reconnecting if the socket dropped. The control
+    /// socket dies whenever the system service restarts (manual restart, crash,
+    /// or auto-update — which replaces the binary and restarts the unit), so the
+    /// tray must re-establish it instead of freezing on stale data forever.
     fn refresh(&self) {
-        let fetched = self.client.lock().ok().and_then(|mut c| c.snapshot().ok());
-        if let Some(snapshot) = fetched {
-            if let Ok(mut cache) = self.cache.lock() {
-                *cache = snapshot;
+        let fetched = {
+            let mut guard = self.client.lock().unwrap();
+            guard.as_mut().and_then(|c| c.snapshot().ok())
+        };
+        match fetched {
+            Some(snapshot) => *self.cache.lock().unwrap() = snapshot,
+            None => self.reconnect(),
+        }
+    }
+
+    /// Drop the (likely dead) handle and try to reconnect, refreshing the cache
+    /// on success. Best-effort: failure leaves the cache stale until the next
+    /// tick retries.
+    fn reconnect(&self) {
+        *self.client.lock().unwrap() = None;
+        if let Ok(mut fresh) = IpcClient::connect(&self.socket_path) {
+            if let Ok(snapshot) = fresh.snapshot() {
+                *self.cache.lock().unwrap() = snapshot;
             }
+            *self.client.lock().unwrap() = Some(fresh);
         }
     }
 
     fn with_client(&self, f: impl FnOnce(&mut IpcClient) -> std::io::Result<()>) {
-        if let Ok(mut client) = self.client.lock() {
-            if let Err(err) = f(&mut client) {
-                eprintln!("[tray] control request failed: {err}");
+        {
+            let mut guard = self.client.lock().unwrap();
+            if guard.is_none() {
+                if let Ok(c) = IpcClient::connect(&self.socket_path) {
+                    *guard = Some(c);
+                }
+            }
+            match guard.as_mut() {
+                Some(client) => {
+                    if let Err(err) = f(client) {
+                        eprintln!("[tray] control request failed: {err}");
+                        *guard = None; // force a reconnect on the next call/tick
+                    }
+                }
+                None => eprintln!("[tray] control request failed: socket unavailable"),
             }
         }
         self.refresh();
