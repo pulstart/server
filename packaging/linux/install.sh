@@ -294,7 +294,10 @@ machine):
 
 Or click the tray icon on this machine to copy the token.
 
-Override the token by setting ST_TOKEN=<hex> in the unit:
+Set the token live from the tray ("Set Token") — it persists and survives
+restarts. ST_TOKEN seeds a token only on first run (no token yet); it does
+NOT override a tray-set token. To force ST_TOKEN, clear the saved "token"
+field in the config first, then add it to the unit:
 
   systemctl --user edit st-server
   (add: [Service] Environment=ST_TOKEN=<your-token>)
@@ -365,6 +368,44 @@ EOF
 # escalation over per-user mode: anyone with the token gets root-level
 # remote control of this machine from the login screen onward.
 # =====================================================================
+
+# Path to the invoking user's per-user st-server config (where their token and
+# peer id live). Mirrors server_control.rs config_path(): ST_STATE_DIR is not
+# consulted here because the user-mode server never sets it; honor XDG_STATE_HOME
+# then fall back to ~/.local/state/st.
+user_config_path() {
+    local base
+    if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+        base="${XDG_STATE_HOME}/st"
+    else
+        base="${HOME}/.local/state/st"
+    fi
+    echo "${base}/${CONFIG_FILENAME}"
+}
+
+CONFIG_FILENAME="st-server-config.json"
+SYSTEM_CONFIG_PATH="${SYSTEM_STATE_DIR}/${CONFIG_FILENAME}"
+
+# Seed the system config from the user's existing per-user config so the
+# system-wide service reuses the SAME token (and peer id) the user already sees
+# in their tray and has entered into clients. Without this, the root service
+# mints a fresh token in /var/lib/st-server on first start and every existing
+# client silently stops discovering the host. Only seeds when no system config
+# exists yet — never clobbers an already-running system token.
+seed_system_config_from_user() {
+    if sudo test -s "$SYSTEM_CONFIG_PATH"; then
+        log "System token already present ($SYSTEM_CONFIG_PATH) — keeping it."
+        return
+    fi
+    local user_cfg
+    user_cfg="$(user_config_path)"
+    if [[ ! -s "$user_cfg" ]]; then
+        log "No per-user token to migrate; the service will generate one (read it from the tray or 'sudo cat $SYSTEM_CONFIG_PATH')."
+        return
+    fi
+    log "Seeding system token from your per-user config ($user_cfg) so existing clients keep working."
+    sudo install -Dm0600 -o root -g root "$user_cfg" "$SYSTEM_CONFIG_PATH"
+}
 
 ensure_system_group() {
     if getent group "$SYSTEM_GROUP" >/dev/null 2>&1; then
@@ -489,6 +530,11 @@ install_system() {
     sudo ln -sf "$SYSTEM_PREFIX/st-server" "$SYSTEM_BIN"
     sudo install -d -m0700 "$SYSTEM_STATE_DIR"
 
+    # Reuse the user's existing token (the one shown in the tray / already in
+    # clients) instead of generating a new one. Must run before the service
+    # starts so its first read picks up the seeded token.
+    seed_system_config_from_user
+
     ensure_system_group
     ensure_uinput_node
     write_tmpfiles
@@ -523,8 +569,9 @@ First-connect token (keep it secret — root-level control):
 
   sudo cat ${SYSTEM_STATE_DIR}/st-server-config.json
 
-Or click the tray icon and pick "Copy Token". Override with
-ST_TOKEN=<hex> via: sudo systemctl edit st-server
+Or click the tray icon and pick "Copy Token" / "Set Token". A token set
+from the tray persists and survives restarts. ST_TOKEN only seeds a token
+on first run (no token yet) and will NOT override a tray-set token.
 
 Uninstall:
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/packaging/linux/install.sh | bash -s -- --system --uninstall

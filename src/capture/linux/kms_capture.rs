@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 use std::thread;
@@ -381,43 +381,69 @@ fn find_cursor_plane(
     None
 }
 
-/// Read cursor position from plane properties.
-fn read_cursor_position(
-    card: &Card,
-    cursor_handle: control::plane::Handle,
-) -> Option<(i32, i32, u32, u32)> {
-    let props = card.get_properties(cursor_handle).ok()?;
-    let mut crtc_x: Option<i32> = None;
-    let mut crtc_y: Option<i32> = None;
-    let mut crtc_w: Option<u32> = None;
-    let mut crtc_h: Option<u32> = None;
-
+/// Read the cursor's on-screen position from atomic plane properties.
+///
+/// Returns `(x, y)` in CRTC pixels. Atomic drivers (AMD/Intel) expose `CRTC_X`/
+/// `CRTC_Y`; NVIDIA drives the cursor through the *legacy* DRM cursor API
+/// (`drmModeMoveCursor`) and exposes none of the `CRTC_*` props, and drm-rs
+/// doesn't surface `drmModeGetPlane`'s legacy `crtc_x/y`. There is no readback
+/// path for the legacy position, so we fall back to `(0, 0)`: in hover-absolute
+/// the client renders the cursor at its own local pointer and only needs the
+/// shape + a visible flag, so an unknown server position is harmless there.
+fn read_cursor_position(card: &Card, cursor_handle: control::plane::Handle) -> (i32, i32) {
+    let Ok(props) = card.get_properties(cursor_handle) else {
+        return (0, 0);
+    };
+    let mut crtc_x = 0;
+    let mut crtc_y = 0;
     for (prop_id, value) in props.iter() {
         if let Ok(info) = card.get_property(*prop_id) {
             match info.name().to_str() {
-                Ok("CRTC_X") => crtc_x = Some(*value as i32),
-                Ok("CRTC_Y") => crtc_y = Some(*value as i32),
-                Ok("CRTC_W") => crtc_w = Some(*value as u32),
-                Ok("CRTC_H") => crtc_h = Some(*value as u32),
+                Ok("CRTC_X") => crtc_x = *value as i32,
+                Ok("CRTC_Y") => crtc_y = *value as i32,
                 _ => {}
             }
         }
     }
+    (crtc_x, crtc_y)
+}
 
-    Some((crtc_x?, crtc_y?, crtc_w?, crtc_h?))
+/// One-shot diagnostic: log the first few `capture_cursor` early-exits so a
+/// silently-missing remote cursor (e.g. NVIDIA/KWin HW cursor plane in an
+/// unexpected layout) is debuggable without `ST_URING_TRACE`.
+static CURSOR_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+fn cursor_diag(reason: &str) {
+    if CURSOR_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+        eprintln!("[kms][cursor] no cursor captured: {reason}");
+    }
 }
 
 /// Capture cursor image from its DRM plane by mmap'ing the cursor framebuffer.
 fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<CapturedCursor> {
-    let plane = card.get_plane(cursor_handle).ok()?;
+    let plane = match card.get_plane(cursor_handle) {
+        Ok(p) => p,
+        Err(e) => {
+            cursor_diag(&format!("get_plane failed: {e}"));
+            return None;
+        }
+    };
 
-    // No framebuffer = cursor hidden
-    let fb_handle = plane.framebuffer()?;
+    // No framebuffer = cursor hidden (or KWin not using this HW cursor plane)
+    let Some(fb_handle) = plane.framebuffer() else {
+        cursor_diag("cursor plane has no framebuffer (hidden or SW cursor)");
+        return None;
+    };
 
-    let (x, y, dst_w, dst_h) = read_cursor_position(card, cursor_handle)?;
+    let (x, y) = read_cursor_position(card, cursor_handle);
 
     // Get cursor framebuffer info — try FB2 first, fall back to FB1
-    let fb2 = card.get_planar_framebuffer(fb_handle).ok()?;
+    let fb2 = match card.get_planar_framebuffer(fb_handle) {
+        Ok(f) => f,
+        Err(e) => {
+            cursor_diag(&format!("get_planar_framebuffer failed: {e}"));
+            return None;
+        }
+    };
 
     let cursor_w = fb2.size().0;
     let cursor_h = fb2.size().1;
@@ -426,15 +452,35 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
     // Only handle ARGB8888 cursors (standard for all known drivers)
     const DRM_FORMAT_ARGB8888: u32 = 0x34325241;
     if pixel_format != DRM_FORMAT_ARGB8888 {
+        let f = pixel_format.to_le_bytes();
+        cursor_diag(&format!(
+            "cursor format fourcc={}{}{}{} (0x{:08x}) not ARGB8888, {}x{}",
+            f[0] as char,
+            f[1] as char,
+            f[2] as char,
+            f[3] as char,
+            pixel_format,
+            cursor_w,
+            cursor_h
+        ));
         return None;
     }
 
     let gem_buffers = fb2.buffers();
-    let gem_handle = gem_buffers[0]?;
+    let Some(gem_handle) = gem_buffers[0] else {
+        cursor_diag("cursor framebuffer has no GEM handle");
+        return None;
+    };
     let pitch = fb2.pitches()[0];
 
     // Export GEM handle as DMA-BUF fd for mmap
-    let fd = card.buffer_to_prime_fd(gem_handle, 0x02).ok()?;
+    let fd = match card.buffer_to_prime_fd(gem_handle, 0x02) {
+        Ok(fd) => fd,
+        Err(e) => {
+            cursor_diag(&format!("cursor buffer_to_prime_fd failed: {e}"));
+            return None;
+        }
+    };
     let mapped_size = (pitch * cursor_h) as usize;
 
     let mapped = unsafe {
@@ -449,6 +495,7 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
     };
 
     if mapped == libc::MAP_FAILED {
+        cursor_diag("cursor mmap failed");
         return None;
     }
 
@@ -486,10 +533,20 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
         y,
         hotspot_x: 0,
         hotspot_y: 0,
-        width: dst_w,
-        height: dst_h,
+        // The pixel buffer is the framebuffer, so report its dimensions (the
+        // displayed CRTC_W/H, when present, can differ; the client scales).
+        width: cursor_w,
+        height: cursor_h,
         shape_serial: 0,
         visible: true,
+    })
+    .inspect(|c| {
+        if CURSOR_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 3 {
+            eprintln!(
+                "[kms][cursor] captured cursor fb={}x{} pos=({}, {})",
+                c.width, c.height, c.x, c.y
+            );
+        }
     })
 }
 
@@ -683,6 +740,7 @@ impl CaptureBackend for KmsCapture {
             let mut capture_err_streak = 0usize;
             let mut last_err_log: Option<Instant> = None;
             let mut last_dims: Option<(u32, u32)> = None;
+            let mut logged_fmt = false;
             // Consecutive stabilize failures before we give up on the GPU copy.
             // Transient failures (all ring slots momentarily in-flight) just
             // drop a frame; only a sustained streak means a real GL/EGL fault.
@@ -749,6 +807,27 @@ impl CaptureBackend for KmsCapture {
                 match capture_frame(&card, current_plane, cursor_handle) {
                     Ok(mut frame) => {
                         let dims = (frame.width, frame.height);
+                        if !logged_fmt {
+                            if let FrameData::DmaBuf {
+                                drm_format, planes, ..
+                            } = &frame.data
+                            {
+                                let f = drm_format.to_le_bytes();
+                                let modifier = planes.first().map(|p| p.modifier).unwrap_or(0);
+                                println!(
+                                    "[kms] scanout format fourcc={}{}{}{} (0x{:08x}) modifier=0x{:016x} {}x{}",
+                                    f[0] as char,
+                                    f[1] as char,
+                                    f[2] as char,
+                                    f[3] as char,
+                                    drm_format,
+                                    modifier,
+                                    dims.0,
+                                    dims.1
+                                );
+                            }
+                            logged_fmt = true;
+                        }
                         let recovered = capture_err_streak > 0;
                         let dims_changed = last_dims.is_some() && last_dims != Some(dims);
                         if recovered {

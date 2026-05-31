@@ -131,6 +131,94 @@ fn fit_cursor_shape_to_payload_budget(mut shape: CursorShape) -> (CursorShape, b
     (shape, true)
 }
 
+/// Crop a BGRA (premultiplied) cursor image to its opaque bounding box.
+///
+/// Hardware cursor planes are frequently a fixed over-allocation — NVIDIA's KMS
+/// cursor plane is a 256×256 buffer with the actual ~32px cursor drawn in one
+/// corner and the rest fully transparent. Sending the whole buffer blows the
+/// control payload budget, forcing `fit_cursor_shape_to_payload_budget` to
+/// downscale the *entire* image, which shrinks the visible cursor on the client.
+/// Trimming to the opaque content sends the real cursor at native size.
+///
+/// Returns `(pixels, width, height, offset_x, offset_y)` (offset = top-left of
+/// the opaque region within the source), or `None` if nothing needs cropping
+/// (already tight, or fully transparent — caller keeps the original).
+fn crop_cursor_to_opaque(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 || pixels.len() < w * h * 4 {
+        return None;
+    }
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, 0usize, 0usize);
+    let mut any = false;
+    for y in 0..h {
+        for x in 0..w {
+            // BGRA premultiplied: alpha is the 4th byte.
+            if pixels[(y * w + x) * 4 + 3] != 0 {
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let cw = max_x - min_x + 1;
+    let ch = max_y - min_y + 1;
+    if cw == w && ch == h {
+        return None; // already tight
+    }
+    let mut out = Vec::with_capacity(cw * ch * 4);
+    for y in min_y..=max_y {
+        let row = (y * w + min_x) * 4;
+        out.extend_from_slice(&pixels[row..row + cw * 4]);
+    }
+    Some((out, cw as u32, ch as u32, min_x as u32, min_y as u32))
+}
+
+/// Estimate a cursor's hotspot when the capture backend can't report one (KMS:
+/// the legacy NVIDIA cursor plane exposes no hotspot). `pixels` is BGRA
+/// premultiplied, `w`×`h` the cropped (tight) cursor.
+///
+/// Heuristic by horizontal symmetry of the opaque mask: symmetric cursors (text
+/// I-beam, crosshair, move/resize) get a center hotspot; asymmetric ones (arrow,
+/// hand) get a top-left hotspot, which after the opaque-bbox crop is the visual
+/// tip. Approximate, but nails the two dominant desktop cases — an arrow whose
+/// click point is the tip, and an I-beam whose click point is its center (the
+/// off-by-half-a-line text-selection bug from assuming (0,0) for everything).
+fn estimate_cursor_hotspot(pixels: &[u8], w: u32, h: u32) -> (u32, u32) {
+    let wu = w as usize;
+    let hu = h as usize;
+    if wu < 2 || hu == 0 || pixels.len() < wu * hu * 4 {
+        return (0, 0);
+    }
+    let mut matched = 0usize;
+    let mut total = 0usize;
+    for y in 0..hu {
+        for x in 0..wu / 2 {
+            let left = pixels[(y * wu + x) * 4 + 3] != 0;
+            let right = pixels[(y * wu + (wu - 1 - x)) * 4 + 3] != 0;
+            total += 1;
+            if left == right {
+                matched += 1;
+            }
+        }
+    }
+    let symmetric = total > 0 && matched * 100 >= total * 85;
+    if symmetric {
+        (w / 2, h / 2)
+    } else {
+        (0, 0)
+    }
+}
+
 struct InputRuntimeInner {
     backend: InputBackend,
     backend_label: String,
@@ -427,13 +515,33 @@ impl InputRuntime {
             return;
         }
 
+        // Trim over-allocated HW cursor buffers (e.g. NVIDIA's 256×256 plane with
+        // the cursor in one corner) to their opaque content, so the visible cursor
+        // is sent at native size instead of being downscaled to fit the budget.
+        let (crop_pixels, crop_w, crop_h, crop_dx, crop_dy) =
+            match crop_cursor_to_opaque(&cursor.pixels, cursor.width, cursor.height) {
+                Some(c) => c,
+                None => (cursor.pixels.to_vec(), cursor.width, cursor.height, 0, 0),
+            };
+        // Backends that expose a real hotspot (pipewire/x11) keep it, shifted by
+        // the crop. KMS can't read the hotspot (legacy NVIDIA cursor plane) and
+        // delivers (0,0); estimate it from the cropped shape so arrows anchor at
+        // the tip and I-beams/crosshairs at their center.
+        let (hotspot_x, hotspot_y) = if cursor.hotspot_x == 0 && cursor.hotspot_y == 0 {
+            estimate_cursor_hotspot(&crop_pixels, crop_w, crop_h)
+        } else {
+            (
+                cursor.hotspot_x.saturating_sub(crop_dx),
+                cursor.hotspot_y.saturating_sub(crop_dy),
+            )
+        };
         let (next_shape, resized) = fit_cursor_shape_to_payload_budget(CursorShape {
             serial: cursor.shape_serial,
-            width: cursor.width.min(u16::MAX as u32) as u16,
-            height: cursor.height.min(u16::MAX as u32) as u16,
-            hotspot_x: cursor.hotspot_x.min(u16::MAX as u32) as u16,
-            hotspot_y: cursor.hotspot_y.min(u16::MAX as u32) as u16,
-            rgba: bgra_to_rgba_premultiplied(&cursor.pixels),
+            width: crop_w.min(u16::MAX as u32) as u16,
+            height: crop_h.min(u16::MAX as u32) as u16,
+            hotspot_x: hotspot_x.min(u16::MAX as u32) as u16,
+            hotspot_y: hotspot_y.min(u16::MAX as u32) as u16,
+            rgba: bgra_to_rgba_premultiplied(&crop_pixels),
         });
         if inner
             .cursor_shape
@@ -467,10 +575,12 @@ impl InputRuntime {
             .as_ref()
             .map(|shape| shape.serial)
             .unwrap_or(0);
+        // Cropping moved the visible top-left by (crop_dx, crop_dy) within the
+        // source buffer, so the reported on-screen position shifts to match.
         let next_state = CursorState {
             serial,
-            x: cursor.x,
-            y: cursor.y,
+            x: cursor.x + crop_dx as i32,
+            y: cursor.y + crop_dy as i32,
             visible: cursor.visible,
         };
         if inner.cursor_state != next_state {

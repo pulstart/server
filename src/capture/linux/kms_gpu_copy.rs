@@ -40,6 +40,17 @@ const DRM_FORMAT_MOD_INVALID: u64 = (1u64 << 56) - 1;
 const GBM_BO_USE_RENDERING: u32 = 1 << 2;
 const GBM_BO_USE_LINEAR: u32 = 1 << 4;
 
+// Fixed output format of the stabilizing copy: 8-bit XRGB8888, DRM_FORMAT_MOD_LINEAR.
+// The copy is a *format-normalizing* blit, not a same-format passthrough: the
+// compositor scanout can be a tiled, deep-color buffer the encoders can't consume
+// (e.g. KWin on NVIDIA Wayland hands out ABGR16161616F / FP16 64bpp with an NVIDIA
+// block-linear modifier). gbm can't even allocate a *linear* BO in that format on
+// NVIDIA, and NVENC's CPU readback assumes linear 32bpp BGRA — feeding it the raw
+// tiled FP16 buffer produces garbage. So we always import the source at its real
+// fourcc+modifier (the GL sampler downconverts FP16→unorm for free) and render into
+// an 8-bit linear XRGB8888 target every encoder can read. 'XR24'.
+const OUTPUT_DRM_FORMAT: u32 = 0x3432_5258;
+
 // --- EGL extension constants (not in khronos-egl core) ---------------------
 
 const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
@@ -218,11 +229,26 @@ pub struct KmsStabilizer {
     program: glow::Program,
     vbo: glow::Buffer,
     src_texture: glow::Texture,
+    swap_rb_uniform: Option<glow::UniformLocation>,
+    flip_y_uniform: Option<glow::UniformLocation>,
     pool: SlotPool,
     slots: Vec<RingSlot>,
+    // glReadPixels fallback target (NVIDIA): a plain GL texture FBO, used when
+    // gbm can't export a CPU/encoder-readable linear DMA-BUF (NVIDIA's gbm
+    // rejects `gbm_bo_create` with `GBM_BO_USE_LINEAR` for renderable targets).
+    ram_target: Option<RamTarget>,
+    ram_mode: bool,
+    logged_ram_fallback: bool,
     width: u32,
     height: u32,
-    drm_format: u32,
+}
+
+/// glReadPixels fallback render target: a normal RGBA8 GL texture + FBO, not a
+/// gbm/DMA-BUF buffer. The blit renders into it and the result is read back to a
+/// CPU `Vec` (`FrameData::Ram`). Used where DMA-BUF export is unavailable.
+struct RamTarget {
+    texture: glow::Texture,
+    framebuffer: glow::Framebuffer,
 }
 
 impl KmsStabilizer {
@@ -346,6 +372,8 @@ impl KmsStabilizer {
                 return Err(e);
             }
         };
+        let swap_rb_uniform = unsafe { gl.get_uniform_location(program, "u_swap_rb") };
+        let flip_y_uniform = unsafe { gl.get_uniform_location(program, "u_flip_y") };
 
         Ok(Self {
             gbm,
@@ -359,11 +387,15 @@ impl KmsStabilizer {
             program,
             vbo,
             src_texture,
+            swap_rb_uniform,
+            flip_y_uniform,
             pool: SlotPool::new(RING_SLOTS),
             slots: Vec::new(),
+            ram_target: None,
+            ram_mode: false,
+            logged_ram_fallback: false,
             width: 0,
             height: 0,
-            drm_format: 0,
         })
     }
 
@@ -383,14 +415,19 @@ impl KmsStabilizer {
                 src_planes.len()
             ));
         }
-        self.ensure_targets(width, height, drm_format)?;
+        self.ensure_targets(width, height)?;
+
+        if self.ram_mode {
+            return self.stabilize_ram(&src_planes[0], drm_format, width, height);
+        }
 
         let idx = self
             .pool
             .acquire()
             .ok_or_else(|| "all stabilizer ring slots in-flight".to_string())?;
 
-        let result = self.blit_into(idx, &src_planes[0], drm_format, width, height);
+        let fbo = self.slots[idx].framebuffer;
+        let result = self.blit_to_fbo(fbo, &src_planes[0], drm_format, width, height, false);
         match result {
             Ok(()) => {
                 let slot = &self.slots[idx];
@@ -408,7 +445,9 @@ impl KmsStabilizer {
                         pitch: slot.stride,
                         modifier: slot.modifier,
                     }],
-                    drm_format,
+                    // The copy normalized the pixel format; downstream encoders
+                    // see 8-bit linear XRGB8888, not the source scanout format.
+                    drm_format: OUTPUT_DRM_FORMAT,
                     _lease: Some(self.pool.lease(idx)),
                 })
             }
@@ -419,13 +458,52 @@ impl KmsStabilizer {
         }
     }
 
-    fn blit_into(
+    /// glReadPixels fallback: blit the source into the plain GL FBO and read it
+    /// back to a CPU `Vec` as BGRA. Used when gbm can't export a linear DMA-BUF
+    /// (NVIDIA). No ring/lease: the GL target frees the instant readback returns
+    /// (`glReadPixels` after the blit's `glFinish` is synchronous), and the `Vec`
+    /// owns the pixels handed to the encoder.
+    fn stabilize_ram(
         &mut self,
-        idx: usize,
         src: &DmaBufPlane,
         drm_format: u32,
         width: u32,
         height: u32,
+    ) -> Result<FrameData, String> {
+        let fbo = self
+            .ram_target
+            .as_ref()
+            .ok_or("RAM stabilizer target missing")?
+            .framebuffer;
+        self.blit_to_fbo(fbo, src, drm_format, width, height, true)?;
+
+        let mut buf = vec![0u8; width as usize * height as usize * 4];
+        let gl = &self.gl;
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut buf)),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        Ok(FrameData::Ram(buf))
+    }
+
+    fn blit_to_fbo(
+        &mut self,
+        fbo: glow::Framebuffer,
+        src: &DmaBufPlane,
+        drm_format: u32,
+        width: u32,
+        height: u32,
+        ram: bool,
     ) -> Result<(), String> {
         let src_fd = {
             use std::os::fd::AsRawFd;
@@ -444,7 +522,6 @@ impl KmsStabilizer {
         )?;
 
         let gl = &self.gl;
-        let fbo = self.slots[idx].framebuffer;
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.src_texture));
             (self.image_target_texture_2d)(glow::TEXTURE_2D, src_image.as_ptr() as *const c_void);
@@ -461,6 +538,16 @@ impl KmsStabilizer {
             gl.disable(glow::DEPTH_TEST);
             gl.disable(glow::CULL_FACE);
             gl.use_program(Some(self.program));
+            // RAM (glReadPixels) mode needs both the R/B swap (readback is GL_RGBA,
+            // encoders want BGRA bytes) and an extra vertical flip (readback origin
+            // is bottom-left). DMA-BUF mode needs neither.
+            let mode = if ram { 1 } else { 0 };
+            if let Some(loc) = self.swap_rb_uniform.as_ref() {
+                gl.uniform_1_i32(Some(loc), mode);
+            }
+            if let Some(loc) = self.flip_y_uniform.as_ref() {
+                gl.uniform_1_i32(Some(loc), mode);
+            }
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.src_texture));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
@@ -485,34 +572,131 @@ impl KmsStabilizer {
         Ok(())
     }
 
-    fn ensure_targets(&mut self, width: u32, height: u32, drm_format: u32) -> Result<(), String> {
-        if self.width == width && self.height == height && self.drm_format == drm_format {
+    fn ensure_targets(&mut self, width: u32, height: u32) -> Result<(), String> {
+        // The output target is always 8-bit (linear XRGB8888 DMA-BUF, or an RGBA8
+        // GL texture read back to RAM) regardless of the source scanout format, so
+        // only the geometry can force a rebuild — a source-format change (e.g.
+        // SDR↔HDR toggling the scanout between 8-bit and FP16) needs no new
+        // targets; the source is re-imported fresh on every blit.
+        let built = !self.slots.is_empty() || self.ram_target.is_some();
+        if built && self.width == width && self.height == height {
             return Ok(());
         }
-        // Resolution/format change: every in-flight slot points at the old
-        // geometry. Wait for them to drain is impractical here, so we destroy
-        // and rebuild; in-flight leases simply return to a fresh pool whose
-        // slots are valid indices (their `in_use=false` is harmless).
-        self.destroy_slots();
+        // Resolution change: every in-flight slot/target points at the old
+        // geometry. Waiting for them to drain is impractical here, so we destroy
+        // and rebuild; in-flight DMA-BUF leases simply return to a fresh pool
+        // whose slots are valid indices (their `in_use=false` is harmless).
+        self.destroy_targets();
         self.pool = SlotPool::new(RING_SLOTS);
 
-        for _ in 0..RING_SLOTS {
-            let slot = self.create_slot(width, height, drm_format)?;
-            self.slots.push(slot);
+        // Prefer zero-copy DMA-BUF targets (AMD/Intel). NVIDIA's gbm rejects
+        // linear renderable BOs, so fall back to a glReadPixels CPU copy. The
+        // probe is one-shot: once RAM mode is chosen we stay there.
+        if !self.ram_mode {
+            match self.try_build_slots(width, height) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.ram_mode = true;
+                    if !self.logged_ram_fallback {
+                        self.logged_ram_fallback = true;
+                        eprintln!(
+                            "[kms] DMA-BUF copy target unavailable ({e}); using glReadPixels \
+                             CPU readback for the stabilizing copy (expected on NVIDIA)"
+                        );
+                    }
+                }
+            }
         }
+        if self.ram_mode {
+            self.ram_target = Some(self.create_ram_target(width, height)?);
+        }
+
         self.width = width;
         self.height = height;
-        self.drm_format = drm_format;
         Ok(())
     }
 
-    fn create_slot(&self, width: u32, height: u32, drm_format: u32) -> Result<RingSlot, String> {
+    /// Build a full ring of DMA-BUF slots, cleaning up any partial set on
+    /// failure (so a failed probe leaves no leaked BOs/images/GL objects).
+    fn try_build_slots(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let mut slots = Vec::with_capacity(RING_SLOTS);
+        for _ in 0..RING_SLOTS {
+            match self.create_slot(width, height) {
+                Ok(slot) => slots.push(slot),
+                Err(e) => {
+                    for slot in slots.drain(..) {
+                        self.free_slot(slot);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        self.slots = slots;
+        Ok(())
+    }
+
+    fn create_ram_target(&self, width: u32, height: u32) -> Result<RamTarget, String> {
+        let gl = &self.gl;
+        unsafe {
+            let texture = gl
+                .create_texture()
+                .map_err(|e| format!("create ram texture: {e}"))?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            // GLES2: internal format must equal `format` and be unsized (RGBA).
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                width as i32,
+                height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            let framebuffer = gl
+                .create_framebuffer()
+                .map_err(|e| format!("create ram FBO: {e}"))?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(texture),
+                0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                gl.delete_framebuffer(framebuffer);
+                gl.delete_texture(texture);
+                return Err(format!("ram FBO incomplete (status {status:#x})"));
+            }
+            Ok(RamTarget {
+                texture,
+                framebuffer,
+            })
+        }
+    }
+
+    fn create_slot(&self, width: u32, height: u32) -> Result<RingSlot, String> {
         let bo = unsafe {
             (self.gbm.bo_create)(
                 self.gbm_device,
                 width,
                 height,
-                drm_format,
+                OUTPUT_DRM_FORMAT,
                 GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR,
             )
         };
@@ -534,7 +718,7 @@ impl KmsStabilizer {
         let image = create_dmabuf_image(
             &self.egl,
             self.display,
-            drm_format,
+            OUTPUT_DRM_FORMAT,
             width,
             height,
             import_fd,
@@ -603,13 +787,24 @@ impl KmsStabilizer {
         }
     }
 
-    fn destroy_slots(&mut self) {
-        for slot in self.slots.drain(..) {
+    fn free_slot(&self, slot: RingSlot) {
+        unsafe {
+            self.gl.delete_framebuffer(slot.framebuffer);
+            self.gl.delete_texture(slot.texture);
+            let _ = self.egl.destroy_image(self.display, slot.image);
+            (self.gbm.bo_destroy)(slot.bo);
+        }
+    }
+
+    fn destroy_targets(&mut self) {
+        let slots = std::mem::take(&mut self.slots);
+        for slot in slots {
+            self.free_slot(slot);
+        }
+        if let Some(target) = self.ram_target.take() {
             unsafe {
-                self.gl.delete_framebuffer(slot.framebuffer);
-                self.gl.delete_texture(slot.texture);
-                let _ = self.egl.destroy_image(self.display, slot.image);
-                (self.gbm.bo_destroy)(slot.bo);
+                self.gl.delete_framebuffer(target.framebuffer);
+                self.gl.delete_texture(target.texture);
             }
         }
     }
@@ -617,7 +812,7 @@ impl KmsStabilizer {
 
 impl Drop for KmsStabilizer {
     fn drop(&mut self) {
-        self.destroy_slots();
+        self.destroy_targets();
         unsafe {
             self.gl.delete_program(self.program);
             self.gl.delete_buffer(self.vbo);
@@ -688,18 +883,31 @@ fn build_gl_program(
 ) -> Result<(glow::Program, glow::Buffer, glow::Texture), String> {
     // Fullscreen-quad passthrough. `flip_y` is baked into the vertex UVs at
     // upload time (see `quad_vertices`). GLES2 / GLSL ES 1.00.
+    // `u_flip_y` flips the sampled row. The RAM path reads back with glReadPixels,
+    // whose origin is bottom-left, so it needs one extra vertical flip vs the
+    // DMA-BUF path to hand the encoder a top-down image.
     const VERT: &str = "attribute vec2 a_pos;\n\
 attribute vec2 a_uv;\n\
 varying vec2 v_uv;\n\
+uniform int u_flip_y;\n\
 void main() {\n\
-    v_uv = a_uv;\n\
+    float ty = a_uv.y;\n\
+    if (u_flip_y == 1) { ty = 1.0 - ty; }\n\
+    v_uv = vec2(a_uv.x, ty);\n\
     gl_Position = vec4(a_pos, 0.0, 1.0);\n\
 }\n";
+    // `u_swap_rb` swaps R/B in the output. DMA-BUF mode renders into an XRGB8888
+    // BO (driver handles channel order via the fourcc) so it stays 0; RAM mode
+    // reads back with glReadPixels(GL_RGBA) and the encoders expect BGRA byte
+    // order, so it writes `.bgr` (swap=1) to land bytes as B,G,R,A.
     const FRAG: &str = "precision mediump float;\n\
 varying vec2 v_uv;\n\
 uniform sampler2D u_src;\n\
+uniform int u_swap_rb;\n\
 void main() {\n\
-    gl_FragColor = vec4(texture2D(u_src, v_uv).rgb, 1.0);\n\
+    vec3 c = texture2D(u_src, v_uv).rgb;\n\
+    if (u_swap_rb == 1) { c = c.bgr; }\n\
+    gl_FragColor = vec4(c, 1.0);\n\
 }\n";
 
     unsafe {

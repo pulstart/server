@@ -107,23 +107,45 @@ fn resolve_peer_id(saved: &mut PersistedSettings) -> String {
 }
 
 fn resolve_token(saved: &mut PersistedSettings) -> String {
-    // ST_TOKEN env var overrides everything
-    if let Ok(env_token) = std::env::var("ST_TOKEN") {
-        let t = env_token.trim().to_string();
-        if !t.is_empty() {
-            if saved.token.as_deref() != Some(t.as_str()) {
-                saved.token = Some(t.clone());
-                persist_settings(saved);
+    resolve_token_with(saved, std::env::var("ST_TOKEN").ok().as_deref())
+}
+
+/// Decide the active token from persisted settings and the optional `ST_TOKEN`
+/// seed. Split out from `resolve_token` so the precedence rule is unit-testable
+/// without touching process env or the on-disk config.
+///
+/// Precedence: the persisted token is authoritative — it is the last token set
+/// from the tray (or a prior run) and the server must keep using it across
+/// restarts until the tray changes it again. `ST_TOKEN` is only a first-run
+/// *seed* for a machine that has no token yet; it must NOT override a token the
+/// operator later set from the tray, otherwise a pinned `Environment=ST_TOKEN`
+/// in the systemd unit would silently revert every tray change on restart.
+fn resolve_token_with(saved: &mut PersistedSettings, env_token: Option<&str>) -> String {
+    let env_token = env_token.map(str::trim).filter(|t| !t.is_empty());
+
+    if let Some(ref persisted) = saved.token {
+        let persisted = persisted.trim();
+        if !persisted.is_empty() {
+            if let Some(env_token) = env_token {
+                if env_token != persisted {
+                    eprintln!(
+                        "[auth] ST_TOKEN is set but a persisted token already exists \
+(set via tray/config); using the persisted token. To apply ST_TOKEN, clear the \
+saved token first (delete the \"token\" field in the config) or set it from the tray."
+                    );
+                }
             }
-            return t;
+            return persisted.to_string();
         }
     }
-    // Use persisted token or generate a new one
-    if let Some(ref t) = saved.token {
-        if !t.is_empty() {
-            return t.clone();
-        }
+    // No persisted token yet: ST_TOKEN seeds it on first run.
+    if let Some(env_token) = env_token {
+        let t = env_token.to_string();
+        saved.token = Some(t.clone());
+        persist_settings(saved);
+        return t;
     }
+    // Nothing anywhere: generate a fresh token and persist it.
     let t = generate_token();
     saved.token = Some(t.clone());
     persist_settings(saved);
@@ -573,4 +595,53 @@ fn notify_client_connection(snapshot: &ConnectedClientSnapshot) {
 #[cfg(target_os = "macos")]
 fn apple_script_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression guard: a token set from the tray is persisted, and the server
+    // must keep using it across restarts even when ST_TOKEN is pinned in the
+    // unit. ST_TOKEN only seeds a token when none is persisted yet.
+    // Touches no process env or on-disk config (the persisted-token branches
+    // never call persist_settings), so it is safe under parallel test runs.
+
+    #[test]
+    fn persisted_token_wins_over_conflicting_env_seed() {
+        let mut saved = PersistedSettings {
+            token: Some("tray-set-token".into()),
+            ..Default::default()
+        };
+        // Pinned ST_TOKEN differs from the tray-set token: persisted must win.
+        assert_eq!(
+            resolve_token_with(&mut saved, Some("env-pinned-token")),
+            "tray-set-token"
+        );
+        // saved.token is unchanged — the env seed never clobbers it.
+        assert_eq!(saved.token.as_deref(), Some("tray-set-token"));
+    }
+
+    #[test]
+    fn persisted_token_used_when_no_env_seed() {
+        let mut saved = PersistedSettings {
+            token: Some("tray-set-token".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_token_with(&mut saved, None), "tray-set-token");
+    }
+
+    #[test]
+    fn env_seed_used_when_no_persisted_and_matching_is_noop() {
+        // Same value in both: still returns the persisted token, no churn.
+        let mut saved = PersistedSettings {
+            token: Some("same-token".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_token_with(&mut saved, Some("same-token")),
+            "same-token"
+        );
+        assert_eq!(saved.token.as_deref(), Some("same-token"));
+    }
 }

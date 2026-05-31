@@ -140,7 +140,10 @@ cat ~/.local/state/st/st-server-config.json
 Or click the tray icon on this machine and pick "Copy Token".
 
 Pre-seed a token by adding `Environment=ST_TOKEN=<your-token>` via
-`systemctl --user edit st-server`.
+`systemctl --user edit st-server`. `ST_TOKEN` only seeds on first run (when
+no token is persisted yet) — it does **not** override a token later set from
+the tray, which is authoritative and survives restarts. To force `ST_TOKEN`,
+clear the saved `token` field in the config first.
 
 ## Troubleshooting
 

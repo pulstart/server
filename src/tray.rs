@@ -146,12 +146,21 @@ pub fn run_tray(
 /// the socket instead of from an `Arc<ServerControl>`.
 #[cfg(target_os = "linux")]
 pub fn run_tray_agent(socket: &std::path::Path) -> Result<(), String> {
-    let remote = RemoteControl::connect(socket).map_err(|err| {
-        format!(
-            "Failed to connect to control socket {}: {err}",
-            socket.display()
-        )
-    })?;
+    // The service may not be up yet (boot ordering) or may be mid-restart, so
+    // wait for the control socket instead of exiting (which would leave the user
+    // with no tray until the next login).
+    let remote = loop {
+        match RemoteControl::connect(socket) {
+            Ok(r) => break r,
+            Err(err) => {
+                eprintln!(
+                    "[tray] control socket {} unavailable ({err}); retrying in 2s",
+                    socket.display()
+                );
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+    };
     run_linux_tray(ControlHandle::Remote(remote))
 }
 
