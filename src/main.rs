@@ -39,6 +39,16 @@ mod transport;
 mod tray;
 mod updater;
 
+// Real-bitstream RS-FEC loss-injection integration test (encode → slice → drop
+// → reconstruct → decode). Test-only; see recovery_loopback.rs.
+#[cfg(test)]
+mod recovery_loopback;
+// A3 intra-refresh loss-recovery convergence test (encode PIR → drop a frame →
+// assert decode re-converges within one period with no IDR). See
+// intra_refresh_loopback.rs.
+#[cfg(test)]
+mod intra_refresh_loopback;
+
 use adaptive_bitrate::{AdaptiveBitrateState, ClientRateController};
 use broadcast::Broadcaster;
 use capture::{CaptureBackend, PlatformCapture};
@@ -55,7 +65,7 @@ use st_protocol::{
 };
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -254,6 +264,13 @@ fn client_hardware_yuv444_video_codecs(display: Option<ClientDisplayInfo>) -> Vi
         .unwrap_or_else(VideoCodecSupport::empty)
 }
 
+/// Whether the connecting client's display can present HDR (D2 AND-gate). A
+/// missing/legacy `ClientDisplayInfo` reports false so an SDR client never gets
+/// a washed-out BT.2020/PQ stream.
+fn client_hdr_display(display: Option<ClientDisplayInfo>) -> bool {
+    display.map(|info| info.hdr_display).unwrap_or(false)
+}
+
 fn stream_chroma_name(chroma: VideoChromaSampling) -> &'static str {
     match chroma {
         VideoChromaSampling::Yuv420 => "yuv420",
@@ -419,6 +436,7 @@ fn select_linux_encoder(
     client_hardware_codecs: VideoCodecSupport,
     client_supported_yuv444_codecs: VideoCodecSupport,
     client_hardware_yuv444_codecs: VideoCodecSupport,
+    client_hdr_display: bool,
     control: &ServerControl,
     capture_render_node: Option<&str>,
 ) -> Result<(EncoderConfig, EncoderKind), String> {
@@ -447,6 +465,16 @@ fn select_linux_encoder(
             EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
         if let Some(quality) = forced_quality {
             base_config.quality = quality;
+        }
+        // D2: HDR is AND-gated on (server ST_HDR) AND (client display is HDR).
+        // A non-HDR client streamed BT.2020+PQ sees washed-out color with no
+        // local tone-map, so fall back to SDR when the client can't present HDR.
+        if base_config.is_hdr() && !client_hdr_display {
+            eprintln!(
+                "[encoder] HDR requested but client display is SDR; encoding SDR ({})",
+                codec_name(codec.to_stream_codec())
+            );
+            base_config.dynamic_range = encode_config::DynamicRange::Sdr;
         }
 
         let mut best_for_codec: Option<LinuxEncoderChoice> = None;
@@ -975,12 +1003,14 @@ struct SharedPipeline {
 }
 
 impl SharedPipeline {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         client_requested_fps: Option<u32>,
         client_supported_codecs: VideoCodecSupport,
         client_hardware_codecs: VideoCodecSupport,
         client_supported_yuv444_codecs: VideoCodecSupport,
         client_hardware_yuv444_codecs: VideoCodecSupport,
+        client_hdr_display: bool,
         input: Arc<InputRuntime>,
         control: Arc<ServerControl>,
     ) -> Result<(Self, ClientSubscription), String> {
@@ -1010,6 +1040,7 @@ impl SharedPipeline {
                 client_hardware_codecs,
                 client_supported_yuv444_codecs,
                 client_hardware_yuv444_codecs,
+                client_hdr_display,
                 input,
                 control,
                 vbc,
@@ -1122,6 +1153,7 @@ fn run_shared_pipeline(
     client_hardware_codecs: VideoCodecSupport,
     client_supported_yuv444_codecs: VideoCodecSupport,
     client_hardware_yuv444_codecs: VideoCodecSupport,
+    client_hdr_display: bool,
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
@@ -1136,6 +1168,10 @@ fn run_shared_pipeline(
     // KMS path (Linux); on other platforms drain-suppress the unused channel.
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = &capture_cmd_rx;
+    // D2 HDR gate is applied in select_linux_encoder; other platforms force SDR
+    // separately (VideoToolbox/D3D HDR encode unimplemented).
+    #[cfg(not(target_os = "linux"))]
+    let _ = client_hdr_display;
     let trace = trace_enabled();
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let _ = client_hardware_codecs;
@@ -1203,6 +1239,7 @@ fn run_shared_pipeline(
         client_hardware_codecs,
         client_supported_yuv444_codecs,
         client_hardware_yuv444_codecs,
+        client_hdr_display,
         &control,
         capture_render_hint.as_deref(),
     ) {
@@ -1535,7 +1572,12 @@ fn run_shared_pipeline(
                 let target_bitrate = if forced_br > 0 {
                     forced_br
                 } else {
-                    rate_control.current_target_kbps()
+                    adaptive_bitrate::encoder_target_kbps(
+                        rate_control.current_target_kbps(),
+                        audio_config.bitrate / 1000,
+                        adaptive_bitrate::fec_reserve_pct_from_env(),
+                        current_config.min_bitrate_kbps,
+                    )
                 };
                 if should_schedule_bitrate_reconfigure(
                     current_config.bitrate_kbps,
@@ -1635,10 +1677,17 @@ fn run_shared_pipeline(
                 }
 
                 let forced_br = control.forced_bitrate_kbps();
+                // ABR targets the on-wire budget; the encoder gets that minus FEC
+                // parity + audio overhead (B3) so on-wire rate matches intent.
                 let target_bitrate = if forced_br > 0 {
                     forced_br
                 } else {
-                    rate_control.current_target_kbps()
+                    adaptive_bitrate::encoder_target_kbps(
+                        rate_control.current_target_kbps(),
+                        audio_config.bitrate / 1000,
+                        adaptive_bitrate::fec_reserve_pct_from_env(),
+                        current_config.min_bitrate_kbps,
+                    )
                 };
                 if pending_encoder_rebuild.is_none()
                     && should_schedule_bitrate_reconfigure(
@@ -1936,7 +1985,39 @@ fn encode_and_broadcast(
 // Per-client transport
 // ---------------------------------------------------------------------------
 
+/// B6 (interleave step): audio is interleaved ahead of video bursts on the
+/// shared socket by default so a 5 ms Opus packet doesn't wait behind a 60-packet
+/// 4K IDR. `ST_AUDIO_INTERLEAVE=0` reverts to draining audio only after the
+/// video burst. Pure send-ordering change — no wire/format change, so it
+/// auto-enables per the CLAUDE.md rule.
+fn audio_interleave_enabled() -> bool {
+    !matches!(
+        std::env::var("ST_AUDIO_INTERLEAVE").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+/// Drain queued Opus packets and send them immediately. Always drains the queue
+/// (so it can't build up) but only transmits when the client enabled audio.
+fn flush_pending_audio(
+    sender: &mut UdpSender,
+    aud_rx: &Option<Receiver<Arc<Vec<u8>>>>,
+    audio_enabled: &AtomicBool,
+    peer: impl std::fmt::Display,
+) {
+    let Some(aud) = aud_rx else { return };
+    let send = audio_enabled.load(Ordering::Relaxed);
+    while let Ok(opus) = aud.try_recv() {
+        if send {
+            if let Err(e) = sender.send_audio(&opus) {
+                eprintln!("[transport] audio send error to {peer}: {e}");
+            }
+        }
+    }
+}
+
 /// Per-client unified transport: sends both video and audio on a single UDP socket.
+#[allow(clippy::too_many_arguments)]
 fn run_transport(
     addr: SocketAddr,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
@@ -1945,6 +2026,10 @@ fn run_transport(
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
+    // A2: adaptive RS parity percentage, updated by the control loop from loss.
+    fec_pct: Arc<AtomicU16>,
+    // E5: adaptive verbatim audio-redundancy depth.
+    audio_depth: Arc<AtomicU8>,
 ) {
     let mut sender = match UdpSender::new(addr, crypto) {
         Ok(s) => s,
@@ -1954,6 +2039,7 @@ fn run_transport(
         }
     };
     let trace = trace_enabled();
+    let interleave_audio = audio_interleave_enabled();
     let mut sent_video_units = 0usize;
     let mut last_video_activity = std::time::Instant::now();
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
@@ -1964,7 +2050,21 @@ fn run_transport(
     // requested IDR. After startup, collapse backlog to the newest queued
     // frame so slow clients stay live instead of replaying stale video.
 
+    let mut last_fec_pct = u16::MAX;
+    let mut last_audio_depth = u8::MAX;
     while running.load(Ordering::SeqCst) {
+        // A2: pick up the latest adaptive FEC strength before sending.
+        let pct = fec_pct.load(Ordering::Relaxed);
+        if pct != last_fec_pct {
+            sender.set_fec_pct(pct);
+            last_fec_pct = pct;
+        }
+        // E5: pick up the latest adaptive audio-redundancy depth.
+        let depth = audio_depth.load(Ordering::Relaxed);
+        if depth != last_audio_depth {
+            sender.set_audio_redundancy_depth(depth as usize);
+            last_audio_depth = depth;
+        }
         // Video: blocking recv with short timeout
         match vid_rx.recv_timeout(std::time::Duration::from_millis(5)) {
             Ok(frame) => {
@@ -1979,6 +2079,10 @@ fn run_transport(
                 let mut pending = Some(frame);
                 let mut burst = 0usize;
                 while let Some(frame) = pending.take() {
+                    // B6: push queued audio ahead of this video unit.
+                    if interleave_audio {
+                        flush_pending_audio(&mut sender, &aud_rx, &audio_enabled, addr);
+                    }
                     let source_gap = last_source_seq
                         .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
                         .unwrap_or(0);
@@ -2329,6 +2433,7 @@ async fn handle_client(
     let hardware_codecs_for_setup = client_hardware_codecs;
     let supported_yuv444_codecs_for_setup = client_supported_yuv444_codecs;
     let hardware_yuv444_codecs_for_setup = client_hardware_yuv444_codecs;
+    let hdr_display_for_setup = client_hdr_display(startup_prefs.display);
     let setup = tokio::task::spawn_blocking(move || -> Result<PipelineSetup, String> {
         // Wait for any previous pipeline stop to finish before starting a new one.
         // Without this, the new capture backend may fail because the old one still
@@ -2362,6 +2467,7 @@ async fn handle_client(
                 hardware_codecs_for_setup,
                 supported_yuv444_codecs_for_setup,
                 hardware_yuv444_codecs_for_setup,
+                hdr_display_for_setup,
                 Arc::clone(&state2.input),
                 Arc::clone(&state2.control),
             )?;
@@ -2542,6 +2648,24 @@ async fn handle_client(
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
     let video_bc = Arc::clone(&sub.video_bc);
+    // A2: adaptive FEC strength shared from the control loop to the sender.
+    let mut fec_controller = adaptive_bitrate::FecController::from_env();
+    let fec_pct_shared = Arc::new(AtomicU16::new(fec_controller.current_pct()));
+    let fec_pct_transport = Arc::clone(&fec_pct_shared);
+    // E5 (default-on): adaptive audio-redundancy depth — starts at 0 and ramps
+    // toward the configured cap on measured loss. ST_AUDIO_ADAPTIVE_REDUNDANCY=0
+    // disables it, pinning the atomic at the fixed configured depth (legacy).
+    let audio_redundancy_adaptive = transport::audio_adaptive_redundancy_enabled();
+    let audio_redundancy_max = transport::configured_audio_redundancy_depth() as u8;
+    let mut audio_redundancy_controller =
+        adaptive_bitrate::AudioRedundancyController::new(audio_redundancy_max);
+    let audio_depth_init = if audio_redundancy_adaptive {
+        audio_redundancy_controller.current_depth()
+    } else {
+        audio_redundancy_max
+    };
+    let audio_depth_shared = Arc::new(AtomicU8::new(audio_depth_init));
+    let audio_depth_transport = Arc::clone(&audio_depth_shared);
     let transport_handle = std::thread::spawn(move || {
         run_transport(
             transport_addr,
@@ -2551,6 +2675,8 @@ async fn handle_client(
             audio_enabled_transport,
             transport_running_clone,
             None,
+            fec_pct_transport,
+            audio_depth_transport,
         );
     });
     if let Err(err) = stream
@@ -2690,8 +2816,25 @@ async fn handle_client(
                                     );
                                 }
                             }
+                            // A2: raise/decay RS FEC strength on the same signal.
+                            let fec_pct = fec_controller.apply_feedback(&feedback);
+                            fec_pct_shared.store(fec_pct, Ordering::Relaxed);
+                            // E5: adapt audio-redundancy depth from the same loss.
+                            if audio_redundancy_adaptive {
+                                let depth = audio_redundancy_controller.apply_feedback(&feedback);
+                                audio_depth_shared.store(depth, Ordering::Relaxed);
+                            }
                             let next_kbps = bitrate_controller.apply_feedback(feedback);
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
+                        }
+                        ControlMessage::ClientBitratePreference(max_kbps) => {
+                            // B4: clamp this client's ABR ceiling to its declared max.
+                            rate_control.set_client_ceiling(sub.vid_sub_id, max_kbps);
+                            if trace_enabled() {
+                                eprintln!(
+                                    "[trace][server] client {addr} declared bitrate ceiling {max_kbps} kbps"
+                                );
+                            }
                         }
                         ControlMessage::ClockSyncPing(ping) => {
                             let server_recv_micros = unix_time_micros();
@@ -3239,6 +3382,7 @@ fn handle_punched_client(
                 client_hardware_codecs,
                 client_supported_yuv444_codecs,
                 client_hardware_yuv444_codecs,
+                _client_display.hdr_display,
                 Arc::clone(&state2.input),
                 Arc::clone(&state2.control),
             ) {
@@ -3375,6 +3519,22 @@ fn handle_punched_client(
     let audio_enabled_transport = Arc::clone(&audio_enabled);
     let punched_transport = Arc::clone(&punched);
     let video_bc = Arc::clone(&sub.video_bc);
+    // A2: adaptive FEC strength shared from the control loop to the sender.
+    let mut fec_controller = adaptive_bitrate::FecController::from_env();
+    let fec_pct_shared = Arc::new(AtomicU16::new(fec_controller.current_pct()));
+    let fec_pct_transport = Arc::clone(&fec_pct_shared);
+    // E5 (default-on): adaptive audio-redundancy depth (ST_AUDIO_ADAPTIVE_REDUNDANCY=0 disables).
+    let audio_redundancy_adaptive = transport::audio_adaptive_redundancy_enabled();
+    let audio_redundancy_max = transport::configured_audio_redundancy_depth() as u8;
+    let mut audio_redundancy_controller =
+        adaptive_bitrate::AudioRedundancyController::new(audio_redundancy_max);
+    let audio_depth_init = if audio_redundancy_adaptive {
+        audio_redundancy_controller.current_depth()
+    } else {
+        audio_redundancy_max
+    };
+    let audio_depth_shared = Arc::new(AtomicU8::new(audio_depth_init));
+    let audio_depth_transport = Arc::clone(&audio_depth_shared);
     let transport_handle = std::thread::spawn(move || {
         run_punched_transport(
             punched_transport,
@@ -3383,6 +3543,8 @@ fn handle_punched_client(
             aud_rx,
             audio_enabled_transport,
             transport_running_clone,
+            fec_pct_transport,
+            audio_depth_transport,
         );
     });
 
@@ -3479,6 +3641,14 @@ fn handle_punched_client(
                             audio_enabled.store(enabled, Ordering::Relaxed);
                         }
                         ControlMessage::TransportFeedback(fb) => {
+                            // A2: drive RS FEC strength from the same loss signal.
+                            let fec_pct = fec_controller.apply_feedback(&fb);
+                            fec_pct_shared.store(fec_pct, Ordering::Relaxed);
+                            // E5: adapt audio-redundancy depth from the same loss.
+                            if audio_redundancy_adaptive {
+                                let depth = audio_redundancy_controller.apply_feedback(&fb);
+                                audio_depth_shared.store(depth, Ordering::Relaxed);
+                            }
                             let next_kbps = bitrate_controller.apply_feedback(fb);
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                             if (fb.lost_packets > 0 || fb.dropped_frames > 0)
@@ -3488,6 +3658,10 @@ fn handle_punched_client(
                                 sub.video_bc.request_keyframe();
                                 last_transport_recovery_keyframe = Instant::now();
                             }
+                        }
+                        ControlMessage::ClientBitratePreference(max_kbps) => {
+                            // B4: clamp this client's ABR ceiling to its declared max.
+                            rate_control.set_client_ceiling(sub.vid_sub_id, max_kbps);
                         }
                         ControlMessage::AcquireControl => {
                             let next_state = state.input.acquire_control(client_id);
@@ -3617,6 +3791,7 @@ fn handle_punched_client(
 }
 
 /// Per-client transport loop for punched connections.
+#[allow(clippy::too_many_arguments)]
 fn run_punched_transport(
     punched: Arc<st_protocol::reliable_udp::PunchedSocket>,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
@@ -3624,13 +3799,31 @@ fn run_punched_transport(
     aud_rx: Option<Receiver<Arc<Vec<u8>>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    // A2: adaptive RS parity percentage from the control loop.
+    fec_pct: Arc<AtomicU16>,
+    // E5: adaptive verbatim audio-redundancy depth.
+    audio_depth: Arc<AtomicU8>,
 ) {
+    let peer = punched.peer();
     let mut sender = UdpSender::from_punched(punched);
     let trace = trace_enabled();
+    let interleave_audio = audio_interleave_enabled();
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
     let mut waiting_for_recovery_frame = false;
     let mut last_source_seq = None::<u64>;
+    let mut last_fec_pct = u16::MAX;
+    let mut last_audio_depth = u8::MAX;
     while running.load(Ordering::SeqCst) {
+        let pct = fec_pct.load(Ordering::Relaxed);
+        if pct != last_fec_pct {
+            sender.set_fec_pct(pct);
+            last_fec_pct = pct;
+        }
+        let depth = audio_depth.load(Ordering::Relaxed);
+        if depth != last_audio_depth {
+            sender.set_audio_redundancy_depth(depth as usize);
+            last_audio_depth = depth;
+        }
         match vid_rx.recv_timeout(Duration::from_millis(5)) {
             Ok(frame) => {
                 // FIFO drain — send every encoded unit in order, never collapse to
@@ -3641,6 +3834,10 @@ fn run_punched_transport(
                 let mut pending = Some(frame);
                 let mut burst = 0usize;
                 while let Some(frame) = pending.take() {
+                    // B6: push queued audio ahead of this video unit.
+                    if interleave_audio {
+                        flush_pending_audio(&mut sender, &aud_rx, &audio_enabled, peer);
+                    }
                     let source_gap = last_source_seq
                         .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
                         .unwrap_or(0);
@@ -3935,6 +4132,11 @@ fn main() {
     #[cfg(unix)]
     if mode == RunMode::System {
         control.start_automatic_update_checks();
+        // Bring up (and follow) the active user's tray agent. enable-at-login
+        // covers fresh logins; this covers a manually-started service, a quit
+        // tray, and user switches without a re-login.
+        #[cfg(target_os = "linux")]
+        session_follow::spawn_tray_follow();
         let ipc_control = Arc::clone(&control);
         let ipc_tunnel = tunnel_state.clone();
         std::thread::spawn(move || {

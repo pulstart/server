@@ -2,11 +2,14 @@
 Type=Application
 Name=st Server
 GenericName=Low-Latency Game Streaming Server
-Comment=Streams this desktop to st clients over the network
-Exec=@BIN@
+Comment=Start the st-server streaming service in your session
+# Reference template. install.sh writes the live entry inline:
+#   per-user mode -> Exec=systemctl --user start st-server.service
+#   system mode   -> Exec=systemctl --user start st-server-tray.service
+Exec=systemctl --user start st-server.service
 Icon=st-server
 Terminal=false
 Categories=Network;RemoteAccess;
+Keywords=stream;remote;game;moonlight;sunshine;
 StartupWMClass=st-server
 StartupNotify=false
-NoDisplay=true

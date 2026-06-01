@@ -11,10 +11,10 @@ use std::mem::{size_of, MaybeUninit};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const NVFBC_VERSION_MAJOR: u32 = 1;
 const NVFBC_VERSION_MINOR: u32 = 8;
@@ -490,6 +490,7 @@ impl DynamicSystemCapturer {
             height: frame_info.dwHeight,
             current_frame: frame_info.dwCurrentFrame,
             is_new_frame: frame_info.bIsNewFrame != 0,
+            missed_frames: frame_info.dwMissedFrames,
         })
     }
 }
@@ -520,7 +521,38 @@ struct SystemFrameInfo<'a> {
     height: u32,
     current_frame: u32,
     is_new_frame: bool,
+    missed_frames: u32,
 }
+
+/// C7: skip re-encoding NvFBC duplicate frames. **Auto-enabled** per the
+/// CLAUDE.md auto-enable rule — NvFBC reports `bIsNewFrame=0` when the grab
+/// returned the same content as the previous frame, so pushing it again wastes
+/// an encode pass. The keepalive valve in the capture loop forwards a frame at
+/// least every `NVFBC_DUP_KEEPALIVE`, so a fully static X11 screen still refreshes
+/// for a late-joining subscriber and a buggy duplicate flag costs at most that
+/// much staleness. `ST_NVFBC_SKIP_DUP=0` (`false`/`no`/`off`) force-disables.
+fn nvfbc_skip_dup_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = nvfbc_skip_dup_tristate(std::env::var("ST_NVFBC_SKIP_DUP").ok().as_deref());
+        eprintln!(
+            "[nvfbc] duplicate-frame skip {} (auto; ST_NVFBC_SKIP_DUP=0 disables)",
+            if on { "on" } else { "off" }
+        );
+        on
+    })
+}
+
+/// Tri-state gate: unset ⇒ on (auto), `0`/`false`/`no`/`off` ⇒ off, any other
+/// value ⇒ on. Kept pure for unit testing.
+fn nvfbc_skip_dup_tristate(var: Option<&str>) -> bool {
+    !matches!(
+        var.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+const NVFBC_DUP_KEEPALIVE: Duration = Duration::from_millis(200);
 
 struct CapturerSendWrapper(DynamicSystemCapturer);
 unsafe impl Send for CapturerSendWrapper {}
@@ -559,13 +591,40 @@ impl CaptureBackend for NvfbcCapture {
         let handle = thread::spawn(move || {
             let mut capturer = wrapped_capturer.0;
             let trace = std::env::var_os("ST_TRACE").is_some();
+            let skip_dup = nvfbc_skip_dup_enabled();
             let mut dropped_frames = 0usize;
+            let mut last_forward: Option<Instant> = None;
+            let mut missed_total = 0u64;
             while running.load(Ordering::SeqCst) {
                 match capturer.next_frame(CaptureMethod::Blocking, Some(Duration::from_millis(50)))
                 {
                     Ok(frame_info) => {
                         let _ = frame_info.current_frame;
-                        let _ = frame_info.is_new_frame;
+                        if frame_info.missed_frames > 0 {
+                            missed_total =
+                                missed_total.saturating_add(frame_info.missed_frames as u64);
+                            if trace {
+                                eprintln!(
+                                    "[trace][nvfbc] driver missed {} frame(s) (total {missed_total})",
+                                    frame_info.missed_frames
+                                );
+                            }
+                        }
+                        // C7: drop duplicate frames the driver flags as not-new,
+                        // but always forward at least every keepalive so a
+                        // static screen still refreshes for late joiners.
+                        if skip_dup && !frame_info.is_new_frame {
+                            let stale = last_forward
+                                .map(|t| t.elapsed() < NVFBC_DUP_KEEPALIVE)
+                                .unwrap_or(false);
+                            if stale {
+                                if trace && dropped_frames < 8 {
+                                    eprintln!("[trace][nvfbc] skipped duplicate (bIsNewFrame=0)");
+                                }
+                                continue;
+                            }
+                        }
+                        last_forward = Some(Instant::now());
                         let frame = CapturedFrame {
                             data: FrameData::Ram(frame_info.buffer.to_vec()),
                             width: frame_info.width,
@@ -603,5 +662,23 @@ impl CaptureBackend for NvfbcCapture {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nvfbc_skip_dup_tristate;
+
+    #[test]
+    fn skip_dup_tristate_auto_on_unless_disabled() {
+        assert!(nvfbc_skip_dup_tristate(None), "unset ⇒ auto-on");
+        assert!(nvfbc_skip_dup_tristate(Some("1")), "explicit on");
+        assert!(nvfbc_skip_dup_tristate(Some("yes")), "truthy on");
+        assert!(!nvfbc_skip_dup_tristate(Some("0")), "0 ⇒ off");
+        assert!(!nvfbc_skip_dup_tristate(Some("off")), "off ⇒ off");
+        assert!(
+            !nvfbc_skip_dup_tristate(Some(" NO ")),
+            "trimmed/case-insensitive off"
+        );
     }
 }

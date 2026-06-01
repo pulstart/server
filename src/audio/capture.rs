@@ -199,6 +199,7 @@ mod platform {
             let running = Arc::clone(&self.running);
             let device_clone = device.map(|d| d.to_string());
             let handle = thread::spawn(move || {
+                crate::audio::set_realtime_priority("capture");
                 println!(
                     "[audio] Capture thread started ({channels}ch, {sample_rate}Hz, frame={samples_per_frame} samples)"
                 );

@@ -188,6 +188,42 @@ impl NvencEncoder {
                     0,
                 );
             }
+
+            // Per-codec min-QP floor (C3). NVENC honors qmin under CBR; this
+            // stops a static scene from over-spending CBR bits / pulsing.
+            if let Some(qmin) = config.min_qp() {
+                (*ctx).qmin = qmin as i32;
+            }
+
+            // Multi-slice encoding (C2). FFmpeg maps avctx->slices to NVENC
+            // sliceMode=3/sliceModeData, so a lost packet corrupts one slice.
+            (*ctx).slices = config.slices_per_frame() as i32;
+
+            // H.264 entropy coder (F1). CABAC default; ST_H264_CODER=cavlc.
+            if let Some(coder) = config.h264_coder() {
+                let coder_key = std::ffi::CString::new("coder").unwrap();
+                let coder_val = std::ffi::CString::new(coder).unwrap();
+                ffi::av_opt_set((*ctx).priv_data, coder_key.as_ptr(), coder_val.as_ptr(), 0);
+            }
+
+            // Intra-refresh recovery (A3, opt-in ST_INTRA_REFRESH). h264_nvenc /
+            // hevc_nvenc accept the `intra-refresh` boolean (periodic intra
+            // refresh instead of IDR). LIVE FINDING (RTX 4080, 2026-06-01):
+            // FFmpeg's NVENC does NOT emit a recovery_point SEI — its only SEIs
+            // were buffering_period + pic_timing — because it doesn't expose
+            // NVENC's `outputRecoveryPointSEI`. So the client's recovery_point
+            // SEI parser stays inert here; NVENC recovery still relies on the
+            // wire frame_type byte (A4) / IDR. (libx264 *does* emit the SEI, so
+            // the in-band path works on the software encoder.) Promoting NVENC
+            // intra-refresh recovery to first-class needs an SDK-direct path
+            // that sets outputRecoveryPointSEI / reference-frame invalidation.
+            if config.intra_refresh_enabled() {
+                let ir_key = std::ffi::CString::new("intra-refresh").unwrap();
+                ffi::av_opt_set((*ctx).priv_data, ir_key.as_ptr(), one.as_ptr(), 0);
+                println!(
+                    "[nvenc] intra-refresh enabled (ST_INTRA_REFRESH); note: no recovery_point SEI via FFmpeg NVENC, client uses wire frame_type for recovery"
+                );
+            }
         }
 
         let ret = unsafe { ffi::avcodec_open2(ctx, codec, ptr::null_mut()) };

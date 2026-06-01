@@ -11,6 +11,68 @@
 pub mod capture;
 pub mod encode;
 
+/// Best-effort elevation of the calling thread's scheduling priority for audio
+/// (E3). Audio capture/encode must not be starved by the video encoder under
+/// contention, or playback drops out. Per platform: Linux `SCHED_RR` → negative
+/// `nice` ladder; macOS QoS class (interactive/user-initiated); Windows thread
+/// priority (time-critical/highest). `ST_AUDIO_RT_PRIO=0` (`false`/`no`/`off`)
+/// disables. Never panics if the privilege (CAP_SYS_NICE / equivalent) is missing.
+pub fn set_realtime_priority(role: &str) {
+    if matches!(
+        std::env::var("ST_AUDIO_RT_PRIO").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    ) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // Capture is the most latency-critical (it gates everything downstream);
+        // encode runs a notch lower so it can't preempt capture.
+        let rt_prio = if role == "capture" { 10 } else { 5 };
+        let param = libc::sched_param {
+            sched_priority: rt_prio,
+        };
+        if libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_RR, &param) == 0 {
+            return;
+        }
+        // SCHED_RR denied — fall back to a nicer nice value (best-effort).
+        let _ = libc::nice(-10);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS has no SCHED_RR for normal processes; the QoS class system is the
+        // supported mechanism. Capture rides the interactive class, encode the
+        // (slightly lower) user-initiated class. Best-effort; never fails hard.
+        let class = if role == "capture" {
+            libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE
+        } else {
+            libc::qos_class_t::QOS_CLASS_USER_INITIATED
+        };
+        unsafe {
+            let _ = libc::pthread_set_qos_class_self_np(class, 0);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+            THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        // Capture gets TIME_CRITICAL, encode HIGHEST — mirrors the Linux ladder
+        // (capture a notch above encode). Best-effort; ignore failure.
+        let prio = if role == "capture" {
+            THREAD_PRIORITY_TIME_CRITICAL
+        } else {
+            THREAD_PRIORITY_HIGHEST
+        };
+        unsafe {
+            let _ = SetThreadPriority(GetCurrentThread(), prio);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let _ = role;
+}
+
 use crate::broadcast::Broadcaster;
 use crate::encode_config::AudioConfig;
 use crossbeam_channel::{unbounded, Sender};

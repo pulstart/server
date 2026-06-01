@@ -6,6 +6,9 @@ Documentation=https://github.com/pulstart/server
 # xdg-desktop-portal are all reachable by this unit natively.
 After=graphical-session.target
 PartOf=graphical-session.target
+# Never give up on a crash loop: keep retrying rather than land in 'failed'
+# after systemd's default 5-starts/10s. RestartSec throttles to one try / 2s.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

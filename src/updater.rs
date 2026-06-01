@@ -99,7 +99,7 @@ pub fn maybe_run_apply_update_from_args() -> Result<bool, String> {
     }
     if flag == RELAUNCH_FLAG {
         let args: Vec<OsString> = args.collect();
-        if args.len() != 3 {
+        if args.len() < 3 {
             return Err("Relaunch helper received an invalid argument set.".to_string());
         }
         let parent_pid = args[0]
@@ -108,8 +108,11 @@ pub fn maybe_run_apply_update_from_args() -> Result<bool, String> {
             .map_err(|e| format!("Invalid parent pid: {e}"))?;
         let staging_root = PathBuf::from(&args[1]);
         let relaunch_executable = PathBuf::from(&args[2]);
+        // Any remaining args are the original argv (minus argv[0]) so the
+        // relaunched process keeps its run-mode flags (e.g. --tray).
+        let forwarded: Vec<OsString> = args[3..].to_vec();
         wait_for_process_exit(parent_pid)?;
-        relaunch_updated_app(&relaunch_executable)?;
+        relaunch_updated_app(&relaunch_executable, &forwarded)?;
         cleanup_staging_root(&staging_root);
         return Ok(true);
     }
@@ -203,13 +206,54 @@ pub fn prepare_and_spawn_update(release: &ReleaseInfo) -> Result<(), String> {
             run_elevated_copy(&package_root, &install_target.install_root)?;
         }
 
-        // Spawn a lightweight helper that just waits for this process to exit
-        // and then relaunches the updated binary.  No copy needed at this point.
+        // Under a systemd-managed service this process lives in the unit's
+        // cgroup. A self-spawned relaunch child would be killed by the default
+        // KillMode=control-group when this process exits, AND it would lose the
+        // run-mode flags (--system), the AmbientCapabilities, and the launcher
+        // script that sets LD_LIBRARY_PATH for the bundled libs. Let systemd
+        // restart the unit instead — it re-runs ExecStart cleanly with all of
+        // that intact.
+        #[cfg(target_os = "linux")]
+        if let Some(scope) = systemd_service_scope() {
+            match request_systemd_restart(&scope) {
+                Ok(()) => {
+                    // Files are already in place; staging is no longer needed.
+                    // Do NOT call cleanup_staging_root here: it self-deletes the
+                    // running executable, which from this (installed) process
+                    // would remove the freshly-installed binary.
+                    let _ = fs::remove_dir_all(&staging_root);
+                    return Ok(());
+                }
+                Err(err) => {
+                    if matches!(scope, SystemdScope::System) {
+                        // The root service has no safe self-relaunch fallback
+                        // (it would come back in the wrong run-mode against the
+                        // wrong state dir). Leave the old instance running and
+                        // surface the error.
+                        return Err(format!(
+                            "Updated files installed, but restarting the service failed: {err}. \
+                             Restart manually: sudo systemctl restart st-server.service"
+                        ));
+                    }
+                    eprintln!(
+                        "[updater] systemd restart failed ({err}); falling back to self-relaunch"
+                    );
+                }
+            }
+        }
+
+        // Not under systemd (desktop launch), or a user-unit restart that fell
+        // through: wait for this process to exit, then relaunch through the
+        // launcher script (which wires up LD_LIBRARY_PATH for bundled libs),
+        // preserving the original argv so the run-mode is retained.
+        let relaunch_target = launcher_for_relaunch(&install_target.relaunch_executable);
+        let forwarded: Vec<OsString> = std::env::args_os().skip(1).collect();
         spawn_relaunch_helper(
             &install_target.relaunch_executable,
             std::process::id(),
             &staging_root,
-            &install_target.relaunch_executable,
+            &relaunch_target,
+            &forwarded,
         )?;
     }
     Ok(())
@@ -246,7 +290,7 @@ fn run_apply_update_command(command: &ApplyUpdateCommand) -> Result<(), String> 
     } else {
         let _ = std::env::set_current_dir(&command.install_root);
     }
-    relaunch_updated_app(&command.relaunch_executable)?;
+    relaunch_updated_app(&command.relaunch_executable, &[])?;
     cleanup_staging_root(&command.staging_root);
     Ok(())
 }
@@ -321,6 +365,7 @@ fn spawn_relaunch_helper(
     parent_pid: u32,
     staging_root: &Path,
     relaunch_executable: &Path,
+    forwarded: &[OsString],
 ) -> Result<(), String> {
     let exec_dir = executable
         .parent()
@@ -331,6 +376,7 @@ fn spawn_relaunch_helper(
         .arg(parent_pid.to_string())
         .arg(staging_root)
         .arg(relaunch_executable)
+        .args(forwarded)
         .current_dir(exec_dir)
         .spawn()
         .map_err(|err| format!("Failed to launch relaunch helper: {err}"))?;
@@ -556,8 +602,9 @@ fn copy_permissions(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn relaunch_updated_app(path: &Path) -> Result<(), String> {
+fn relaunch_updated_app(path: &Path, args: &[OsString]) -> Result<(), String> {
     let mut command = Command::new(path);
+    command.args(args);
     if let Some(parent) = path.parent() {
         command.current_dir(parent);
     }
@@ -568,6 +615,73 @@ fn relaunch_updated_app(path: &Path) -> Result<(), String> {
         )
     })?;
     Ok(())
+}
+
+/// Resolve the executable to relaunch in the self-relaunch (non-systemd) path.
+///
+/// The Linux package ships a launcher script named `st-server` next to the real
+/// binary `st-server-bin`; the launcher sets `LD_LIBRARY_PATH` for the bundled
+/// libs. Relaunch through it when present so the bundled libs resolve. On macOS
+/// (and dev builds where the running binary is itself named `st-server`) this
+/// resolves to the executable itself.
+#[cfg(unix)]
+fn launcher_for_relaunch(exe: &Path) -> PathBuf {
+    let launcher = exe.with_file_name("st-server");
+    if launcher.is_file() && launcher != exe {
+        launcher
+    } else {
+        exe.to_path_buf()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum SystemdScope {
+    System,
+    User,
+}
+
+/// Detect whether this process is a systemd-managed st-server unit, and which
+/// manager owns it. Returns `None` for a plain desktop / double-click launch,
+/// which keeps the self-relaunch path.
+#[cfg(target_os = "linux")]
+fn systemd_service_scope() -> Option<SystemdScope> {
+    // System-wide service sets this explicitly (main::apply_system_mode_env()).
+    if std::env::var("ST_SYSTEM_MODE").as_deref() == Ok("1") {
+        return Some(SystemdScope::System);
+    }
+    // Any other systemd unit (notably the per-user `--user` install) exposes
+    // INVOCATION_ID. A plain desktop / double-click launch does not.
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        return Some(SystemdScope::User);
+    }
+    None
+}
+
+/// Ask systemd to restart the st-server unit. Used instead of self-relaunch when
+/// running under systemd: a self-spawned child would be reaped with the unit's
+/// cgroup and would lose the run-mode flags, capabilities, and launcher.
+#[cfg(target_os = "linux")]
+fn request_systemd_restart(scope: &SystemdScope) -> Result<(), String> {
+    const UNIT: &str = "st-server.service";
+    let mut command = Command::new("systemctl");
+    if matches!(scope, SystemdScope::User) {
+        command.arg("--user");
+    }
+    // --no-block: enqueue the restart job in PID1 and return immediately. The
+    // job is owned by systemd, so it survives this process exiting and the
+    // cgroup teardown, then brings up a fresh instance via ExecStart.
+    let status = command
+        .arg("--no-block")
+        .arg("restart")
+        .arg(UNIT)
+        .status()
+        .map_err(|err| format!("failed to run systemctl: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("systemctl exited with status {status}"))
+    }
 }
 
 fn cleanup_staging_root(staging_root: &Path) {

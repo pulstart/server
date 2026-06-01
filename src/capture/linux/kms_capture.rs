@@ -316,7 +316,7 @@ pub fn probe_can_capture() -> Result<(), String> {
         .map_err(|e| format!("set UniversalPlanes: {e}"))?;
     let plane = find_active_plane(&card)?;
     let cursor = find_cursor_plane(&card, plane);
-    let frame = capture_frame(&card, plane, cursor).map_err(|e| {
+    let frame = capture_frame(&card, plane, cursor, None).map_err(|e| {
         format!("KMS probe capture failed (not DRM master / missing cap_sys_admin?): {e}")
     })?;
     if frame.width == 0 || frame.height == 0 {
@@ -418,8 +418,29 @@ fn cursor_diag(reason: &str) {
     }
 }
 
+/// Per-capture-thread cache for KMS cursor dirty-tracking (C5). KWin only swaps
+/// the cursor plane's framebuffer when the cursor *shape* changes, so while the
+/// fb handle is unchanged the pixels are identical: we skip the
+/// PRIME-export + mmap + row-copy and reuse the cached pixels, reading only the
+/// (cheap) position. `serial` increments on every shape change so the control
+/// publish layer can de-dup unchanged shapes.
+#[derive(Default)]
+struct CursorCache {
+    fb_handle: Option<control::framebuffer::Handle>,
+    pixels: Option<Arc<[u8]>>,
+    width: u32,
+    height: u32,
+    serial: u64,
+}
+
 /// Capture cursor image from its DRM plane by mmap'ing the cursor framebuffer.
-fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<CapturedCursor> {
+/// With a `cache`, an unchanged framebuffer handle short-circuits the heavy
+/// export+mmap+copy (C5).
+fn capture_cursor(
+    card: &Card,
+    cursor_handle: control::plane::Handle,
+    mut cache: Option<&mut CursorCache>,
+) -> Option<CapturedCursor> {
     let plane = match card.get_plane(cursor_handle) {
         Ok(p) => p,
         Err(e) => {
@@ -431,10 +452,33 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
     // No framebuffer = cursor hidden (or KWin not using this HW cursor plane)
     let Some(fb_handle) = plane.framebuffer() else {
         cursor_diag("cursor plane has no framebuffer (hidden or SW cursor)");
+        if let Some(c) = &mut cache {
+            c.fb_handle = None;
+            c.pixels = None;
+        }
         return None;
     };
 
     let (x, y) = read_cursor_position(card, cursor_handle);
+
+    // C5 fast path: framebuffer unchanged → cached pixels are still valid.
+    if let Some(c) = cache.as_deref() {
+        if c.fb_handle == Some(fb_handle) {
+            if let Some(px) = &c.pixels {
+                return Some(CapturedCursor {
+                    pixels: px.clone(),
+                    x,
+                    y,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                    width: c.width,
+                    height: c.height,
+                    shape_serial: c.serial,
+                    visible: true,
+                });
+            }
+        }
+    }
 
     // Get cursor framebuffer info — try FB2 first, fall back to FB1
     let fb2 = match card.get_planar_framebuffer(fb_handle) {
@@ -527,8 +571,28 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
         libc::munmap(mapped, mapped_size);
     }
 
+    let pixels_arc: Arc<[u8]> = pixels.into();
+    // Update the cache and derive a shape serial that increments on each fb
+    // change, so the publish layer can de-dup unchanged shapes (C5).
+    let serial = if let Some(c) = cache {
+        if c.fb_handle != Some(fb_handle) {
+            c.serial = c.serial.wrapping_add(1);
+        }
+        c.fb_handle = Some(fb_handle);
+        c.pixels = Some(pixels_arc.clone());
+        c.width = cursor_w;
+        c.height = cursor_h;
+        c.serial
+    } else {
+        0
+    };
+
+    if CURSOR_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 3 {
+        eprintln!("[kms][cursor] captured cursor fb={cursor_w}x{cursor_h} pos=({x}, {y})");
+    }
+
     Some(CapturedCursor {
-        pixels: pixels.into(),
+        pixels: pixels_arc,
         x,
         y,
         hotspot_x: 0,
@@ -537,16 +601,8 @@ fn capture_cursor(card: &Card, cursor_handle: control::plane::Handle) -> Option<
         // displayed CRTC_W/H, when present, can differ; the client scales).
         width: cursor_w,
         height: cursor_h,
-        shape_serial: 0,
+        shape_serial: serial,
         visible: true,
-    })
-    .inspect(|c| {
-        if CURSOR_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 3 {
-            eprintln!(
-                "[kms][cursor] captured cursor fb={}x{} pos=({}, {})",
-                c.width, c.height, c.x, c.y
-            );
-        }
     })
 }
 
@@ -592,6 +648,7 @@ fn capture_frame(
     card: &Card,
     plane_handle: control::plane::Handle,
     cursor_handle: Option<control::plane::Handle>,
+    cursor_cache: Option<&mut CursorCache>,
 ) -> Result<CapturedFrame, String> {
     let plane = card
         .get_plane(plane_handle)
@@ -640,7 +697,7 @@ fn capture_frame(
     }
 
     // Capture cursor from its separate plane
-    let cursor = cursor_handle.and_then(|h| capture_cursor(card, h));
+    let cursor = cursor_handle.and_then(|h| capture_cursor(card, h, cursor_cache));
 
     Ok(CapturedFrame {
         data: FrameData::DmaBuf {
@@ -715,7 +772,7 @@ impl CaptureBackend for KmsCapture {
 
         // Test-capture one frame to verify GEM handle export works.
         // On Wayland, non-DRM-master processes can't read framebuffer handles.
-        let test_frame = capture_frame(&card, plane_handle, cursor_handle)
+        let test_frame = capture_frame(&card, plane_handle, cursor_handle, None)
             .map_err(|e| format!("KMS test capture failed (not DRM master?): {e}"))?;
         println!(
             "[kms] Test capture OK ({}x{})",
@@ -785,26 +842,20 @@ impl CaptureBackend for KmsCapture {
                 eprintln!("[kms] timerfd unavailable; falling back to sleep-based pacer");
             }
 
+            // C4: cache the resolved plane handle. Plane handles are stable; only
+            // the framebuffer bound to a plane flips. So we reuse the validated
+            // handle and only re-walk all planes (the N+N×M `type`-property reads)
+            // when a capture actually fails — i.e. a modeset moved the binding.
+            let mut current_plane = plane_handle;
+            // C5: per-thread cursor dirty-tracking cache.
+            let mut cursor_cache = CursorCache::default();
+            // C9: throttle for capture-overrun (coalesced timerfd expiration) logs.
+            let mut last_overshoot_log: Option<Instant> = None;
+
             while running.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
 
-                // Re-find the plane each iteration (the framebuffer handle may
-                // change on a compositor flip). When an output was selected we
-                // stay pinned to its CRTC; otherwise we track the primary plane.
-                let current_plane = match target_crtc {
-                    Some(crtc) => find_plane_for_crtc(&card, crtc),
-                    None => find_active_plane(&card).ok(),
-                };
-                let current_plane = match current_plane {
-                    Some(p) => p,
-                    None => {
-                        // Plane might momentarily disappear during a modeset
-                        thread::sleep(Duration::from_millis(16));
-                        continue;
-                    }
-                };
-
-                match capture_frame(&card, current_plane, cursor_handle) {
+                match capture_frame(&card, current_plane, cursor_handle, Some(&mut cursor_cache)) {
                     Ok(mut frame) => {
                         let dims = (frame.width, frame.height);
                         if !logged_fmt {
@@ -916,6 +967,15 @@ impl CaptureBackend for KmsCapture {
                             );
                             last_err_log = Some(now);
                         }
+                        // C4: a failed capture means the framebuffer binding moved
+                        // (modeset / active-session switch) — re-walk the planes
+                        // once to re-acquire it, then retry next iteration.
+                        if let Some(p) = match target_crtc {
+                            Some(crtc) => find_plane_for_crtc(&card, crtc),
+                            None => find_active_plane(&card).ok(),
+                        } {
+                            current_plane = p;
+                        }
                         thread::sleep(Duration::from_millis(16));
                         continue;
                     }
@@ -925,7 +985,25 @@ impl CaptureBackend for KmsCapture {
                     Some(p) => {
                         // Block on the timerfd; coalesced expirations (capture was
                         // slower than the target interval) mean we skip ahead.
-                        let _ = p.wait();
+                        match p.wait() {
+                            // C9: >1 expiration = capture overran the frame
+                            // interval and the kernel coalesced the missed ticks.
+                            Ok(expirations) if expirations > 1 => {
+                                let now = Instant::now();
+                                if last_overshoot_log
+                                    .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2))
+                                {
+                                    eprintln!(
+                                        "[kms] capture overran frame interval by {} tick(s) \
+                                         (encode/copy too slow for {:?} cadence)",
+                                        expirations - 1,
+                                        target_interval
+                                    );
+                                    last_overshoot_log = Some(now);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     None => {
                         let elapsed = frame_start.elapsed();

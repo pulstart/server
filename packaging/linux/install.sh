@@ -44,6 +44,7 @@ SYSTEM_BIN="/usr/local/bin/st-server"
 SYSTEM_SERVICE_PATH="/etc/systemd/system/st-server.service"
 GLOBAL_TRAY_PATH="/etc/systemd/user/st-server-tray.service"
 TMPFILES_PATH="/etc/tmpfiles.d/st-server.conf"
+SYSTEM_DESKTOP_PATH="/usr/share/applications/st-server.desktop"
 SYSTEM_STATE_DIR="/var/lib/st-server"
 SOCKET_DIR="/run/st-server"
 SYSTEM_GROUP="st-server"
@@ -144,6 +145,10 @@ Description=st low-latency game-streaming server
 Documentation=https://github.com/${REPO}
 After=graphical-session.target
 PartOf=graphical-session.target
+# Never give up on a crash loop: an always-on streaming host should keep
+# retrying rather than land in 'failed' after systemd's default 5-starts/10s.
+# RestartSec below still throttles to one attempt every 2s.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -159,20 +164,24 @@ EOF
 write_desktop_entry() {
     mkdir -p "$DESKTOP_DIR"
     local dst="${DESKTOP_DIR}/st-server.desktop"
-    log "Writing $dst"
+    log "Writing $dst (start-menu launcher)"
+    # Visible in the application menu. Clicking it starts the systemd *user*
+    # service rather than launching the binary directly — launching a second
+    # process would fight the already-running unit for the TCP/UDP ports.
+    # Starting an already-running unit is a harmless no-op.
     install -Dm0644 /dev/stdin "$dst" <<EOF
 [Desktop Entry]
 Type=Application
 Name=st Server
 GenericName=Low-Latency Game Streaming Server
-Comment=Streams this desktop to st clients over the network
-Exec=${BIN_DIR}/st-server
+Comment=Start the st-server streaming service in your session
+Exec=systemctl --user start st-server.service
 Icon=st-server
 Terminal=false
 Categories=Network;RemoteAccess;
+Keywords=stream;remote;game;moonlight;sunshine;
 StartupWMClass=st-server
 StartupNotify=false
-NoDisplay=true
 EOF
 }
 
@@ -457,6 +466,10 @@ Documentation=https://github.com/${REPO}
 # (the greeter holds DRM-master) to capture.
 After=display-manager.service systemd-logind.service
 Wants=graphical.target
+# Never give up on a crash loop: an always-on streaming host should keep
+# retrying rather than land in 'failed' after systemd's default 5-starts/10s.
+# RestartSec below still throttles to one attempt every 2s.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -485,6 +498,9 @@ write_global_tray_unit() {
 Description=st-server tray agent
 After=graphical-session.target
 PartOf=graphical-session.target
+# Keep retrying instead of landing in 'failed' after a quick restart burst
+# (e.g. control socket not up yet at boot). RestartSec throttles attempts.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -494,6 +510,28 @@ RestartSec=3
 
 [Install]
 WantedBy=graphical-session.target
+EOF
+}
+
+# System-wide start-menu launcher, installed for ALL users. The root service
+# itself starts at boot and can't be (re)started from an unprivileged click;
+# what a user interacts with is their per-user tray agent, so this entry starts
+# that. Starting an already-running tray is a harmless no-op.
+write_system_desktop_entry() {
+    log "Writing $SYSTEM_DESKTOP_PATH (start-menu launcher, all users)"
+    sudo install -Dm0644 /dev/stdin "$SYSTEM_DESKTOP_PATH" <<EOF
+[Desktop Entry]
+Type=Application
+Name=st Server Tray
+GenericName=Low-Latency Game Streaming Server
+Comment=Show the st-server tray for the system-wide streaming service
+Exec=systemctl --user start st-server-tray.service
+Icon=st-server
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=stream;remote;game;moonlight;sunshine;
+StartupWMClass=st-server
+StartupNotify=false
 EOF
 }
 
@@ -540,6 +578,7 @@ install_system() {
     write_tmpfiles
     write_system_service
     write_global_tray_unit
+    write_system_desktop_entry
     enable_system_services
     print_system_hint
 }
@@ -565,6 +604,12 @@ The tray icon appears in each user's session and reaches the service
 over the control socket. You were added to the '${SYSTEM_GROUP}' group —
 log out and back in for the tray to connect.
 
+A "st Server Tray" entry is in your application menu — launch it to bring
+the tray back if you closed it ("Quit Tray" closes only your tray; the
+system service keeps running). Stop the service itself with:
+
+  sudo systemctl stop st-server
+
 First-connect token (keep it secret — root-level control):
 
   sudo cat ${SYSTEM_STATE_DIR}/st-server-config.json
@@ -585,8 +630,9 @@ uninstall_system() {
     sudo systemctl --global disable st-server-tray.service 2>/dev/null || true
     systemctl --user stop st-server-tray.service 2>/dev/null || true
 
-    log "Removing system units, tmpfiles, binary symlink (needs sudo)"
-    sudo rm -f "$SYSTEM_SERVICE_PATH" "$GLOBAL_TRAY_PATH" "$TMPFILES_PATH" "$SYSTEM_BIN"
+    log "Removing system units, tmpfiles, desktop entry, binary symlink (needs sudo)"
+    sudo rm -f "$SYSTEM_SERVICE_PATH" "$GLOBAL_TRAY_PATH" "$TMPFILES_PATH" \
+               "$SYSTEM_DESKTOP_PATH" "$SYSTEM_BIN"
     sudo systemctl daemon-reload 2>/dev/null || true
 
     if [[ -d "$SYSTEM_PREFIX" ]]; then

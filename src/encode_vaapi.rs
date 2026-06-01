@@ -346,6 +346,27 @@ impl VaapiEncoder {
                         let lp_val = std::ffi::CString::new("1").unwrap();
                         ffi::av_opt_set((*ctx).priv_data, lp_key.as_ptr(), lp_val.as_ptr(), 0);
                     }
+
+                    // Per-codec min-QP floor (C3).
+                    if let Some(qmin) = config.min_qp() {
+                        (*ctx).qmin = qmin as i32;
+                    }
+
+                    // Multi-slice encoding (C2), clamped by the driver to
+                    // VAConfigAttribEncMaxSlices if it advertises a lower max.
+                    (*ctx).slices = config.slices_per_frame() as i32;
+
+                    // H.264 entropy coder (F1). CABAC default; ST_H264_CODER=cavlc.
+                    if let Some(coder) = config.h264_coder() {
+                        let coder_key = std::ffi::CString::new("coder").unwrap();
+                        let coder_val = std::ffi::CString::new(coder).unwrap();
+                        ffi::av_opt_set(
+                            (*ctx).priv_data,
+                            coder_key.as_ptr(),
+                            coder_val.as_ptr(),
+                            0,
+                        );
+                    }
                 }
 
                 let ret = unsafe { ffi::avcodec_open2(ctx, codec, ptr::null_mut()) };

@@ -133,6 +133,14 @@ impl SoftwareEncoder {
 
             // Apply colorspace metadata
             colorspace.apply_to_codec_ctx(ctx);
+
+            // Per-codec min-QP floor (C3).
+            if let Some(qmin) = config.min_qp() {
+                (*ctx).qmin = qmin as i32;
+            }
+
+            // Multi-slice encoding (C2): x264/x265 honor avctx->slices.
+            (*ctx).slices = config.slices_per_frame() as i32;
         }
 
         // Codec-specific options (preset driven by quality setting)
@@ -151,7 +159,15 @@ impl SoftwareEncoder {
                 let forced_idr = std::ffi::CString::new("forced-idr").unwrap();
                 let one = std::ffi::CString::new("1").unwrap();
                 let x264_params = std::ffi::CString::new("x264-params").unwrap();
-                let stream_params = std::ffi::CString::new("repeat-headers=1:aud=1").unwrap();
+                // A3 (opt-in): periodic intra-refresh wave. x264 emits a
+                // recovery_point SEI at each wave end, which the client now parses
+                // to exit recovery without a full-IDR spike.
+                let mut params = String::from("repeat-headers=1:aud=1");
+                if config.intra_refresh_enabled() {
+                    params.push_str(":intra-refresh=1");
+                    println!("[sw] x264 intra-refresh enabled (ST_INTRA_REFRESH)");
+                }
+                let stream_params = std::ffi::CString::new(params).unwrap();
                 unsafe {
                     ffi::av_opt_set((*ctx).priv_data, forced_idr.as_ptr(), one.as_ptr(), 0);
                     ffi::av_opt_set(
@@ -160,6 +176,17 @@ impl SoftwareEncoder {
                         stream_params.as_ptr(),
                         0,
                     );
+                    // H.264 entropy coder (F1). CABAC default; ST_H264_CODER=cavlc.
+                    if let Some(coder) = config.h264_coder() {
+                        let coder_key = std::ffi::CString::new("coder").unwrap();
+                        let coder_val = std::ffi::CString::new(coder).unwrap();
+                        ffi::av_opt_set(
+                            (*ctx).priv_data,
+                            coder_key.as_ptr(),
+                            coder_val.as_ptr(),
+                            0,
+                        );
+                    }
                 }
             }
             Codec::Hevc => {
@@ -725,6 +752,201 @@ mod inplace_bitrate_tests {
             assert!(
                 after > before * 1.5,
                 "libx264 ignored runtime bitrate change: {before:.0} -> {after:.0} bytes/pkt"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod slice_qp_tests {
+    use super::*;
+
+    // Count H.264 slice NAL units (type 1 = non-IDR coded slice, 5 = IDR slice)
+    // in an Annex-B bitstream by scanning 3-/4-byte start codes.
+    fn count_slice_nals(data: &[u8]) -> usize {
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i + 3 < data.len() {
+            let sc4 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+            let sc3 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+            let (hdr, adv) = if sc4 {
+                (data.get(i + 4).copied(), 4)
+            } else if sc3 {
+                (data.get(i + 3).copied(), 3)
+            } else {
+                i += 1;
+                continue;
+            };
+            if let Some(b) = hdr {
+                let nal_type = b & 0x1f;
+                if nal_type == 1 || nal_type == 5 {
+                    count += 1;
+                }
+            }
+            i += adv;
+        }
+        count
+    }
+
+    // C2 regression guard: avctx->slices must reach libx264's slice mode so each
+    // frame is split into multiple slice NALs. The client runs FF_THREAD_SLICE
+    // and a lost packet then corrupts only one slice rather than the whole frame.
+    // If a future ffmpeg/x264 change stops honoring avctx->slices this fails loud.
+    #[test]
+    fn libx264_emits_multiple_slices_per_frame() {
+        unsafe {
+            let codec = ffi::avcodec_find_encoder_by_name(c"libx264".as_ptr());
+            if codec.is_null() {
+                eprintln!("libx264 not available; skipping");
+                return;
+            }
+            let ctx = ffi::avcodec_alloc_context3(codec);
+            (*ctx).width = 640;
+            (*ctx).height = 480;
+            (*ctx).time_base = ffi::AVRational { num: 1, den: 60 };
+            (*ctx).framerate = ffi::AVRational { num: 60, den: 1 };
+            (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
+            (*ctx).gop_size = i32::MAX;
+            (*ctx).max_b_frames = 0;
+            (*ctx).bit_rate = 4_000_000;
+            (*ctx).slices = 4; // exactly the field encode_sw sets from slices_per_frame
+            let preset = CString::new("ultrafast").unwrap();
+            let tune = CString::new("zerolatency").unwrap();
+            ffi::av_opt_set((*ctx).priv_data, c"preset".as_ptr(), preset.as_ptr(), 0);
+            ffi::av_opt_set((*ctx).priv_data, c"tune".as_ptr(), tune.as_ptr(), 0);
+            assert!(
+                ffi::avcodec_open2(ctx, codec, ptr::null_mut()) >= 0,
+                "open libx264"
+            );
+
+            let frame = ffi::av_frame_alloc();
+            (*frame).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            (*frame).width = 640;
+            (*frame).height = 480;
+            ffi::av_frame_get_buffer(frame, 32);
+            // gradient luma so the slices carry residual (not skip-only)
+            let y = (*frame).data[0];
+            let ls = (*frame).linesize[0] as usize;
+            for row in 0..480usize {
+                let base = y.add(row * ls);
+                for x in 0..ls {
+                    *base.add(x) = ((row * 3 + x) & 0xff) as u8;
+                }
+            }
+            (*frame).pts = 0;
+
+            let pkt = ffi::av_packet_alloc();
+            ffi::avcodec_send_frame(ctx, frame);
+            ffi::avcodec_send_frame(ctx, ptr::null_mut()); // flush
+            let mut slice_nals = 0usize;
+            loop {
+                let r = ffi::avcodec_receive_packet(ctx, pkt);
+                if r < 0 {
+                    break;
+                }
+                let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
+                slice_nals += count_slice_nals(data);
+                ffi::av_packet_unref(pkt);
+            }
+            ffi::av_packet_free(&mut { pkt });
+            ffi::av_frame_free(&mut { frame });
+            ffi::avcodec_free_context(&mut { ctx });
+
+            assert!(
+                slice_nals > 1,
+                "expected >1 slice NAL with avctx->slices=4, got {slice_nals}"
+            );
+        }
+    }
+
+    // Encode `count` frames of active (changing) content at a generous CBR budget
+    // and return average packet bytes. With no min-QP, rate control pours the
+    // budget into low-QP frames; a min-QP floor caps QP and curbs that spend.
+    unsafe fn avg_bytes_with_qmin(qmin: i32, count: i64) -> f64 {
+        let codec = ffi::avcodec_find_encoder_by_name(c"libx264".as_ptr());
+        let ctx = ffi::avcodec_alloc_context3(codec);
+        (*ctx).width = 640;
+        (*ctx).height = 480;
+        (*ctx).time_base = ffi::AVRational { num: 1, den: 60 };
+        (*ctx).framerate = ffi::AVRational { num: 60, den: 1 };
+        (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
+        (*ctx).gop_size = i32::MAX;
+        (*ctx).max_b_frames = 0;
+        let bps: i64 = 50_000_000; // generous, so qmin=0 would pick a very low QP
+        (*ctx).bit_rate = bps;
+        (*ctx).rc_max_rate = bps;
+        (*ctx).rc_buffer_size = (bps / 60) as i32;
+        if qmin > 0 {
+            (*ctx).qmin = qmin; // exactly the field encode_sw sets from min_qp()
+        }
+        let preset = CString::new("ultrafast").unwrap();
+        let tune = CString::new("zerolatency").unwrap();
+        ffi::av_opt_set((*ctx).priv_data, c"preset".as_ptr(), preset.as_ptr(), 0);
+        ffi::av_opt_set((*ctx).priv_data, c"tune".as_ptr(), tune.as_ptr(), 0);
+        assert!(
+            ffi::avcodec_open2(ctx, codec, ptr::null_mut()) >= 0,
+            "open libx264"
+        );
+
+        let frame = ffi::av_frame_alloc();
+        (*frame).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+        (*frame).width = 640;
+        (*frame).height = 480;
+        ffi::av_frame_get_buffer(frame, 32);
+
+        let pkt = ffi::av_packet_alloc();
+        let mut total: u64 = 0;
+        let mut packets: u64 = 0;
+        let ls = (*frame).linesize[0] as usize;
+        let h = (*frame).height as usize;
+        for i in 0..count {
+            let y = (*frame).data[0];
+            let iu = i as usize;
+            for row in 0..h {
+                let base = y.add(row * ls);
+                for x in 0..ls {
+                    *base.add(x) = (((iu * 7 + row * 3 + x) & 0xff) as u8).wrapping_mul(3);
+                }
+            }
+            (*frame).pts = i;
+            ffi::avcodec_send_frame(ctx, frame);
+            loop {
+                let r = ffi::avcodec_receive_packet(ctx, pkt);
+                if r == ffi::AVERROR(ffi::EAGAIN) || r == ffi::AVERROR_EOF || r < 0 {
+                    break;
+                }
+                total += (*pkt).size as u64;
+                packets += 1;
+                ffi::av_packet_unref(pkt);
+            }
+        }
+        ffi::av_packet_free(&mut { pkt });
+        ffi::av_frame_free(&mut { frame });
+        ffi::avcodec_free_context(&mut { ctx });
+        if packets == 0 {
+            0.0
+        } else {
+            total as f64 / packets as f64
+        }
+    }
+
+    // C3 regression guard: the per-codec min-QP floor must actually reach the
+    // encoder and curb CBR over-spend. At a generous budget, no-floor encodes
+    // low-QP (large) frames; a qmin floor caps QP so average packet bytes must
+    // drop. Mirrors Sunshine's enableMinQP. If (*ctx).qmin stops being honored
+    // this fails loud.
+    #[test]
+    fn min_qp_floor_curbs_overspend() {
+        unsafe {
+            if ffi::avcodec_find_encoder_by_name(c"libx264".as_ptr()).is_null() {
+                eprintln!("libx264 not available; skipping");
+                return;
+            }
+            let no_floor = avg_bytes_with_qmin(0, 60);
+            let with_floor = avg_bytes_with_qmin(35, 60);
+            assert!(
+                with_floor < no_floor,
+                "min-QP floor did not curb over-spend: {no_floor:.0} -> {with_floor:.0} bytes/pkt"
             );
         }
     }

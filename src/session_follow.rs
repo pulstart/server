@@ -38,14 +38,97 @@ pub fn maybe_spawn(audio: Arc<Mutex<AudioPipeline>>) {
 }
 
 fn disabled() -> bool {
+    env_off("ST_AUDIO_FOLLOW")
+}
+
+fn env_off(var: &str) -> bool {
     matches!(
-        std::env::var("ST_AUDIO_FOLLOW")
+        std::env::var(var)
             .unwrap_or_default()
             .trim()
             .to_lowercase()
             .as_str(),
         "0" | "false" | "no" | "off"
     )
+}
+
+/// Conventional first human-user uid. Below this are system accounts and the
+/// display-manager greeter, which have no st-server tray to start.
+const HUMAN_UID_MIN: u32 = 1000;
+
+/// System-wide mode: keep the active user's per-user tray agent running.
+///
+/// The tray unit (`st-server-tray.service`) is globally enabled, so it
+/// autostarts at login. This watcher covers the gaps that enable-at-login does
+/// not: a service started manually mid-session, a tray the user quit, and user
+/// switches — on each it (re)starts the now-active user's tray so the tray
+/// reappears without a re-login. Independent of audio-follow; `ST_TRAY_FOLLOW=0`
+/// (also `false`/`no`/`off`) disables it.
+pub fn spawn_tray_follow() {
+    if std::env::var_os("ST_SYSTEM_MODE").is_none() {
+        return;
+    }
+    if env_off("ST_TRAY_FOLLOW") {
+        println!("[tray-follow] disabled via ST_TRAY_FOLLOW");
+        return;
+    }
+    thread::spawn(|| {
+        println!("[tray-follow] watching seat0 to start the active user's tray");
+        let mut current: Option<u32> = None;
+        loop {
+            let active = active_uid();
+            if active != current {
+                if let Some(uid) = active {
+                    start_user_tray(uid);
+                }
+                current = active;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    });
+}
+
+/// Start the given user's tray agent from the root service via their user
+/// manager. Best-effort: logs and moves on if the user has no running manager
+/// (not logged in) or `systemctl --machine` is unavailable.
+fn start_user_tray(uid: u32) {
+    if uid < HUMAN_UID_MIN {
+        return; // greeter / system users have no tray
+    }
+    let Some(name) = username_for_uid(uid) else {
+        eprintln!("[tray-follow] no username for uid={uid}; skipping tray start");
+        return;
+    };
+    let machine = format!("{name}@.host");
+    let status = std::process::Command::new("systemctl")
+        .args([
+            "--machine",
+            &machine,
+            "--user",
+            "start",
+            "st-server-tray.service",
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("[tray-follow] started tray for {name} (uid={uid})"),
+        Ok(s) => eprintln!("[tray-follow] tray start for {name} (uid={uid}) exited with {s}"),
+        Err(e) => eprintln!("[tray-follow] failed to start tray for {name} (uid={uid}): {e}"),
+    }
+}
+
+fn username_for_uid(uid: u32) -> Option<String> {
+    let output = std::process::Command::new("getent")
+        .args(["passwd", &uid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split(':')
+        .next()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 fn run(audio: Arc<Mutex<AudioPipeline>>) {

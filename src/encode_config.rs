@@ -23,6 +23,23 @@ pub enum QualityPreset {
 }
 
 impl QualityPreset {
+    /// Parse `ST_QUALITY` (F3): `low`/`latency`, `balanced`, `high`/`quality`.
+    /// `None` when unset so the caller keeps its default. Tray/control-socket
+    /// `forced_quality` still overrides this at runtime.
+    pub fn from_env() -> Option<Self> {
+        match std::env::var("ST_QUALITY")
+            .ok()?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "low" | "lowlatency" | "low-latency" | "latency" | "ll" => Some(Self::LowLatency),
+            "balanced" | "balance" | "med" | "medium" => Some(Self::Balanced),
+            "high" | "highquality" | "high-quality" | "quality" | "hq" => Some(Self::HighQuality),
+            _ => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::LowLatency => "Low Latency",
@@ -228,7 +245,7 @@ impl EncoderConfig {
             gop_size,
             max_b_frames: 0,
             low_delay: true,
-            quality: QualityPreset::Balanced,
+            quality: QualityPreset::from_env().unwrap_or(QualityPreset::Balanced),
         }
     }
 
@@ -306,6 +323,95 @@ impl EncoderConfig {
         self.chroma == ChromaSampling::Yuv444
     }
 
+    /// Per-codec minimum-QP floor (mirrors Sunshine's `enableMinQP`: h264=19,
+    /// hevc=23, av1=23). Under CBR/VBV a static scene otherwise drives QP toward
+    /// 0, over-spending bits and producing a visible quality pulse. Always-on;
+    /// `ST_MIN_QP=0|off|false|no` disables, a numeric value overrides.
+    pub fn min_qp(&self) -> Option<u32> {
+        if let Ok(raw) = std::env::var("ST_MIN_QP") {
+            let trimmed = raw.trim();
+            return match trimmed.to_ascii_lowercase().as_str() {
+                "0" | "off" | "false" | "no" => None,
+                _ => trimmed.parse::<u32>().ok().map(|v| v.min(255)),
+            };
+        }
+        Some(match self.codec {
+            Codec::H264 => 19,
+            Codec::Hevc => 23,
+            Codec::Av1 => 23,
+        })
+    }
+
+    /// Number of slices per encoded frame (C2). More than one slice means a
+    /// single lost UDP packet corrupts only its slice instead of the whole
+    /// frame, and lets the client's `FF_THREAD_SLICE` decoder actually
+    /// parallelise. FFmpeg maps `AVCodecContext::slices` to NVENC `sliceMode=3`,
+    /// VAAPI slices, and x264/x265 `slices`. Resolution-based default
+    /// (auto-enabled per the auto-enable rule); `ST_SLICES` overrides, `1`
+    /// disables.
+    pub fn slices_per_frame(&self) -> u32 {
+        if let Some(n) = std::env::var("ST_SLICES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            return n.clamp(1, 32);
+        }
+        match self.height {
+            h if h >= 2160 => 4,
+            h if h >= 1080 => 2,
+            _ => 1,
+        }
+    }
+
+    /// H.264 entropy coder selection. CABAC (default, current effective
+    /// behavior) or CAVLC via `ST_H264_CODER=cavlc`. `None` for non-H.264.
+    pub fn h264_coder(&self) -> Option<&'static str> {
+        if self.codec != Codec::H264 {
+            return None;
+        }
+        match std::env::var("ST_H264_CODER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cavlc" | "vlc" => Some("cavlc"),
+            _ => Some("cabac"),
+        }
+    }
+
+    /// Intra-refresh recovery (A3, opt-in). Spreads intra coding across a wave of
+    /// frames instead of periodic full IDRs, so loss recovery (paired with the
+    /// client's `recovery_point` SEI parser) costs no bitrate spike.
+    ///
+    /// **Encoder side is validated.** `intra_refresh_loopback.rs` is a real
+    /// packet-loss-injection convergence test (the CLAUDE.md §9 gate): encode a
+    /// PIR stream, drop a mid-stream P-frame, and prove the libavcodec decoder
+    /// re-converges to the clean reference within one refresh period with *no*
+    /// intervening IDR — and it discriminates (the same test fails when PIR is
+    /// disabled). So the encoder recovery property A3 relies on is no longer a
+    /// probe-only claim.
+    ///
+    /// **Still opt-in, by design.** The headline A3 benefit — killing the
+    /// post-loss IDR *storm* — is not realized until the client stops eagerly
+    /// requesting a keyframe on every loss (`pipeline.rs` `request_recovery_
+    /// keyframe`) and instead rides the PIR wave, exiting recovery on the next
+    /// `recovery_point` SEI it already parses. That client change plus its live
+    /// loss validation is the remaining blocker for default-on; flipping the
+    /// server alone would still emit the forced IDR (no storm reduction) for a
+    /// only-marginal recovery-latency gain. `ST_INTRA_REFRESH=1` opts in today.
+    ///
+    /// NVENC note: FFmpeg's NVENC wrapper emits no `recovery_point` SEI (validated
+    /// live on an RTX 4080), so NVENC recovery stays IDR-based regardless.
+    /// AV1/VAAPI have no portable FFmpeg knob, so this only affects
+    /// libx264/libx265/NVENC.
+    pub fn intra_refresh_enabled(&self) -> bool {
+        matches!(
+            std::env::var("ST_INTRA_REFRESH").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        )
+    }
+
     /// Compute VBV buffer size in bits (bitrate / fps for HW, larger for SW).
     ///
     /// `libsvtav1` derives a VBV duration from `rc_buffer_size` and rejects values below 20 ms.
@@ -379,17 +485,27 @@ impl EncoderConfig {
             height: self.height,
             framerate: self.framerate.min(u16::MAX as u32) as u16,
             audio_sample_rate: audio.sample_rate,
-            audio_channels: audio.channels.min(u8::MAX as u32) as u8,
+            // E4: advertise the downmixed (stereo) channel count so the
+            // stereo-only client accepts surround presets.
+            audio_channels: audio.output_channels().min(u8::MAX as u32) as u8,
             hdr: self.is_hdr(),
             chroma: match self.chroma {
                 ChromaSampling::Yuv420 => VideoChromaSampling::Yuv420,
                 ChromaSampling::Yuv444 => VideoChromaSampling::Yuv444,
             },
+            packet_duration_ms: audio.packet_duration_ms.min(u8::MAX as u32) as u8,
         }
     }
 }
 
 /// Audio stream configuration.
+/// Default Opus frame duration (E1). 5 ms — the low-latency game-streaming choice
+/// (matches Sunshine) — shaves ~15 ms vs the old 20 ms. The client derives all of
+/// its sequence-gap / concealment timing from this over the wire
+/// (`StreamConfig.packet_duration_ms`); `ST_AUDIO_FRAME_MS=20` restores the old
+/// behavior. Opus-valid (2.5/5/10/20/40/60 ms).
+pub const DEFAULT_OPUS_FRAME_MS: u32 = 5;
+
 #[derive(Debug, Clone)]
 pub struct AudioConfig {
     pub sample_rate: u32,
@@ -399,9 +515,15 @@ pub struct AudioConfig {
 }
 
 impl AudioConfig {
-    /// Build audio config from ST_AUDIO env var.
+    /// Build audio config from ST_AUDIO env var. The Opus frame duration defaults
+    /// to [`DEFAULT_OPUS_FRAME_MS`] (5 ms, E1 low-latency default); `ST_AUDIO_FRAME_MS`
+    /// overrides it (e.g. `=20` restores the old conservative framing). Opus only
+    /// supports 2.5/5/10/20/40/60 ms frames, so the value is snapped to the
+    /// nearest valid duration. The client derives all of its timing from this
+    /// over the wire (`StreamConfig.packet_duration_ms`), so changing it here is
+    /// sufficient.
     pub fn from_env() -> Self {
-        match std::env::var("ST_AUDIO")
+        let mut config = match std::env::var("ST_AUDIO")
             .unwrap_or_default()
             .to_lowercase()
             .as_str()
@@ -412,7 +534,24 @@ impl AudioConfig {
             "surround71" | "7.1" => Self::surround71(),
             "high_surround71" | "high_7.1" => Self::high_surround71(),
             _ => Self::stereo(),
+        };
+        if let Some(ms) = std::env::var("ST_AUDIO_FRAME_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            config.packet_duration_ms = Self::snap_opus_frame_ms(ms);
         }
+        config
+    }
+
+    /// Snap an arbitrary ms value to the nearest Opus-supported frame duration.
+    fn snap_opus_frame_ms(ms: u32) -> u32 {
+        const VALID: [u32; 5] = [5, 10, 20, 40, 60];
+        VALID
+            .iter()
+            .copied()
+            .min_by_key(|v| v.abs_diff(ms))
+            .unwrap_or(20)
     }
 
     pub fn stereo() -> Self {
@@ -420,7 +559,7 @@ impl AudioConfig {
             sample_rate: 48000,
             channels: 2,
             bitrate: 96_000,
-            packet_duration_ms: 20,
+            packet_duration_ms: DEFAULT_OPUS_FRAME_MS,
         }
     }
 
@@ -429,7 +568,7 @@ impl AudioConfig {
             sample_rate: 48000,
             channels: 2,
             bitrate: 512_000,
-            packet_duration_ms: 20,
+            packet_duration_ms: DEFAULT_OPUS_FRAME_MS,
         }
     }
 
@@ -438,7 +577,7 @@ impl AudioConfig {
             sample_rate: 48000,
             channels: 6,
             bitrate: 256_000,
-            packet_duration_ms: 20,
+            packet_duration_ms: DEFAULT_OPUS_FRAME_MS,
         }
     }
 
@@ -447,7 +586,7 @@ impl AudioConfig {
             sample_rate: 48000,
             channels: 6,
             bitrate: 1_536_000,
-            packet_duration_ms: 20,
+            packet_duration_ms: DEFAULT_OPUS_FRAME_MS,
         }
     }
 
@@ -456,7 +595,7 @@ impl AudioConfig {
             sample_rate: 48000,
             channels: 8,
             bitrate: 450_000,
-            packet_duration_ms: 20,
+            packet_duration_ms: DEFAULT_OPUS_FRAME_MS,
         }
     }
 
@@ -465,7 +604,7 @@ impl AudioConfig {
             sample_rate: 48000,
             channels: 8,
             bitrate: 2_048_000,
-            packet_duration_ms: 20,
+            packet_duration_ms: DEFAULT_OPUS_FRAME_MS,
         }
     }
 
@@ -476,11 +615,68 @@ impl AudioConfig {
     pub fn total_samples_per_frame(&self) -> usize {
         (self.samples_per_frame() * self.channels) as usize
     }
+
+    /// E4 MVP: the client Opus decoder is stereo-only and rejects any stream
+    /// with `audio_channels != 2`, so the 5.1/7.1 capture presets produce **no
+    /// audio at all** today. Fold them to stereo on the server (capture still
+    /// grabs all `channels` from the monitor; the encoder + advertised
+    /// `StreamConfig` use `output_channels()`). Front L/R pass through
+    /// unchanged, so this is strictly better than silence even on a driver
+    /// whose surround channel order differs. `ST_AUDIO_DOWNMIX=0` restores raw
+    /// passthrough (original behavior, still rejected by the stereo client).
+    pub fn downmix_to_stereo_enabled(&self) -> bool {
+        self.channels > 2
+            && !matches!(
+                std::env::var("ST_AUDIO_DOWNMIX").ok().as_deref(),
+                Some("0") | Some("false") | Some("no") | Some("off")
+            )
+    }
+
+    /// Channel count the Opus encoder and the on-wire `StreamConfig` actually
+    /// use (stereo when surround is downmixed; otherwise the capture count).
+    pub fn output_channels(&self) -> u32 {
+        if self.downmix_to_stereo_enabled() {
+            2
+        } else {
+            self.channels
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_presets_default_to_5ms_low_latency_frame() {
+        // E1: every preset ships the 5 ms low-latency frame by default.
+        for cfg in [
+            AudioConfig::stereo(),
+            AudioConfig::high_stereo(),
+            AudioConfig::surround51(),
+            AudioConfig::high_surround51(),
+            AudioConfig::surround71(),
+            AudioConfig::high_surround71(),
+        ] {
+            assert_eq!(cfg.packet_duration_ms, DEFAULT_OPUS_FRAME_MS);
+            assert_eq!(DEFAULT_OPUS_FRAME_MS, 5);
+            // 5 ms @ 48 kHz = 240 samples/channel — a valid Opus frame size.
+            assert_eq!(cfg.samples_per_frame(), 240);
+        }
+        // 20 ms restore path stays a valid Opus frame (960 samples/channel).
+        let mut twenty = AudioConfig::stereo();
+        twenty.packet_duration_ms = 20;
+        assert_eq!(twenty.samples_per_frame(), 960);
+    }
+
+    #[test]
+    fn snap_opus_frame_ms_picks_nearest_valid() {
+        assert_eq!(AudioConfig::snap_opus_frame_ms(5), 5);
+        assert_eq!(AudioConfig::snap_opus_frame_ms(4), 5);
+        assert_eq!(AudioConfig::snap_opus_frame_ms(13), 10);
+        assert_eq!(AudioConfig::snap_opus_frame_ms(20), 20);
+        assert_eq!(AudioConfig::snap_opus_frame_ms(1000), 60);
+    }
 
     fn config(codec: Codec, framerate: u32) -> EncoderConfig {
         EncoderConfig {

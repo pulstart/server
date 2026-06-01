@@ -595,6 +595,104 @@ fn convert_cursor_bitmap_to_bgra(
     Some(out)
 }
 
+/// C6: PipeWire damage-skip. **Auto-enabled** per the CLAUDE.md auto-enable rule:
+/// when the compositor fills `SPA_META_VideoDamage` with zero changed regions the
+/// buffer repeats the previous frame, so re-encoding it is wasted work on a
+/// static desktop. The decision is self-probing and safe to leave on — when the
+/// compositor attaches *no* damage meta, [`damage_skip_should_forward`] returns
+/// `true` (forwards every buffer, identical to disabled), so this only skips a
+/// buffer a compositor explicitly marked unchanged. The keepalive valve forwards
+/// a frame at least every `DAMAGE_SKIP_KEEPALIVE` (a static screen still
+/// refreshes for late joiners; a buggy zero-damage report costs at most that much
+/// staleness) and a cursor move always forwards. `ST_PW_DAMAGE_SKIP=0`
+/// (`false`/`no`/`off`) force-disables.
+fn pipewire_damage_skip_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = damage_skip_tristate(std::env::var("ST_PW_DAMAGE_SKIP").ok().as_deref());
+        eprintln!(
+            "[pipewire] damage-skip {} (auto; ST_PW_DAMAGE_SKIP=0 disables)",
+            if on { "on" } else { "off" }
+        );
+        on
+    })
+}
+
+/// Tri-state gate: unset ⇒ on (auto), `0`/`false`/`no`/`off` ⇒ off, any other
+/// value ⇒ on. Kept pure for unit testing.
+fn damage_skip_tristate(var: Option<&str>) -> bool {
+    !matches!(
+        var.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+const DAMAGE_SKIP_KEEPALIVE: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[derive(Default)]
+struct DamageSkipState {
+    last_forward: Option<std::time::Instant>,
+    last_cursor_sig: Option<(i32, i32, u64, bool)>,
+}
+
+/// Count valid (non-zero-area) damage regions on a buffer. `None` means the
+/// compositor did not attach `SPA_META_VideoDamage`, so we cannot prove the
+/// frame is a duplicate and must forward it.
+///
+/// # Safety
+/// `spa_buffer` must be a valid, non-null buffer pointer for the call.
+unsafe fn pipewire_damage_region_count(
+    spa_buffer: *const pw::spa::sys::spa_buffer,
+) -> Option<usize> {
+    // struct spa_meta_region { struct spa_region region; }
+    // struct spa_region { struct spa_point position; struct spa_rectangle size; }
+    // wire layout: i32 x, i32 y, u32 width, u32 height -> 16 bytes per region.
+    const REGION_SIZE: usize = 16;
+    const MAX_REGIONS: usize = 16;
+    let ptr = pw::spa::sys::spa_buffer_find_meta_data(
+        spa_buffer,
+        pw::spa::sys::SPA_META_VideoDamage,
+        REGION_SIZE,
+    );
+    if ptr.is_null() {
+        return None;
+    }
+    let base = ptr as *const u8;
+    let mut count = 0usize;
+    for i in 0..MAX_REGIONS {
+        let region = base.add(i * REGION_SIZE);
+        let width = *(region.add(8) as *const u32);
+        let height = *(region.add(12) as *const u32);
+        // Damage list terminates at the first invalid (zero-area) region.
+        if width == 0 || height == 0 {
+            break;
+        }
+        count += 1;
+    }
+    Some(count)
+}
+
+/// Pure decision used by the process callback (kept FFI-free so it is
+/// unit-testable). Forward when the video changed, the cursor moved, the
+/// keepalive valve elapsed, or the damage signal is untrustworthy.
+fn damage_skip_should_forward(
+    damage_regions: Option<usize>,
+    cursor_changed: bool,
+    since_last_forward: Option<std::time::Duration>,
+    keepalive: std::time::Duration,
+) -> bool {
+    let Some(regions) = damage_regions else {
+        return true;
+    };
+    if regions > 0 || cursor_changed {
+        return true;
+    }
+    match since_last_forward {
+        Some(elapsed) => elapsed >= keepalive,
+        None => true, // never forwarded yet
+    }
+}
+
 fn extract_cursor(
     spa_buffer: *mut pw::spa::sys::spa_buffer,
     cache: &mut CursorCache,
@@ -1839,10 +1937,12 @@ fn run_pipewire_stream(
 
     let video_info: Arc<Mutex<Option<NegotiatedVideoInfo>>> = Arc::new(Mutex::new(None));
     let cursor_cache = Arc::new(Mutex::new(CursorCache::default()));
+    let damage_skip_state = Arc::new(Mutex::new(DamageSkipState::default()));
 
     let video_info_param = Arc::clone(&video_info);
     let video_info_process = Arc::clone(&video_info);
     let cursor_cache_process = Arc::clone(&cursor_cache);
+    let damage_skip_state_process = Arc::clone(&damage_skip_state);
     let running_check = Arc::clone(&running);
     let process_counter = Arc::new(AtomicUsize::new(0));
     let dropped_counter = Arc::new(AtomicUsize::new(0));
@@ -1986,6 +2086,40 @@ fn run_pipewire_stream(
                 let mut cache = cursor_cache_process.lock().unwrap();
                 extract_cursor(spa_buffer, &mut cache)
             };
+
+            // C6: drop duplicate frames the compositor flags as undamaged.
+            if pipewire_damage_skip_enabled() {
+                let damage = unsafe { pipewire_damage_region_count(spa_buffer.cast_const()) };
+                let cursor_sig = cursor.as_ref().map(|c| (c.x, c.y, c.shape_serial, c.visible));
+                let mut skip = false;
+                {
+                    let mut st = damage_skip_state_process.lock().unwrap();
+                    let cursor_changed = st.last_cursor_sig != cursor_sig;
+                    let since = st.last_forward.map(|t| t.elapsed());
+                    if damage_skip_should_forward(
+                        damage,
+                        cursor_changed,
+                        since,
+                        DAMAGE_SKIP_KEEPALIVE,
+                    ) {
+                        st.last_forward = Some(std::time::Instant::now());
+                        st.last_cursor_sig = cursor_sig;
+                    } else {
+                        skip = true;
+                    }
+                }
+                if skip {
+                    if trace && process_idx < 16 {
+                        eprintln!(
+                            "[trace][pipewire] damage-skip: undamaged duplicate, requeued"
+                        );
+                    }
+                    unsafe {
+                        let _ = pw::sys::pw_stream_queue_buffer(stream_ptr, latest);
+                    }
+                    return;
+                }
+            }
 
             // Explicit-sync telemetry: if the compositor honored our
             // SPA_META_SyncTimeline request, record the acquire/release
@@ -2207,6 +2341,78 @@ mod tests {
         assert_eq!(cursor.x, 10);
         assert_eq!(cursor.y, 20);
         assert!(cursor.visible);
+    }
+
+    #[test]
+    fn damage_skip_tristate_auto_on_unless_disabled() {
+        assert!(damage_skip_tristate(None), "unset ⇒ auto-on");
+        assert!(damage_skip_tristate(Some("1")), "explicit on");
+        assert!(damage_skip_tristate(Some("garbage")), "unknown ⇒ on");
+        assert!(!damage_skip_tristate(Some("0")), "0 ⇒ off");
+        assert!(!damage_skip_tristate(Some("off")), "off ⇒ off");
+        assert!(
+            !damage_skip_tristate(Some(" False ")),
+            "trimmed/case-insensitive off"
+        );
+    }
+
+    #[test]
+    fn damage_skip_forwards_when_meta_absent() {
+        // Compositor attached no damage meta -> cannot prove duplicate.
+        let ka = std::time::Duration::from_millis(200);
+        assert!(damage_skip_should_forward(None, false, Some(ka), ka));
+    }
+
+    #[test]
+    fn damage_skip_forwards_on_real_damage() {
+        let ka = std::time::Duration::from_millis(200);
+        assert!(damage_skip_should_forward(
+            Some(3),
+            false,
+            Some(std::time::Duration::ZERO),
+            ka
+        ));
+    }
+
+    #[test]
+    fn damage_skip_drops_undamaged_within_keepalive() {
+        let ka = std::time::Duration::from_millis(200);
+        // No damage, cursor unchanged, only 50ms since last forward -> skip.
+        assert!(!damage_skip_should_forward(
+            Some(0),
+            false,
+            Some(std::time::Duration::from_millis(50)),
+            ka
+        ));
+    }
+
+    #[test]
+    fn damage_skip_forwards_undamaged_after_keepalive() {
+        let ka = std::time::Duration::from_millis(200);
+        assert!(damage_skip_should_forward(
+            Some(0),
+            false,
+            Some(std::time::Duration::from_millis(250)),
+            ka
+        ));
+    }
+
+    #[test]
+    fn damage_skip_forwards_on_cursor_move_without_damage() {
+        let ka = std::time::Duration::from_millis(200);
+        assert!(damage_skip_should_forward(
+            Some(0),
+            true,
+            Some(std::time::Duration::from_millis(10)),
+            ka
+        ));
+    }
+
+    #[test]
+    fn damage_skip_forwards_first_frame() {
+        let ka = std::time::Duration::from_millis(200);
+        // never forwarded yet -> always send the first frame.
+        assert!(damage_skip_should_forward(Some(0), false, None, ka));
     }
 
     #[test]

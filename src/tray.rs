@@ -14,6 +14,8 @@ use crate::control_ipc::{ClientSnapshot, IpcClient, StateSnapshot, UpdateStateWi
 #[cfg(target_os = "linux")]
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 #[cfg(target_os = "linux")]
 use std::time::UNIX_EPOCH;
@@ -168,14 +170,16 @@ pub fn run_tray_agent(socket: &std::path::Path) -> Result<(), String> {
 fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
     let mut last_version = control.ui_version();
     let mut last_api_connected = control.api_connected();
+    let quit = Arc::new(AtomicBool::new(false));
     let handle = LinuxTray {
         control: control.clone(),
+        quit: Arc::clone(&quit),
     }
     .assume_sni_available(true)
     .spawn()
     .map_err(|err| format!("Failed to create Linux tray: {err}"))?;
 
-    while !control.shutdown_requested() && !handle.is_closed() {
+    while !quit.load(Ordering::SeqCst) && !control.shutdown_requested() && !handle.is_closed() {
         // Remote handles pull a fresh snapshot here; Local is a no-op.
         control.refresh();
         let version = control.ui_version();
@@ -212,6 +216,13 @@ impl ControlHandle {
         if let ControlHandle::Remote(r) = self {
             r.refresh();
         }
+    }
+
+    /// True when this tray is the per-user agent talking to a system-wide root
+    /// service over the control socket (Remote), as opposed to the in-process
+    /// per-user tray (Local).
+    fn is_system_agent(&self) -> bool {
+        matches!(self, ControlHandle::Remote(_))
     }
 
     fn ui_version(&self) -> usize {
@@ -355,7 +366,9 @@ impl ControlHandle {
                     .client
                     .lock()
                     .ok()
-                    .and_then(|mut guard| guard.as_mut().and_then(|c| c.request_disconnect(id).ok()))
+                    .and_then(|mut guard| {
+                        guard.as_mut().and_then(|c| c.request_disconnect(id).ok())
+                    })
                     .unwrap_or(false);
                 r.refresh();
                 res
@@ -518,6 +531,11 @@ fn quality_to_u8(q: Option<QualityPreset>) -> u8 {
 #[cfg(target_os = "linux")]
 struct LinuxTray {
     control: ControlHandle,
+    /// Set by the "Quit" menu item to exit the tray run loop locally. In the
+    /// per-user (Local) tray this is paired with a server shutdown; in the
+    /// system-mode agent (Remote) it only closes this user's tray and leaves
+    /// the machine-wide root service running.
+    quit: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -659,9 +677,24 @@ impl ksni::Tray for LinuxTray {
             .into(),
             LinuxMenuItem::Separator,
             LinuxStandardItem {
-                label: "Quit".into(),
+                // In system-wide mode this agent is one per-user tray among
+                // possibly several; "Quit" closes only this tray, leaving the
+                // root service (which serves the greeter and every user) up.
+                // Stop the service itself with `sudo systemctl stop st-server`.
+                label: if self.control.is_system_agent() {
+                    "Quit Tray".into()
+                } else {
+                    "Quit".into()
+                },
                 activate: Box::new(|tray: &mut LinuxTray| {
-                    tray.control.request_shutdown();
+                    // Per-user (Local) tray owns the server process, so quitting
+                    // it stops the server too. The system-mode agent must not:
+                    // it would take the machine-wide root service down for all
+                    // users from an unprivileged per-user click.
+                    if !tray.control.is_system_agent() {
+                        tray.control.request_shutdown();
+                    }
+                    tray.quit.store(true, Ordering::SeqCst);
                 }),
                 ..Default::default()
             }

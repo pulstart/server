@@ -37,7 +37,12 @@ fn expected_audio_packet_loss_pct() -> u32 {
         .min(100)
 }
 
-fn opus_application_value(expected_loss: u32) -> &'static str {
+fn opus_application_value(_expected_loss: u32) -> &'static str {
+    // Default to RESTRICTED_LOWDELAY (matches Sunshine). LBRR in-band FEC works
+    // in lowdelay too (set below via `fec`/`packet_loss`), so the old downgrade
+    // to "audio" mode whenever expected_loss>0 — which is the default path
+    // (ST_AUDIO_PACKET_LOSS_PCT=5) — needlessly cost ~2.5 ms encoder look-ahead.
+    // Explicit ST_AUDIO_OPUS_APPLICATION still overrides.
     match std::env::var("ST_AUDIO_OPUS_APPLICATION")
         .unwrap_or_default()
         .to_lowercase()
@@ -45,10 +50,54 @@ fn opus_application_value(expected_loss: u32) -> &'static str {
     {
         "voip" => "voip",
         "audio" => "audio",
-        "lowdelay" => "lowdelay",
-        _ if expected_loss > 0 => "audio",
         _ => "lowdelay",
     }
+}
+
+/// -3 dB (≈0.7071) attenuation used for center/surround fold-down.
+const M3DB: f32 = 0.707_106_77;
+
+/// E4 MVP: fold an interleaved N-channel frame down to interleaved stereo
+/// (ITU-R BS.775 coefficients). Channel order is assumed to be the
+/// PulseAudio/ALSA default we capture with:
+///   6ch (5.1): FL FR RL RR FC LFE
+///   8ch (7.1): FL FR RL RR FC LFE SL SR
+/// LFE is dropped (the stereo client has no bass management). Front L/R pass
+/// through unchanged so the dominant energy is correct regardless of layout;
+/// unknown counts fold the extra channels equally into both sides.
+fn downmix_to_stereo(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    if channels <= 2 {
+        return interleaved.to_vec();
+    }
+    let frames = interleaved.len() / channels;
+    let mut out = Vec::with_capacity(frames * 2);
+    for f in 0..frames {
+        let base = f * channels;
+        let ch = |i: usize| interleaved.get(base + i).copied().unwrap_or(0.0);
+        let mut l = ch(0); // FL
+        let mut r = ch(1); // FR
+        match channels {
+            6 => {
+                l += M3DB * ch(4) + M3DB * ch(2); // FC + RL
+                r += M3DB * ch(4) + M3DB * ch(3); // FC + RR
+            }
+            8 => {
+                l += M3DB * ch(4) + M3DB * ch(2) + M3DB * ch(6); // FC + RL + SL
+                r += M3DB * ch(4) + M3DB * ch(3) + M3DB * ch(7); // FC + RR + SR
+            }
+            n => {
+                for i in 2..n {
+                    let s = M3DB * ch(i);
+                    l += s;
+                    r += s;
+                }
+            }
+        }
+        // Summed channels can exceed unity; clamp to avoid hard clipping.
+        out.push(l.clamp(-1.0, 1.0));
+        out.push(r.clamp(-1.0, 1.0));
+    }
+    out
 }
 
 impl OpusEncoder {
@@ -66,6 +115,10 @@ impl OpusEncoder {
             return Err("avcodec_alloc_context3 failed for opus".into());
         }
 
+        // E4: encode at the (possibly downmixed) output channel count, not the
+        // capture count — the stereo-only client rejects >2ch streams.
+        let out_channels = config.output_channels();
+
         unsafe {
             (*ctx).sample_rate = config.sample_rate as i32;
             (*ctx).bit_rate = config.bitrate as i64;
@@ -77,7 +130,7 @@ impl OpusEncoder {
             (*ctx).frame_size = config.samples_per_frame() as i32;
 
             // Set channel layout based on channel count
-            Self::set_channel_layout(ctx, config.channels);
+            Self::set_channel_layout(ctx, out_channels);
 
             // Opus-specific options: low delay, CBR
             let expected_loss = expected_audio_packet_loss_pct();
@@ -129,7 +182,7 @@ impl OpusEncoder {
             (*frame).format = ffi::AVSampleFormat::AV_SAMPLE_FMT_FLT as i32;
             (*frame).sample_rate = config.sample_rate as i32;
             (*frame).nb_samples = samples_per_frame as i32;
-            Self::set_frame_channel_layout(frame, config.channels);
+            Self::set_frame_channel_layout(frame, out_channels);
 
             let ret = ffi::av_frame_get_buffer(frame, 0);
             if ret < 0 {
@@ -139,9 +192,15 @@ impl OpusEncoder {
             }
         }
 
+        if out_channels != config.channels {
+            println!(
+                "[audio] downmixing {}ch capture -> {}ch output (E4; ST_AUDIO_DOWNMIX=0 to disable)",
+                config.channels, out_channels
+            );
+        }
         println!(
             "[audio] Opus encoder initialized: {}ch, {}Hz, {}kbps, frame={}, app={}, fec={} packet_loss={}%",
-            config.channels,
+            out_channels,
             config.sample_rate,
             config.bitrate / 1000,
             samples_per_frame,
@@ -158,7 +217,7 @@ impl OpusEncoder {
             ctx,
             frame,
             samples_per_frame,
-            channels: config.channels,
+            channels: out_channels,
         })
     }
 
@@ -277,6 +336,7 @@ pub fn run_encode_thread(
     running: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        crate::audio::set_realtime_priority("encode");
         let mut encoder = match OpusEncoder::new(&config) {
             Ok(e) => e,
             Err(e) => {
@@ -285,6 +345,7 @@ pub fn run_encode_thread(
             }
         };
 
+        let out_channels = config.output_channels();
         let mut pts: i64 = 0;
         let trace = std::env::var_os("ST_TRACE").is_some();
         let max_capture_backlog = std::env::var("ST_AUDIO_MAX_CAPTURE_BACKLOG")
@@ -329,7 +390,16 @@ pub fn run_encode_thread(
                 continue;
             }
 
-            match encoder.encode(&samples.data, pts) {
+            // E4: fold surround capture down to the encoder's output channels.
+            let downmixed;
+            let frame_samples: &[f32] = if samples.channels != out_channels {
+                downmixed = downmix_to_stereo(&samples.data, samples.channels as usize);
+                &downmixed
+            } else {
+                &samples.data
+            };
+
+            match encoder.encode(frame_samples, pts) {
                 Ok(packets) => {
                     for pkt_data in packets {
                         let packet = EncodedAudioPacket { data: pkt_data };
@@ -357,4 +427,78 @@ fn ffmpeg_err(code: i32) -> String {
     }
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..len]).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downmix_stereo_passthrough() {
+        let s = [0.1, -0.2, 0.3, -0.4];
+        assert_eq!(downmix_to_stereo(&s, 2), s.to_vec());
+    }
+
+    #[test]
+    fn downmix_5_1_preserves_front_and_folds_center_rear() {
+        // One frame, ALSA 5.1 order: FL FR RL RR FC LFE.
+        let fl = 0.20;
+        let fr = -0.10;
+        let rl = 0.04;
+        let rr = 0.06;
+        let fc = 0.10;
+        let lfe = 0.90; // dropped entirely
+        let frame = [fl, fr, rl, rr, fc, lfe];
+        let out = downmix_to_stereo(&frame, 6);
+        assert_eq!(out.len(), 2);
+        let exp_l = fl + M3DB * fc + M3DB * rl;
+        let exp_r = fr + M3DB * fc + M3DB * rr;
+        assert!((out[0] - exp_l).abs() < 1e-6, "L {} != {}", out[0], exp_l);
+        assert!((out[1] - exp_r).abs() < 1e-6, "R {} != {}", out[1], exp_r);
+        // LFE must not leak into either channel.
+        assert!(out[0] < 0.5 && out[1] < 0.5);
+    }
+
+    #[test]
+    fn downmix_7_1_folds_side_channels() {
+        // ALSA 7.1 order: FL FR RL RR FC LFE SL SR.
+        let frame = [0.10, 0.20, 0.01, 0.02, 0.04, 0.99, 0.03, 0.05];
+        let out = downmix_to_stereo(&frame, 8);
+        let exp_l = 0.10 + M3DB * 0.04 + M3DB * 0.01 + M3DB * 0.03;
+        let exp_r = 0.20 + M3DB * 0.04 + M3DB * 0.02 + M3DB * 0.05;
+        assert!((out[0] - exp_l).abs() < 1e-6);
+        assert!((out[1] - exp_r).abs() < 1e-6);
+    }
+
+    #[test]
+    fn downmix_clamps_to_unit_range() {
+        // Loud surround sums must not exceed [-1, 1].
+        let frame = [0.9, 0.9, 0.9, 0.9, 0.9, 0.0];
+        let out = downmix_to_stereo(&frame, 6);
+        assert!(out.iter().all(|&v| (-1.0..=1.0).contains(&v)));
+    }
+
+    #[test]
+    fn downmix_handles_multiple_frames() {
+        // Two 5.1 frames -> two stereo frames.
+        let frame: Vec<f32> = [0.1f32, 0.2, 0.0, 0.0, 0.0, 0.0]
+            .iter()
+            .chain([0.3f32, 0.4, 0.0, 0.0, 0.0, 0.0].iter())
+            .copied()
+            .collect();
+        let out = downmix_to_stereo(&frame, 6);
+        assert_eq!(out.len(), 4);
+        assert!((out[0] - 0.1).abs() < 1e-6);
+        assert!((out[3] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn output_channels_downmixes_surround_by_default() {
+        let cfg = AudioConfig::surround51();
+        assert_eq!(cfg.output_channels(), 2);
+        assert!(cfg.downmix_to_stereo_enabled());
+        let stereo = AudioConfig::stereo();
+        assert_eq!(stereo.output_channels(), 2);
+        assert!(!stereo.downmix_to_stereo_enabled());
+    }
 }
