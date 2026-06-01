@@ -542,13 +542,32 @@ enable_system_services() {
         log "Enable manually: sudo systemctl enable --now st-server && systemctl --global enable st-server-tray"
         return
     fi
-    log "Enabling and starting the system service"
-    sudo systemctl enable --now st-server.service
-    # --global enables the tray unit for every user's session (applies on
-    # their next login; start it now for the current user if a session exists).
+    log "Enabling and (re)starting the system service"
+    sudo systemctl enable st-server.service
+    # `restart` (not `enable --now`) so reinstalling over an already-running
+    # service actually swaps to the new binary; on a fresh install `restart`
+    # just starts it. `enable --now` is a no-op on a service that is already up,
+    # which would leave the old binary running after an update.
+    sudo systemctl restart st-server.service
+    # A leftover `systemctl edit` drop-in can pin ExecStart to a dev/target-dir
+    # build and silently shadow this install — warn if the live unit is not the
+    # binary we just installed (we never delete a user's manual override).
+    local effective_exec
+    effective_exec="$(systemctl show -p ExecStart --value st-server.service 2>/dev/null || true)"
+    if [[ -n "$effective_exec" \
+          && "$effective_exec" != *"$SYSTEM_PREFIX"* \
+          && "$effective_exec" != *"$SYSTEM_BIN"* ]]; then
+        warn "st-server.service ExecStart is NOT the installed binary — a drop-in override is shadowing it:"
+        warn "  $effective_exec"
+        warn "Remove it to run the installed release:"
+        warn "  sudo rm -f /etc/systemd/system/st-server.service.d/override.conf && sudo systemctl daemon-reload && sudo systemctl restart st-server"
+    fi
+    # --global enables the tray unit for every user's session (applies on their
+    # next login; (re)start it now for the current user if a session exists so an
+    # update swaps the tray binary too).
     log "Enabling the per-user tray agent for all users"
     sudo systemctl --global enable st-server-tray.service
-    systemctl --user start st-server-tray.service 2>/dev/null || true
+    systemctl --user restart st-server-tray.service 2>/dev/null || true
 }
 
 install_system() {
