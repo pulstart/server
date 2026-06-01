@@ -311,6 +311,43 @@ fn env_fec_config() -> st_protocol::FecConfig {
     }
 }
 
+/// Policy for the delayed-duplicate FrameStart (cheap loss hardening for the
+/// most critical packet of a multi-packet unit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DupFirstMode {
+    /// Never duplicate.
+    Off,
+    /// Always duplicate (legacy behavior).
+    On,
+    /// Duplicate only while recent loss is present (default).
+    Auto,
+}
+
+/// `ST_DUP_FRAMESTART`: `off` never duplicates, `on` always (legacy), `auto`
+/// (default) only while the link shows recent loss — so a clean / bandwidth-
+/// constrained path pays no duplicate overhead. Sending it unconditionally was
+/// pure waste on a clean link (and the original false-`late` source the ABR
+/// controller misread as impairment).
+fn dup_first_mode_from_env() -> DupFirstMode {
+    match std::env::var("ST_DUP_FRAMESTART") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" | "false" | "no" => DupFirstMode::Off,
+            "on" | "1" | "true" | "yes" | "always" => DupFirstMode::On,
+            _ => DupFirstMode::Auto,
+        },
+        Err(_) => DupFirstMode::Auto,
+    }
+}
+
+/// Resolve whether to send the duplicate FrameStart for this unit.
+fn dup_first_effective(mode: DupFirstMode, loss_active: bool) -> bool {
+    match mode {
+        DupFirstMode::Off => false,
+        DupFirstMode::On => true,
+        DupFirstMode::Auto => loss_active,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn configured_udp_priority() -> Option<i32> {
     Some(
@@ -606,6 +643,11 @@ pub struct UdpSender {
     frame_id: u32,
     audio_seq: u16,
     audio_redundancy_depth: usize,
+    // Delayed-duplicate FrameStart policy + the live Auto-mode verdict pushed by
+    // the utility `DupFirstController` (only sends the duplicate while it has
+    // measurably reduced frame loss).
+    dup_mode: DupFirstMode,
+    dup_auto_active: bool,
     audio_buf: Vec<u8>,
     previous_audio: VecDeque<Vec<u8>>,
     encrypt_buf: Vec<u8>,
@@ -693,6 +735,8 @@ impl UdpSender {
             frame_id: 0,
             audio_seq: 0,
             audio_redundancy_depth: audio_redundancy_depth(),
+            dup_mode: dup_first_mode_from_env(),
+            dup_auto_active: false,
             audio_buf: Vec::with_capacity(1500),
             previous_audio: VecDeque::with_capacity(AUDIO_REDUNDANCY_MAX_DEPTH),
             encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
@@ -757,6 +801,8 @@ impl UdpSender {
             frame_id: 0,
             audio_seq: 0,
             audio_redundancy_depth: audio_redundancy_depth(),
+            dup_mode: dup_first_mode_from_env(),
+            dup_auto_active: false,
             audio_buf: Vec::with_capacity(1500),
             previous_audio: VecDeque::with_capacity(AUDIO_REDUNDANCY_MAX_DEPTH),
             encrypt_buf: Vec::with_capacity(1500 + CRYPTO_OVERHEAD),
@@ -774,6 +820,13 @@ impl UdpSender {
         if self.slicer.fec_pct() != pct {
             self.slicer.set_fec_pct(pct);
         }
+    }
+
+    /// Live Auto-mode verdict from the `DupFirstController` (A/B utility probe):
+    /// whether the delayed-duplicate FrameStart is currently earning its keep.
+    /// Ignored when `ST_DUP_FRAMESTART` forces `off`/`on`.
+    pub fn set_dup_first(&mut self, on: bool) {
+        self.dup_auto_active = on;
     }
 
     /// Live-update the verbatim audio-redundancy depth (E5 adaptive redundancy).
@@ -841,6 +894,8 @@ impl UdpSender {
         let slice_start = fec_trace.then(std::time::Instant::now);
 
         let frame_id = self.frame_id;
+        // Resolve the duplicate-FrameStart decision before borrowing the slicer.
+        let dup_first_allowed = dup_first_effective(self.dup_mode, self.dup_auto_active);
         let (packets, parity) = self.slicer.slice_with_meta_parts(
             &frame.data,
             frame_id,
@@ -852,7 +907,7 @@ impl UdpSender {
         );
         self.frame_id = self.frame_id.wrapping_add(1);
 
-        let resend_first_packet = packets.len() > 1;
+        let resend_first_packet = packets.len() > 1 && dup_first_allowed;
 
         // Build a flat list of plaintext packets to send: the sliced packets,
         // zero or more FEC parity packets (XOR ⇒ ≤1, RS ⇒ 0..M), optionally a
@@ -1312,6 +1367,21 @@ mod pacing_tests {
         // Defensive: never divide by zero.
         let gs = pacing_group_size(10, 0, 100_000_000, 1000, 12_000);
         assert!(gs >= 10);
+    }
+}
+
+#[cfg(test)]
+mod dup_first_tests {
+    use super::{dup_first_effective, DupFirstMode};
+
+    #[test]
+    fn dup_first_auto_gates_on_recent_loss() {
+        // Auto: duplicate only while loss is active — clean link pays nothing.
+        assert!(!dup_first_effective(DupFirstMode::Auto, false));
+        assert!(dup_first_effective(DupFirstMode::Auto, true));
+        // Off never duplicates; On always does (legacy override).
+        assert!(!dup_first_effective(DupFirstMode::Off, true));
+        assert!(dup_first_effective(DupFirstMode::On, false));
     }
 }
 

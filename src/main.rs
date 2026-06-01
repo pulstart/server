@@ -1386,6 +1386,28 @@ fn run_shared_pipeline(
     let mut last_encoder_reconfigure = Instant::now();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut bitrate_verifier = BitrateVerifier::new(current_config.framerate, Instant::now());
+    // Adaptive encode frame-rate: steps fps down when the box can't sustain the
+    // target cadence (regular cadence → smaller client jitter buffer → lower
+    // latency) and probes back up on sustained headroom. Ceiling = the
+    // negotiated target; default-on, `ST_ADAPTIVE_FPS=0` forces the fixed rate.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut adaptive_fps =
+        adaptive_bitrate::AdaptiveFrameRate::from_env(current_config.framerate, Instant::now());
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut frame_rate_tracker = adaptive_bitrate::EncodeRateTracker::new(Instant::now());
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if adaptive_fps.enabled() {
+        println!(
+            "[adapt-fps] enabled, ceiling {} fps (current {}); ST_ADAPTIVE_FPS=0 to disable",
+            current_config.framerate,
+            adaptive_fps.current_fps()
+        );
+    } else {
+        println!(
+            "[adapt-fps] disabled (ST_ADAPTIVE_FPS); fixed at {} fps",
+            current_config.framerate
+        );
+    }
     encode_and_broadcast(
         &mut encoder,
         &video_bc,
@@ -1633,16 +1655,32 @@ fn run_shared_pipeline(
                         .expect("pending rebuild missing after result");
                     match result {
                         Ok(mut next_encoder) => {
-                            println!(
-                                "[abr] {} bitrate {} -> {} kbps",
-                                encoder_backend_name(pending.backend),
-                                current_config.bitrate_kbps,
-                                pending.config.bitrate_kbps
-                            );
+                            let fps_changed = pending.config.framerate != current_config.framerate;
+                            if fps_changed {
+                                println!(
+                                    "[adapt-fps] {} now encoding at {} fps",
+                                    encoder_backend_name(pending.backend),
+                                    pending.config.framerate
+                                );
+                            } else {
+                                println!(
+                                    "[abr] {} bitrate {} -> {} kbps",
+                                    encoder_backend_name(pending.backend),
+                                    current_config.bitrate_kbps,
+                                    pending.config.bitrate_kbps
+                                );
+                            }
                             request_next_keyframe(&mut next_encoder);
                             encoder = next_encoder;
                             current_config = pending.config;
                             last_encoder_reconfigure = Instant::now();
+                            // An fps change alters StreamConfig.framerate — push
+                            // it so every client re-fits its present pacing and
+                            // jitter buffer; force a keyframe (done above).
+                            if fps_changed {
+                                capture_state
+                                    .publish_config(current_config.to_stream_config(&audio_config));
+                            }
                         }
                         Err(err) => {
                             eprintln!(
@@ -1750,6 +1788,8 @@ fn run_shared_pipeline(
                     }
                 }
             }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let encode_start = Instant::now();
             let _encoded_bytes = encode_and_broadcast(
                 &mut encoder,
                 &video_bc,
@@ -1758,7 +1798,37 @@ fn run_shared_pipeline(
                 frame_captured_micros,
             );
             #[cfg(any(target_os = "linux", target_os = "windows"))]
-            bitrate_verifier.record(_encoded_bytes);
+            {
+                bitrate_verifier.record(_encoded_bytes);
+                let now = Instant::now();
+                let encode_us = now.duration_since(encode_start).as_micros() as u64;
+                let budget_us = (1_000_000u64 / current_config.framerate.max(1) as u64).max(1);
+                frame_rate_tracker.record(encode_us, budget_us);
+                // Don't stack an fps rebuild on a pending bitrate/resolution one.
+                if pending_encoder_rebuild.is_none() {
+                    if let Some(sample) = frame_rate_tracker.take_sample(now) {
+                        if let Some(new_fps) = adaptive_fps.apply_at(&sample, now) {
+                            let mut new_config = current_config.clone();
+                            new_config.framerate = new_fps;
+                            let backend = encoder_backend(&encoder);
+                            println!(
+                                "[adapt-fps] {} fps {} -> {} (delivered {:.0}, overrun {:.0}%, encode {:.1}ms)",
+                                encoder_backend_name(backend),
+                                current_config.framerate,
+                                new_fps,
+                                sample.delivered_fps,
+                                sample.overrun_ratio * 100.0,
+                                sample.avg_encode_ms,
+                            );
+                            // Slow capture immediately to stop overrunning; the
+                            // encoder swaps to the new fps when the rebuild lands.
+                            capture::set_target_fps(new_fps);
+                            pending_encoder_rebuild =
+                                Some(spawn_encoder_rebuild(new_config, backend));
+                        }
+                    }
+                }
+            }
         } else {
             // Release frame resources without encoding
             #[cfg(target_os = "macos")]
@@ -2030,6 +2100,8 @@ fn run_transport(
     fec_pct: Arc<AtomicU16>,
     // E5: adaptive verbatim audio-redundancy depth.
     audio_depth: Arc<AtomicU8>,
+    // Auto-mode duplicate-FrameStart verdict from the DupFirstController.
+    dup_first: Arc<AtomicBool>,
 ) {
     let mut sender = match UdpSender::new(addr, crypto) {
         Ok(s) => s,
@@ -2052,6 +2124,7 @@ fn run_transport(
 
     let mut last_fec_pct = u16::MAX;
     let mut last_audio_depth = u8::MAX;
+    let mut last_dup_first: Option<bool> = None;
     while running.load(Ordering::SeqCst) {
         // A2: pick up the latest adaptive FEC strength before sending.
         let pct = fec_pct.load(Ordering::Relaxed);
@@ -2064,6 +2137,12 @@ fn run_transport(
         if depth != last_audio_depth {
             sender.set_audio_redundancy_depth(depth as usize);
             last_audio_depth = depth;
+        }
+        // Duplicate-FrameStart: send only while the controller says it helps.
+        let dup_on = dup_first.load(Ordering::Relaxed);
+        if last_dup_first != Some(dup_on) {
+            sender.set_dup_first(dup_on);
+            last_dup_first = Some(dup_on);
         }
         // Video: blocking recv with short timeout
         match vid_rx.recv_timeout(std::time::Duration::from_millis(5)) {
@@ -2652,6 +2731,11 @@ async fn handle_client(
     let mut fec_controller = adaptive_bitrate::FecController::from_env();
     let fec_pct_shared = Arc::new(AtomicU16::new(fec_controller.current_pct()));
     let fec_pct_transport = Arc::clone(&fec_pct_shared);
+    // Duplicate-FrameStart utility controller (A/B probe): only keeps the
+    // duplicate on while it measurably reduces frame loss.
+    let mut dup_first_controller = adaptive_bitrate::DupFirstController::new();
+    let dup_first_shared = Arc::new(AtomicBool::new(dup_first_controller.enabled()));
+    let dup_first_transport = Arc::clone(&dup_first_shared);
     // E5 (default-on): adaptive audio-redundancy depth — starts at 0 and ramps
     // toward the configured cap on measured loss. ST_AUDIO_ADAPTIVE_REDUNDANCY=0
     // disables it, pinning the atomic at the fixed configured depth (legacy).
@@ -2677,6 +2761,7 @@ async fn handle_client(
             None,
             fec_pct_transport,
             audio_depth_transport,
+            dup_first_transport,
         );
     });
     if let Err(err) = stream
@@ -2824,6 +2909,9 @@ async fn handle_client(
                                 let depth = audio_redundancy_controller.apply_feedback(&feedback);
                                 audio_depth_shared.store(depth, Ordering::Relaxed);
                             }
+                            // Duplicate-FrameStart A/B: keep it only while it helps.
+                            let dup_on = dup_first_controller.apply_feedback(&feedback);
+                            dup_first_shared.store(dup_on, Ordering::Relaxed);
                             let next_kbps = bitrate_controller.apply_feedback(feedback);
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                         }
@@ -3523,6 +3611,10 @@ fn handle_punched_client(
     let mut fec_controller = adaptive_bitrate::FecController::from_env();
     let fec_pct_shared = Arc::new(AtomicU16::new(fec_controller.current_pct()));
     let fec_pct_transport = Arc::clone(&fec_pct_shared);
+    // Duplicate-FrameStart utility controller (A/B probe).
+    let mut dup_first_controller = adaptive_bitrate::DupFirstController::new();
+    let dup_first_shared = Arc::new(AtomicBool::new(dup_first_controller.enabled()));
+    let dup_first_transport = Arc::clone(&dup_first_shared);
     // E5 (default-on): adaptive audio-redundancy depth (ST_AUDIO_ADAPTIVE_REDUNDANCY=0 disables).
     let audio_redundancy_adaptive = transport::audio_adaptive_redundancy_enabled();
     let audio_redundancy_max = transport::configured_audio_redundancy_depth() as u8;
@@ -3545,6 +3637,7 @@ fn handle_punched_client(
             transport_running_clone,
             fec_pct_transport,
             audio_depth_transport,
+            dup_first_transport,
         );
     });
 
@@ -3649,6 +3742,9 @@ fn handle_punched_client(
                                 let depth = audio_redundancy_controller.apply_feedback(&fb);
                                 audio_depth_shared.store(depth, Ordering::Relaxed);
                             }
+                            // Duplicate-FrameStart A/B: keep it only while it helps.
+                            let dup_on = dup_first_controller.apply_feedback(&fb);
+                            dup_first_shared.store(dup_on, Ordering::Relaxed);
                             let next_kbps = bitrate_controller.apply_feedback(fb);
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                             if (fb.lost_packets > 0 || fb.dropped_frames > 0)
@@ -3803,6 +3899,8 @@ fn run_punched_transport(
     fec_pct: Arc<AtomicU16>,
     // E5: adaptive verbatim audio-redundancy depth.
     audio_depth: Arc<AtomicU8>,
+    // Auto-mode duplicate-FrameStart verdict from the DupFirstController.
+    dup_first: Arc<AtomicBool>,
 ) {
     let peer = punched.peer();
     let mut sender = UdpSender::from_punched(punched);
@@ -3813,6 +3911,7 @@ fn run_punched_transport(
     let mut last_source_seq = None::<u64>;
     let mut last_fec_pct = u16::MAX;
     let mut last_audio_depth = u8::MAX;
+    let mut last_dup_first: Option<bool> = None;
     while running.load(Ordering::SeqCst) {
         let pct = fec_pct.load(Ordering::Relaxed);
         if pct != last_fec_pct {
@@ -3823,6 +3922,11 @@ fn run_punched_transport(
         if depth != last_audio_depth {
             sender.set_audio_redundancy_depth(depth as usize);
             last_audio_depth = depth;
+        }
+        let dup_on = dup_first.load(Ordering::Relaxed);
+        if last_dup_first != Some(dup_on) {
+            sender.set_dup_first(dup_on);
+            last_dup_first = Some(dup_on);
         }
         match vid_rx.recv_timeout(Duration::from_millis(5)) {
             Ok(frame) => {
