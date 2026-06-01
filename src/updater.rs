@@ -634,6 +634,13 @@ fn launcher_for_relaunch(exe: &Path) -> PathBuf {
     }
 }
 
+/// Windows has no launcher script (no `LD_LIBRARY_PATH` wiring); relaunch the
+/// executable itself.
+#[cfg(target_os = "windows")]
+fn launcher_for_relaunch(exe: &Path) -> PathBuf {
+    exe.to_path_buf()
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum SystemdScope {

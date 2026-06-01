@@ -948,7 +948,6 @@ pub fn set_clipboard_file(path: &Path) {
 #[cfg(target_os = "windows")]
 pub fn set_clipboard_file(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };

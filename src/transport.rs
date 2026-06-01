@@ -628,6 +628,8 @@ impl UdpSender {
             .connect(client_addr)
             .map_err(|e| format!("connect UDP: {e}"))?;
         let overhead = if crypto.is_some() { CRYPTO_OVERHEAD } else { 0 };
+        // Mutated only on the Linux PMTU path below; non-Linux keeps the default.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut max_udp = select_max_udp_packet_size(client_addr).saturating_sub(overhead);
         // B7: consult the kernel's route MTU. Always shrink to fit a small-MTU
         // egress path; only grow past the conservative default under ST_PMTU_PROBE.

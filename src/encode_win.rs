@@ -349,7 +349,6 @@ impl WindowsHwEncoder {
             // 3. Update encoder-side upload texture via UpdateSubresource
             let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
             staging.upload_texture.GetDesc(&mut tex_desc);
-            let row_pitch = tex_desc.Width * 4; // BGRA = 4 bytes per pixel
 
             let box_region = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
                 left: 0,
