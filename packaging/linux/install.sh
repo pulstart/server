@@ -26,6 +26,8 @@
 #     ST_SERVER_VERSION=v0.4.6    Pin a specific release (default: latest).
 #     ST_SERVER_PREFIX=$HOME/...  Override the user install prefix.
 #     ST_SERVER_NO_ENABLE=1       Install but do not `systemctl --user enable --now`.
+#     ST_SERVER_KEEP_OVERRIDE=1   Keep a drop-in override that points ExecStart at a
+#                                 dev/local build (default: clear it so the release runs).
 
 set -euo pipefail
 
@@ -550,17 +552,34 @@ enable_system_services() {
     # which would leave the old binary running after an update.
     sudo systemctl restart st-server.service
     # A leftover `systemctl edit` drop-in can pin ExecStart to a dev/target-dir
-    # build and silently shadow this install — warn if the live unit is not the
-    # binary we just installed (we never delete a user's manual override).
+    # build and silently shadow this install. By default we clear the shadowing
+    # override so the installed release actually runs; ST_SERVER_KEEP_OVERRIDE=1
+    # preserves it (for devs intentionally running a local build).
+    local dropin_dir="/etc/systemd/system/st-server.service.d"
     local effective_exec
     effective_exec="$(systemctl show -p ExecStart --value st-server.service 2>/dev/null || true)"
     if [[ -n "$effective_exec" \
           && "$effective_exec" != *"$SYSTEM_PREFIX"* \
           && "$effective_exec" != *"$SYSTEM_BIN"* ]]; then
-        warn "st-server.service ExecStart is NOT the installed binary — a drop-in override is shadowing it:"
-        warn "  $effective_exec"
-        warn "Remove it to run the installed release:"
-        warn "  sudo rm -f /etc/systemd/system/st-server.service.d/override.conf && sudo systemctl daemon-reload && sudo systemctl restart st-server"
+        if [[ -n "${ST_SERVER_KEEP_OVERRIDE:-}" ]]; then
+            warn "st-server.service ExecStart is a drop-in override (kept — ST_SERVER_KEEP_OVERRIDE set):"
+            warn "  $effective_exec"
+            warn "Remove manually: sudo rm -f $dropin_dir/override.conf && sudo systemctl daemon-reload && sudo systemctl restart st-server"
+        elif [[ -f "$dropin_dir/override.conf" ]]; then
+            warn "A drop-in override is shadowing the installed binary — removing it to run the release."
+            warn "  was: $effective_exec"
+            sudo cp -a "$dropin_dir/override.conf" "$dropin_dir/override.conf.bak"
+            sudo rm -f "$dropin_dir/override.conf"
+            sudo systemctl daemon-reload
+            sudo systemctl restart st-server.service
+            effective_exec="$(systemctl show -p ExecStart --value st-server.service 2>/dev/null || true)"
+            log "Removed shadowing override (backup: $dropin_dir/override.conf.bak; ST_SERVER_KEEP_OVERRIDE=1 to keep next time)."
+            log "ExecStart now: $effective_exec"
+        else
+            warn "st-server.service ExecStart points outside the install prefix and no override.conf was found to remove:"
+            warn "  $effective_exec"
+            warn "Inspect the drop-ins under $dropin_dir and remove the shadowing one."
+        fi
     fi
     # --global enables the tray unit for every user's session (applies on their
     # next login; (re)start it now for the current user if a session exists so an
