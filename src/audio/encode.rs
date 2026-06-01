@@ -129,6 +129,25 @@ impl OpusEncoder {
             };
             (*ctx).frame_size = config.samples_per_frame() as i32;
 
+            // FFmpeg's libopus derives the Opus packet size from its private
+            // `frame_duration` option (default 20 ms), NOT from avctx->frame_size —
+            // it overwrites frame_size during avcodec_open2. Setting only
+            // frame_size left the encoder at 20 ms (960 samples) while we fed 5 ms
+            // (240) frames, so every frame was rejected with "frame_size (960) was
+            // not respected for a non-last frame" → no audio. Set frame_duration
+            // (ms, matching samples_per_frame) so the E1 5 ms framing actually
+            // encodes. (probe ≠ correctness — the config-level unit test missed
+            // this because it never ran a real avcodec_send_frame.)
+            let frame_ms = config.samples_per_frame() as f64 * 1000.0 / config.sample_rate as f64;
+            let frame_duration_key = std::ffi::CString::new("frame_duration").unwrap();
+            let frame_duration_val = std::ffi::CString::new(format!("{frame_ms}")).unwrap();
+            ffi::av_opt_set(
+                (*ctx).priv_data,
+                frame_duration_key.as_ptr(),
+                frame_duration_val.as_ptr(),
+                0,
+            );
+
             // Set channel layout based on channel count
             Self::set_channel_layout(ctx, out_channels);
 
@@ -437,6 +456,37 @@ mod tests {
     fn downmix_stereo_passthrough() {
         let s = [0.1, -0.2, 0.3, -0.4];
         assert_eq!(downmix_to_stereo(&s, 2), s.to_vec());
+    }
+
+    // Regression guard for the E1 5 ms framing: FFmpeg's libopus must be told the
+    // frame duration via the `frame_duration` private option, else it stays at
+    // its 20 ms default and rejects our shorter frames ("frame_size (960) was not
+    // respected for a non-last frame"), which silently kills ALL audio. This
+    // drives a real avcodec_send_frame round-trip — the thing the config-level
+    // test never did, which is why the bug shipped.
+    #[test]
+    fn opus_encoder_accepts_configured_frame_size() {
+        let config = AudioConfig::stereo();
+        let mut enc = match OpusEncoder::new(&config) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("libopus unavailable ({e}); skipping");
+                return;
+            }
+        };
+        let n = config.total_samples_per_frame();
+        let samples = vec![0.0f32; n];
+        let mut packets = 0usize;
+        for i in 0..5i64 {
+            let pkts = enc
+                .encode(&samples, i * config.samples_per_frame() as i64)
+                .expect("opus rejected the configured frame size (frame_duration not wired?)");
+            packets += pkts.len();
+        }
+        assert!(
+            packets > 0,
+            "no opus packets produced at the configured frame size"
+        );
     }
 
     #[test]
