@@ -390,19 +390,49 @@ fn find_cursor_plane(
 /// path for the legacy position, so we fall back to `(0, 0)`: in hover-absolute
 /// the client renders the cursor at its own local pointer and only needs the
 /// shape + a visible flag, so an unknown server position is harmless there.
-fn read_cursor_position(card: &Card, cursor_handle: control::plane::Handle) -> (i32, i32) {
+fn read_cursor_position(
+    card: &Card,
+    cursor_handle: control::plane::Handle,
+    cached_props: &mut Option<(control::property::Handle, control::property::Handle)>,
+) -> (i32, i32) {
     let Ok(props) = card.get_properties(cursor_handle) else {
         return (0, 0);
     };
+
+    // Resolve CRTC_X / CRTC_Y property handles once. Property IDs are stable for
+    // a given object on a device, so after the first frame we skip the per-prop
+    // `get_property` name-resolve ioctls and read the values by handle below.
+    // Drivers exposing no CRTC_X/Y (NVIDIA legacy cursor) leave this `None` and
+    // fall back to the full walk each frame, matching the previous behavior.
+    if cached_props.is_none() {
+        let mut x_id = None;
+        let mut y_id = None;
+        for (prop_id, _value) in props.iter() {
+            if let Ok(info) = card.get_property(*prop_id) {
+                match info.name().to_str() {
+                    Ok("CRTC_X") => x_id = Some(*prop_id),
+                    Ok("CRTC_Y") => y_id = Some(*prop_id),
+                    _ => {}
+                }
+            }
+        }
+        if let (Some(x), Some(y)) = (x_id, y_id) {
+            *cached_props = Some((x, y));
+        }
+    }
+
+    let Some((crtc_x_id, crtc_y_id)) = *cached_props else {
+        // No CRTC_X/Y on this plane — no position readback (see fn-doc above).
+        return (0, 0);
+    };
+
     let mut crtc_x = 0;
     let mut crtc_y = 0;
     for (prop_id, value) in props.iter() {
-        if let Ok(info) = card.get_property(*prop_id) {
-            match info.name().to_str() {
-                Ok("CRTC_X") => crtc_x = *value as i32,
-                Ok("CRTC_Y") => crtc_y = *value as i32,
-                _ => {}
-            }
+        if *prop_id == crtc_x_id {
+            crtc_x = *value as i32;
+        } else if *prop_id == crtc_y_id {
+            crtc_y = *value as i32;
         }
     }
     (crtc_x, crtc_y)
@@ -431,6 +461,11 @@ struct CursorCache {
     width: u32,
     height: u32,
     serial: u64,
+    /// Resolved CRTC_X / CRTC_Y property handles for this cursor plane. Property
+    /// IDs are stable for an object on a device, so we resolve the names once and
+    /// then read the position by handle, skipping a `get_property` name-resolve
+    /// ioctl per plane property every frame (15-60us/frame on atomic drivers).
+    crtc_pos_props: Option<(control::property::Handle, control::property::Handle)>,
 }
 
 /// Capture cursor image from its DRM plane by mmap'ing the cursor framebuffer.
@@ -459,7 +494,14 @@ fn capture_cursor(
         return None;
     };
 
-    let (x, y) = read_cursor_position(card, cursor_handle);
+    // Read the position via the cache's resolved prop handles (falls back to a
+    // local scratch when no cache is provided).
+    let mut scratch_props = None;
+    let cached_props = match &mut cache {
+        Some(c) => &mut c.crtc_pos_props,
+        None => &mut scratch_props,
+    };
+    let (x, y) = read_cursor_position(card, cursor_handle, cached_props);
 
     // C5 fast path: framebuffer unchanged → cached pixels are still valid.
     if let Some(c) = cache.as_deref() {

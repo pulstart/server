@@ -245,7 +245,12 @@ impl EncoderConfig {
             gop_size,
             max_b_frames: 0,
             low_delay: true,
-            quality: QualityPreset::from_env().unwrap_or(QualityPreset::Balanced),
+            // Latency-first default: this is a low-latency streaming server, so an
+            // unforced session encodes with the LowLatency preset (NVENC p1/ull,
+            // x26x ultrafast, svtav1 preset 12) rather than Balanced — the p4→p1
+            // GPU-compute drop alone shaves ~0.3-1.5ms/frame on NVENC. The tray /
+            // control-socket `forced_quality` and `ST_QUALITY` still override this.
+            quality: QualityPreset::from_env().unwrap_or(QualityPreset::LowLatency),
         }
     }
 
