@@ -676,6 +676,13 @@ pub struct ClientRateController {
     probe_failures: u32,
     probe_backoff_until: Instant,
     seen_completed_frame: bool,
+    /// Latest server-side cap→send backlog (µs), EWMA-smoothed by the transport
+    /// loop. This is the one congestion signal that survives WiFi bufferbloat:
+    /// when we overdrive the link the path *buffers* rather than drops, so the
+    /// loss/late/owd signals stay clean while our own outbound queue (and the
+    /// client's reported cap→send) balloons. Reacting to it is the only way to
+    /// settle bitrate near real capacity on a buffer-bloated path.
+    send_backlog_us: u32,
 }
 
 impl ClientRateController {
@@ -698,7 +705,14 @@ impl ClientRateController {
             probe_failures: 0,
             probe_backoff_until: now - Duration::from_secs(1),
             seen_completed_frame: false,
+            send_backlog_us: 0,
         }
+    }
+
+    /// Feed the latest server-side cap→send backlog (µs) before `apply_feedback`.
+    /// Call once per feedback window from the transport loop's EWMA.
+    pub fn note_send_backlog_us(&mut self, us: u32) {
+        self.send_backlog_us = us;
     }
 
     pub fn apply_feedback(&mut self, feedback: TransportFeedback) -> u32 {
@@ -716,6 +730,15 @@ impl ClientRateController {
     /// bottleneck queue as building and refuse to probe the bitrate up — react to
     /// congestion *before* it turns into loss (B1, GCC-style delay gradient).
     const OWD_RISING_US: i32 = 4_000;
+    /// Server-side cap→send backlog (µs) above which we actively *reduce* bitrate
+    /// even with zero packet loss. On WiFi an overdriven link buffers instead of
+    /// dropping, so the queue (and end-to-end latency) bloats while loss stays 0;
+    /// this is the only signal that catches it. ~60 ms is well clear of a healthy
+    /// path (encode + one-frame dwell is single-digit ms) yet trips long before
+    /// the multi-hundred-ms pathology. Latency-first.
+    const BACKLOG_REDUCE_US: u32 = 60_000;
+    /// Deeper backlog ⇒ a harder cut so we converge out of bufferbloat faster.
+    const BACKLOG_HEAVY_US: u32 = 150_000;
 
     fn apply_feedback_at(&mut self, feedback: TransportFeedback, now: Instant) -> u32 {
         if feedback.received_packets == 0
@@ -797,6 +820,27 @@ impl ClientRateController {
             if probe_failed {
                 self.revert_failed_probe(now);
             }
+        } else if self.send_backlog_us >= Self::BACKLOG_REDUCE_US {
+            // Bufferbloat downshift: no packet loss, but our own cap→send queue is
+            // bloated — we are pushing more than the path drains in real time and
+            // it is buffering (classic WiFi). Loss-based ABR is blind here, so cut
+            // bitrate to drain the queue and settle near real capacity. Mark a
+            // probe failure so up-probing backs off and we don't immediately
+            // re-climb into the same bloat (hysteresis).
+            self.clean_intervals = 0;
+            if startup || self.can_decrease(now) {
+                let factor = if self.send_backlog_us >= Self::BACKLOG_HEAVY_US {
+                    75
+                } else {
+                    88
+                };
+                self.recommended_kbps = ((self.recommended_kbps as u64 * factor) / 100) as u32;
+                self.recommended_kbps = self.recommended_kbps.max(self.min_kbps);
+                self.last_decrease = now;
+                self.stable_kbps = self.recommended_kbps;
+                self.clear_pending_probe();
+                self.apply_probe_backoff(now);
+            }
         } else if feedback.owd_trend_us > Self::OWD_RISING_US {
             // B1: no loss yet, but one-way delay is trending up — the bottleneck
             // queue is filling. Hold the bitrate (don't probe up) and reset the
@@ -868,12 +912,19 @@ impl ClientRateController {
         self.stable_kbps = fallback;
         self.clean_intervals = 0;
         self.last_decrease = now;
+        self.apply_probe_backoff(now);
+        self.clear_pending_probe();
+    }
+
+    /// Register a failed/abandoned up-probe: grow the exponential backoff so the
+    /// next probe waits longer (caps at `MAX_PROBE_BACKOFF`). Shared by an
+    /// explicit probe revert and the bufferbloat downshift.
+    fn apply_probe_backoff(&mut self, now: Instant) {
         self.probe_failures = self.probe_failures.saturating_add(1);
         let backoff_secs = (Self::BASE_PROBE_BACKOFF.as_secs()
             * (1u64 << self.probe_failures.saturating_sub(1).min(3)))
         .min(Self::MAX_PROBE_BACKOFF.as_secs());
         self.probe_backoff_until = now + Duration::from_secs(backoff_secs);
-        self.clear_pending_probe();
     }
 
     fn clear_pending_probe(&mut self) {
@@ -1127,6 +1178,38 @@ mod tests {
         now += ClientRateController::UPGRADE_COOLDOWN;
         let held = controller.apply_feedback_at(clean_but_congested, now);
         assert_eq!(held, 6_000, "must not probe up while OWD is rising");
+    }
+
+    #[test]
+    fn controller_reduces_bitrate_on_send_backlog_without_loss() {
+        // WiFi bufferbloat: the link buffers instead of dropping, so loss/owd stay
+        // clean while our own cap→send queue bloats. ABR must still downshift.
+        let start = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 90_000, 80_000, start);
+        let clean_but_bloated = TransportFeedback {
+            interval_ms: 500,
+            received_packets: 1_100,
+            completed_frames: 60,
+            // No loss, no late, no rising owd — only the server-side backlog.
+            recv_video_kbps: 80_000,
+            ..Default::default()
+        };
+
+        // 800 ms of cap→send backlog → must cut bitrate.
+        controller.note_send_backlog_us(800_000);
+        let next =
+            controller.apply_feedback_at(clean_but_bloated, start + Duration::from_millis(500));
+        assert!(
+            next < 80_000,
+            "bloated queue must lower bitrate, got {next}"
+        );
+        assert!(next >= 5_000, "never below floor");
+
+        // A healthy backlog (well under the trip) leaves bitrate alone.
+        let mut healthy = ClientRateController::from_limits_at(5_000, 90_000, 40_000, start);
+        healthy.note_send_backlog_us(10_000); // 10 ms — normal
+        let held = healthy.apply_feedback_at(clean_but_bloated, start + Duration::from_millis(500));
+        assert_eq!(held, 40_000, "healthy backlog must not cut bitrate");
     }
 
     #[test]

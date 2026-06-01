@@ -2088,6 +2088,53 @@ fn flush_pending_audio(
 
 /// Per-client unified transport: sends both video and audio on a single UDP socket.
 #[allow(clippy::too_many_arguments)]
+/// Hard cap→send latency ceiling (µs). When a queued video unit has been waiting
+/// longer than this on the server, the path is bufferbloated faster than the
+/// bitrate controller can drain it; we stop replaying the stale backlog and jump
+/// to a fresh keyframe instead (bounds worst-case latency to one recovery on a
+/// WiFi stall). `ST_MAX_QUEUE_LATENCY_MS=0`/`off` disables; default 500 ms is the
+/// safety net, the bitrate controller's BACKLOG_REDUCE downshift is the primary.
+fn max_queue_latency_us() -> Option<u32> {
+    match std::env::var("ST_MAX_QUEUE_LATENCY_MS").ok().as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("no") => None,
+        Some(v) => v
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .map(|ms| ms.saturating_mul(1000))
+            .or(Some(500_000)),
+        None => Some(500_000),
+    }
+}
+
+/// Fold one sent unit's cap→send dwell into the published backlog EWMA and report
+/// whether its *instantaneous* dwell breached the hard latency ceiling (caller
+/// then drains to a recovery keyframe). Shared by both transport loops so the
+/// direct and punched paths stay identical.
+fn observe_send_backlog(
+    capture_micros: u64,
+    now_us: u64,
+    ewma_us: &mut u32,
+    seen: &mut bool,
+    published: &AtomicU32,
+    hard_ceiling_us: Option<u32>,
+) -> bool {
+    let dwell = now_us.saturating_sub(capture_micros).min(u32::MAX as u64) as u32;
+    *ewma_us = if *seen {
+        ((*ewma_us as u64 * 7 + dwell as u64) / 8) as u32
+    } else {
+        *seen = true;
+        dwell
+    };
+    published.store(*ewma_us, Ordering::Relaxed);
+    hard_ceiling_us.is_some_and(|c| dwell >= c)
+}
+
+// Per-client transport setup: one Arc per independent adaptive-control signal
+// (FEC, audio redundancy, dup-FrameStart, send backlog) plus the transport
+// plumbing. Grouping them into a struct would only move the argument list.
+#[allow(clippy::too_many_arguments)]
 fn run_transport(
     addr: SocketAddr,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
@@ -2102,6 +2149,9 @@ fn run_transport(
     audio_depth: Arc<AtomicU8>,
     // Auto-mode duplicate-FrameStart verdict from the DupFirstController.
     dup_first: Arc<AtomicBool>,
+    // Server-side cap→send backlog (µs, EWMA) published for the bitrate controller
+    // so it can react to WiFi bufferbloat that never shows up as packet loss.
+    send_backlog_us: Arc<AtomicU32>,
 ) {
     let mut sender = match UdpSender::new(addr, crypto) {
         Ok(s) => s,
@@ -2125,6 +2175,9 @@ fn run_transport(
     let mut last_fec_pct = u16::MAX;
     let mut last_audio_depth = u8::MAX;
     let mut last_dup_first: Option<bool> = None;
+    let mut backlog_ewma_us: u32 = 0;
+    let mut backlog_seen = false;
+    let hard_ceiling_us = max_queue_latency_us();
     while running.load(Ordering::SeqCst) {
         // A2: pick up the latest adaptive FEC strength before sending.
         let pct = fec_pct.load(Ordering::Relaxed);
@@ -2166,6 +2219,33 @@ fn run_transport(
                         .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
                         .unwrap_or(0);
                     last_source_seq = Some(frame.source_seq);
+
+                    // Server-side cap→send latency for this unit; publish the EWMA
+                    // for the bitrate controller and trip a recovery drain if a
+                    // single unit has bloated past the hard ceiling (WiFi stall).
+                    let frame_now_us = unix_time_micros();
+                    if observe_send_backlog(
+                        frame.capture_micros,
+                        frame_now_us,
+                        &mut backlog_ewma_us,
+                        &mut backlog_seen,
+                        &send_backlog_us,
+                        hard_ceiling_us,
+                    ) && !frame.is_recovery
+                        && !waiting_for_recovery_frame
+                    {
+                        waiting_for_recovery_frame = true;
+                        if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                            video_bc.request_keyframe();
+                            last_backlog_keyframe_request = Instant::now();
+                        }
+                        if trace {
+                            eprintln!(
+                                "[trace][server] cap→send backlog {}µs over ceiling for {addr}; draining to recovery keyframe",
+                                frame_now_us.saturating_sub(frame.capture_micros)
+                            );
+                        }
+                    }
 
                     if source_gap > 0 {
                         waiting_for_recovery_frame = true;
@@ -2212,7 +2292,7 @@ fn run_transport(
                         }
                         sent_video_units = sent_video_units.saturating_add(1);
                         last_video_activity = std::time::Instant::now();
-                        if let Err(e) = sender.send_frame(&frame, unix_time_micros()) {
+                        if let Err(e) = sender.send_frame(&frame, frame_now_us) {
                             eprintln!("[transport] video send error to {addr}: {e}");
                         }
                     }
@@ -2736,6 +2816,10 @@ async fn handle_client(
     let mut dup_first_controller = adaptive_bitrate::DupFirstController::new();
     let dup_first_shared = Arc::new(AtomicBool::new(dup_first_controller.enabled()));
     let dup_first_transport = Arc::clone(&dup_first_shared);
+    // Server-side cap→send backlog (µs, EWMA) published by the transport loop and
+    // read by the bitrate controller to react to WiFi bufferbloat (zero loss).
+    let send_backlog_shared = Arc::new(AtomicU32::new(0));
+    let send_backlog_transport = Arc::clone(&send_backlog_shared);
     // E5 (default-on): adaptive audio-redundancy depth — starts at 0 and ramps
     // toward the configured cap on measured loss. ST_AUDIO_ADAPTIVE_REDUNDANCY=0
     // disables it, pinning the atomic at the fixed configured depth (legacy).
@@ -2762,6 +2846,7 @@ async fn handle_client(
             fec_pct_transport,
             audio_depth_transport,
             dup_first_transport,
+            send_backlog_transport,
         );
     });
     if let Err(err) = stream
@@ -2912,6 +2997,10 @@ async fn handle_client(
                             // Duplicate-FrameStart A/B: keep it only while it helps.
                             let dup_on = dup_first_controller.apply_feedback(&feedback);
                             dup_first_shared.store(dup_on, Ordering::Relaxed);
+                            // Bufferbloat: feed the server-side cap→send backlog so
+                            // ABR can downshift on WiFi queue growth (zero loss).
+                            bitrate_controller
+                                .note_send_backlog_us(send_backlog_shared.load(Ordering::Relaxed));
                             let next_kbps = bitrate_controller.apply_feedback(feedback);
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                         }
@@ -3615,6 +3704,9 @@ fn handle_punched_client(
     let mut dup_first_controller = adaptive_bitrate::DupFirstController::new();
     let dup_first_shared = Arc::new(AtomicBool::new(dup_first_controller.enabled()));
     let dup_first_transport = Arc::clone(&dup_first_shared);
+    // Server-side cap→send backlog (µs, EWMA) for bufferbloat-aware bitrate.
+    let send_backlog_shared = Arc::new(AtomicU32::new(0));
+    let send_backlog_transport = Arc::clone(&send_backlog_shared);
     // E5 (default-on): adaptive audio-redundancy depth (ST_AUDIO_ADAPTIVE_REDUNDANCY=0 disables).
     let audio_redundancy_adaptive = transport::audio_adaptive_redundancy_enabled();
     let audio_redundancy_max = transport::configured_audio_redundancy_depth() as u8;
@@ -3638,6 +3730,7 @@ fn handle_punched_client(
             fec_pct_transport,
             audio_depth_transport,
             dup_first_transport,
+            send_backlog_transport,
         );
     });
 
@@ -3745,6 +3838,9 @@ fn handle_punched_client(
                             // Duplicate-FrameStart A/B: keep it only while it helps.
                             let dup_on = dup_first_controller.apply_feedback(&fb);
                             dup_first_shared.store(dup_on, Ordering::Relaxed);
+                            // Bufferbloat: feed the server-side cap→send backlog.
+                            bitrate_controller
+                                .note_send_backlog_us(send_backlog_shared.load(Ordering::Relaxed));
                             let next_kbps = bitrate_controller.apply_feedback(fb);
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                             if (fb.lost_packets > 0 || fb.dropped_frames > 0)
@@ -3887,6 +3983,7 @@ fn handle_punched_client(
 }
 
 /// Per-client transport loop for punched connections.
+// Same adaptive-control Arc set as run_transport, over the punched socket.
 #[allow(clippy::too_many_arguments)]
 fn run_punched_transport(
     punched: Arc<st_protocol::reliable_udp::PunchedSocket>,
@@ -3901,6 +3998,8 @@ fn run_punched_transport(
     audio_depth: Arc<AtomicU8>,
     // Auto-mode duplicate-FrameStart verdict from the DupFirstController.
     dup_first: Arc<AtomicBool>,
+    // Server-side cap→send backlog (µs, EWMA) for the bitrate controller.
+    send_backlog_us: Arc<AtomicU32>,
 ) {
     let peer = punched.peer();
     let mut sender = UdpSender::from_punched(punched);
@@ -3912,6 +4011,9 @@ fn run_punched_transport(
     let mut last_fec_pct = u16::MAX;
     let mut last_audio_depth = u8::MAX;
     let mut last_dup_first: Option<bool> = None;
+    let mut backlog_ewma_us: u32 = 0;
+    let mut backlog_seen = false;
+    let hard_ceiling_us = max_queue_latency_us();
     while running.load(Ordering::SeqCst) {
         let pct = fec_pct.load(Ordering::Relaxed);
         if pct != last_fec_pct {
@@ -3947,6 +4049,31 @@ fn run_punched_transport(
                         .unwrap_or(0);
                     last_source_seq = Some(frame.source_seq);
 
+                    // Server-side cap→send latency for this unit (see run_transport).
+                    let frame_now_us = unix_time_micros();
+                    if observe_send_backlog(
+                        frame.capture_micros,
+                        frame_now_us,
+                        &mut backlog_ewma_us,
+                        &mut backlog_seen,
+                        &send_backlog_us,
+                        hard_ceiling_us,
+                    ) && !frame.is_recovery
+                        && !waiting_for_recovery_frame
+                    {
+                        waiting_for_recovery_frame = true;
+                        if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                            video_bc.request_keyframe();
+                            last_backlog_keyframe_request = Instant::now();
+                        }
+                        if trace {
+                            eprintln!(
+                                "[trace][server] punched cap→send backlog {}µs over ceiling; draining to recovery keyframe",
+                                frame_now_us.saturating_sub(frame.capture_micros)
+                            );
+                        }
+                    }
+
                     if source_gap > 0 {
                         waiting_for_recovery_frame = true;
                         if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
@@ -3981,7 +4108,7 @@ fn run_punched_transport(
                                 );
                             }
                         }
-                        if let Err(e) = sender.send_frame(&frame, unix_time_micros()) {
+                        if let Err(e) = sender.send_frame(&frame, frame_now_us) {
                             eprintln!("[punched-transport] video send error: {e}");
                         }
                     }
