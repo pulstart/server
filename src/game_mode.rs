@@ -8,15 +8,20 @@
 //! fullscreen games work even where the warp detector can't (e.g. NVIDIA, no
 //! cursor-position readback).
 //!
-//! Signal: focused window is **fullscreen** AND its app-class is **not** a known
-//! browser / video player (those go fullscreen for content you still want to
-//! click). Backends: KWin (event-driven via a loaded KWin script that calls back
-//! over D-Bus), Hyprland & Sway (polled via `hyprctl` / `swaymsg`). Other
-//! compositors get no auto-detection (manual only).
+//! Signal: the focused window is a game when EITHER
+//!   - its app-class matches a known game class (`steam_app_…`, `gamescope`, …),
+//!     regardless of fullscreen — catches **windowed / borderless** games; OR
+//!   - it is **fullscreen** AND its app-class is **not** a known browser / video
+//!     player (those go fullscreen for content you still want to click).
+//!
+//! Backends: KWin (event-driven via a loaded KWin script that calls back over
+//! D-Bus), Hyprland & Sway (polled via `hyprctl` / `swaymsg`). Other compositors
+//! get no auto-detection (manual only).
 //!
 //! `ST_GAME_MODE=0`/`false`/`no`/`off` disables the whole detector. Extra
-//! excluded classes (comma-separated, case-insensitive substring match) via
-//! `ST_GAME_MODE_EXCLUDE`.
+//! excluded classes via `ST_GAME_MODE_EXCLUDE`; extra always-game classes (for a
+//! windowed game with an arbitrary class) via `ST_GAME_MODE_CLASSES`. Both are
+//! comma-separated, case-insensitive substring matches.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,6 +58,11 @@ const DEFAULT_EXCLUDED: &[&str] = &[
     "dragonplayer",
 ];
 
+/// Built-in app-class fragments that are games regardless of fullscreen state —
+/// matched so windowed / borderless games still trigger. Matched
+/// case-insensitively as substrings of the window's resource class / app-id.
+const DEFAULT_GAME_CLASSES: &[&str] = &["steam_app_", "gamescope", "lutris"];
+
 /// True when game-mode auto-detection is enabled (`ST_GAME_MODE`, default on).
 fn enabled() -> bool {
     !matches!(
@@ -61,9 +71,11 @@ fn enabled() -> bool {
     )
 }
 
-fn excluded_classes() -> Vec<String> {
-    let mut v: Vec<String> = DEFAULT_EXCLUDED.iter().map(|s| s.to_string()).collect();
-    if let Ok(extra) = std::env::var("ST_GAME_MODE_EXCLUDE") {
+/// Merge a built-in fragment list with a comma-separated env override into a
+/// lowercased substring-match list.
+fn class_list(builtin: &[&str], env_key: &str) -> Vec<String> {
+    let mut v: Vec<String> = builtin.iter().map(|s| s.to_string()).collect();
+    if let Ok(extra) = std::env::var(env_key) {
         for c in extra.split(',') {
             let c = c.trim().to_ascii_lowercase();
             if !c.is_empty() {
@@ -74,12 +86,25 @@ fn excluded_classes() -> Vec<String> {
     v
 }
 
-/// Apply the fullscreen + class-filter rule to a focused-window state.
-fn is_game(state: &FocusState, excluded: &[String]) -> bool {
+fn excluded_classes() -> Vec<String> {
+    class_list(DEFAULT_EXCLUDED, "ST_GAME_MODE_EXCLUDE")
+}
+
+fn game_classes() -> Vec<String> {
+    class_list(DEFAULT_GAME_CLASSES, "ST_GAME_MODE_CLASSES")
+}
+
+/// Decide whether the focused window is a game. A known game class wins
+/// regardless of fullscreen (windowed / borderless games); otherwise it must be
+/// fullscreen and not a known browser / video player.
+fn is_game(state: &FocusState, excluded: &[String], games: &[String]) -> bool {
+    let cls = state.class.to_ascii_lowercase();
+    if games.iter().any(|g| cls.contains(g.as_str())) {
+        return true;
+    }
     if !state.fullscreen {
         return false;
     }
-    let cls = state.class.to_ascii_lowercase();
     !excluded.iter().any(|e| cls.contains(e.as_str()))
 }
 
@@ -147,13 +172,14 @@ fn spawn_wlroots_poll(
 ) {
     thread::spawn(move || {
         let excluded = excluded_classes();
+        let games = game_classes();
         let mut last: Option<bool> = None;
         while !stop.load(Ordering::SeqCst) {
             if let Some(state) = match kind {
                 WlrootsKind::Hyprland => query_hyprland(),
                 WlrootsKind::Sway => query_sway(),
             } {
-                let game = is_game(&state, &excluded);
+                let game = is_game(&state, &excluded, &games);
                 if last != Some(game) {
                     last = Some(game);
                     on_change(game);
@@ -306,11 +332,12 @@ fn spawn_kwin(stop: Arc<AtomicBool>, on_change: Arc<dyn Fn(bool) + Send + Sync>)
             }
 
             let excluded = excluded_classes();
+            let games = game_classes();
             let mut last: Option<bool> = None;
             while !stop.load(Ordering::SeqCst) {
                 if dirty.swap(false, Ordering::SeqCst) {
                     let state = shared.lock().unwrap().clone();
-                    let game = is_game(&state, &excluded);
+                    let game = is_game(&state, &excluded, &games);
                     if last != Some(game) {
                         last = Some(game);
                         on_change(game);
@@ -349,4 +376,57 @@ async fn load_kwin_script() -> Result<(), String> {
         .await
         .map_err(|e| format!("start: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(fullscreen: bool, class: &str) -> FocusState {
+        FocusState {
+            fullscreen,
+            class: class.to_string(),
+        }
+    }
+
+    fn lists() -> (Vec<String>, Vec<String>) {
+        (
+            DEFAULT_EXCLUDED.iter().map(|s| s.to_string()).collect(),
+            DEFAULT_GAME_CLASSES.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn fullscreen_game_is_game() {
+        let (ex, ga) = lists();
+        assert!(is_game(&st(true, "cs2"), &ex, &ga));
+    }
+
+    #[test]
+    fn fullscreen_browser_is_not_game() {
+        let (ex, ga) = lists();
+        assert!(!is_game(&st(true, "firefox"), &ex, &ga));
+        assert!(!is_game(&st(true, "org.mozilla.firefox"), &ex, &ga));
+    }
+
+    #[test]
+    fn windowed_non_game_is_not_game() {
+        let (ex, ga) = lists();
+        assert!(!is_game(&st(false, "Alacritty"), &ex, &ga));
+    }
+
+    #[test]
+    fn windowed_steam_game_is_game() {
+        // A known game class wins even when the window is not fullscreen.
+        let (ex, ga) = lists();
+        assert!(is_game(&st(false, "steam_app_730"), &ex, &ga));
+        assert!(is_game(&st(false, "gamescope"), &ex, &ga));
+    }
+
+    #[test]
+    fn game_class_beats_exclusion_and_fullscreen() {
+        // game-class match short-circuits before the fullscreen + exclude rule.
+        let (ex, ga) = lists();
+        assert!(is_game(&st(false, "steam_app_42"), &ex, &ga));
+    }
 }

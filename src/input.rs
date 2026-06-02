@@ -606,6 +606,7 @@ impl InputRuntime {
                         keyboard: true,
                         separate_cursor: true,
                         hover_capture: true,
+                        cursor_position_reliable: true,
                     };
                 }
                 Err(err) => {
@@ -631,6 +632,7 @@ impl InputRuntime {
                         keyboard: true,
                         separate_cursor: true,
                         hover_capture: true,
+                        cursor_position_reliable: true,
                     };
                 }
                 Err(err) => {
@@ -673,20 +675,39 @@ impl InputRuntime {
     }
 
     /// Set the session-sourced game-mode hint (pushed by the in-session tray
-    /// agent when a fullscreen game-class window is focused). ORed into
-    /// `CursorState.app_grab`. Forces an immediate cursor-state republish on a
-    /// real change, because a game that hides its cursor produces no capture
-    /// frames to recompute `app_grab` on (KMS returns no cursor framebuffer).
+    /// agent when a focused window is a game — fullscreen, or a known game
+    /// class even when windowed).
+    ///
+    /// game_mode does NOT itself force relative capture. It *gates* how
+    /// `update_cursor` reads a hidden HW cursor: on the desktop a hidden cursor
+    /// is preserved (NVIDIA's legacy plane reports "no framebuffer" for an idle
+    /// pointer, indistinguishable from truly gone), but inside a game a hidden
+    /// cursor means the game grabbed the pointer for mouselook, so we publish
+    /// `visible=false` and the client enters relative. When the same game shows
+    /// its cursor again (an in-game menu / inventory), `update_cursor` publishes
+    /// `visible=true` and the pointer comes back — the per-frame cursor sample
+    /// is the real signal, fullscreen is only the gate.
     pub fn set_game_mode(&self, on: bool) {
         if self.game_mode.swap(on, Ordering::SeqCst) == on {
             return;
         }
+        eprintln!("[input] session game_mode={on}");
+        if on {
+            // Entry needs no forced state: the next captured frame's
+            // `update_cursor` republishes the correct visible/app_grab within
+            // one frame (it runs every frame regardless of cursor presence).
+            return;
+        }
+        // Exit must act. The last KMS sample may have been a hidden (None)
+        // cursor we published as `visible=false`; on the desktop a None sample
+        // is preserved, so without an explicit restore the pointer would stay
+        // hidden/relative after the user alt-tabs out of the game.
         let mut inner = self.inner.lock().unwrap();
-        let desired = on || inner.warp.app_grab;
-        if inner.cursor_state.app_grab != desired {
-            inner.cursor_state.app_grab = desired;
+        inner.warp.reset();
+        if !inner.cursor_state.visible || inner.cursor_state.app_grab {
+            inner.cursor_state.visible = true;
+            inner.cursor_state.app_grab = false;
             inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
-            eprintln!("[input] session game_mode={on} → app_grab={desired}");
         }
     }
 
@@ -708,6 +729,28 @@ impl InputRuntime {
         }
 
         let Some(cursor) = cursor else {
+            // No HW cursor framebuffer this frame. On the desktop we can't tell
+            // an idle/parked pointer (NVIDIA's legacy cursor plane reports no
+            // framebuffer when idle) from a truly hidden one, so we preserve the
+            // last state to avoid flickering the pointer off. Inside a game
+            // (session tray reported a focused game window), a hidden cursor
+            // means the game grabbed the pointer for mouselook → publish a
+            // definite hidden state so the client enters relative capture.
+            if self.game_mode.load(Ordering::Relaxed) {
+                inner.warp.reset();
+                let next_state = CursorState {
+                    serial: inner.cursor_state.serial,
+                    x: inner.cursor_state.x,
+                    y: inner.cursor_state.y,
+                    visible: false,
+                    app_grab: false,
+                };
+                if inner.cursor_state != next_state {
+                    inner.cursor_state = next_state;
+                    inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+                    eprintln!("[input] game_mode hidden cursor → visible=false (mouselook)");
+                }
+            }
             return;
         };
 
@@ -815,12 +858,13 @@ impl InputRuntime {
         // source buffer, so the reported on-screen position shifts to match.
         let cursor_x = cursor.x + crop_dx as i32;
         let cursor_y = cursor.y + crop_dy as i32;
-        // Feed the real on-screen position to the warp detector: if the client
-        // keeps commanding the cursor but this position does not follow, the app
-        // is doing mouselook without hiding the cursor → app_grab. ORed with the
-        // session-sourced game-mode hint (tray detected a fullscreen game).
-        let app_grab =
-            inner.warp.observe_cursor(cursor_x, cursor_y) || self.game_mode.load(Ordering::Relaxed);
+        // A visible HW cursor means the app is showing a pointer — even inside a
+        // game this is a menu / inventory the user must click, so game_mode does
+        // NOT force a grab here (that's what hid the menu cursor before). The
+        // only relative signal left on a *visible* cursor is the warp detector:
+        // if the client keeps commanding the cursor but this position does not
+        // follow, the app is doing mouselook without hiding the cursor.
+        let app_grab = inner.warp.observe_cursor(cursor_x, cursor_y);
         let next_state = CursorState {
             serial,
             x: cursor_x,
@@ -1612,6 +1656,7 @@ fn select_linux_backend(
                     keyboard: true,
                     separate_cursor: true,
                     hover_capture: true,
+                    cursor_position_reliable: true,
                 },
                 "x11/xtest",
             )),
@@ -1624,6 +1669,8 @@ fn select_linux_backend(
                         keyboard: true,
                         separate_cursor: true,
                         hover_capture: false,
+                        // Capture is still X11/XFixes → real cursor position.
+                        cursor_position_reliable: true,
                     },
                     "uinput(rel)",
                 )),
@@ -1639,6 +1686,7 @@ fn select_linux_backend(
                     keyboard: true,
                     separate_cursor: false,
                     hover_capture: true,
+                    cursor_position_reliable: false,
                 },
                 "x11/xtest",
             )),
@@ -1651,6 +1699,7 @@ fn select_linux_backend(
                         keyboard: true,
                         separate_cursor: false,
                         hover_capture: false,
+                        cursor_position_reliable: false,
                     },
                     "uinput(rel)",
                 )),
@@ -1666,6 +1715,7 @@ fn select_linux_backend(
                     keyboard: true,
                     separate_cursor: false,
                     hover_capture: false,
+                    cursor_position_reliable: false,
                 },
                 "uinput(rel)",
             )
@@ -1681,6 +1731,7 @@ fn select_linux_backend(
                         keyboard: true,
                         separate_cursor: true,
                         hover_capture: true,
+                        cursor_position_reliable: true,
                     },
                     "portal/remote-desktop",
                 ))
@@ -1695,6 +1746,8 @@ fn select_linux_backend(
                             keyboard: true,
                             separate_cursor: true,
                             hover_capture: absolute,
+                            // PipeWire SPA_META_Cursor → real cursor position.
+                            cursor_position_reliable: true,
                         },
                         if absolute {
                             "uinput(abs+rel)"
@@ -1715,6 +1768,9 @@ fn select_linux_backend(
                     keyboard: true,
                     separate_cursor: true,
                     hover_capture: absolute,
+                    // KMS cursor plane reports (0,0) on NVIDIA's legacy plane —
+                    // a separate cursor image but no usable position.
+                    cursor_position_reliable: false,
                 },
                 if absolute {
                     "uinput(abs+rel)"
@@ -1737,6 +1793,7 @@ fn select_linux_backend(
                     keyboard: true,
                     separate_cursor: false,
                     hover_capture: false,
+                    cursor_position_reliable: false,
                 },
                 "uinput(rel)",
             )
