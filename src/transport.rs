@@ -895,6 +895,22 @@ impl UdpSender {
         Ok(())
     }
 
+    /// Send a header-only liveness keepalive on the media path. Used when no
+    /// video is flowing (static screen → capture produces no frames) so the
+    /// client can tell an idle path from a dead one. Works for both backends.
+    pub fn send_keepalive(&mut self) -> Result<(), String> {
+        let mut hdr = [0u8; HEADER_SIZE];
+        PacketHeader {
+            seq: 0,
+            frame_id: 0,
+            payload_type: PayloadType::Keepalive,
+        }
+        .serialize(&mut hdr);
+        let backend = &self.backend;
+        let encrypt_buf = &mut self.encrypt_buf;
+        Self::send_bytes_with(backend, encrypt_buf, &hdr)
+    }
+
     /// Send a single NAL unit as sliced UDP packets (video).
     pub fn send_frame(
         &mut self,
