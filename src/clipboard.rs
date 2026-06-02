@@ -49,67 +49,27 @@ pub struct ClipboardSync {
 }
 
 impl ClipboardSync {
-    #[allow(dead_code)]
-    pub fn start<F>(
+    pub fn start_with_file_detection(
         label: &'static str,
-        send_initial_snapshot_on_activate: bool,
-        is_active: F,
-        outbound_tx: Sender<ControlMessage>,
-    ) -> Self
-    where
-        F: Fn() -> bool + Send + 'static,
-    {
-        Self::start_inner(
-            label,
-            send_initial_snapshot_on_activate,
-            is_active,
-            outbound_tx,
-            None,
-            None,
-        )
-    }
-
-    pub fn start_with_file_detection<F>(
-        label: &'static str,
-        send_initial_snapshot_on_activate: bool,
-        is_active: F,
         outbound_tx: Sender<ControlMessage>,
         file_tx: Sender<PathBuf>,
         suppressed: SuppressedPaths,
-    ) -> Self
-    where
-        F: Fn() -> bool + Send + 'static,
-    {
-        Self::start_inner(
-            label,
-            send_initial_snapshot_on_activate,
-            is_active,
-            outbound_tx,
-            Some(file_tx),
-            Some(suppressed),
-        )
+    ) -> Self {
+        Self::start_inner(label, outbound_tx, Some(file_tx), Some(suppressed))
     }
 
-    fn start_inner<F>(
+    fn start_inner(
         label: &'static str,
-        send_initial_snapshot_on_activate: bool,
-        is_active: F,
         outbound_tx: Sender<ControlMessage>,
         file_tx: Option<Sender<PathBuf>>,
         suppressed: Option<SuppressedPaths>,
-    ) -> Self
-    where
-        F: Fn() -> bool + Send + 'static,
-    {
+    ) -> Self {
         let (remote_tx, remote_rx) = crossbeam_channel::bounded::<String>(REMOTE_CHANNEL_BOUND);
         let stop = Arc::new(AtomicBool::new(false));
 
         let stop_flag = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            // is_active / send_initial_snapshot_on_activate are unused now — clipboard
-            // text sync is always active while connected. Keep the params in the public
-            // API for backward compat but drop them here.
-            let _ = (is_active, send_initial_snapshot_on_activate);
+            // Clipboard text sync is always active while connected.
             run_clipboard_loop(label, outbound_tx, remote_rx, stop_flag);
         });
 

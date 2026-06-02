@@ -34,6 +34,155 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const MAX_CURSOR_SHAPE_RGBA_BYTES: usize = u16::MAX as usize - 16;
+
+// ---- Warp / mouselook-without-hide detector (ST_WARP_DETECT) ----------------
+// Cursor observations accumulated before a window is judged.
+const WARP_WINDOW_SAMPLES: u32 = 6;
+// Minimum commanded net travel (stream px, manhattan) for a window to count —
+// below this the user is essentially idle and the verdict is held, not changed.
+const WARP_MIN_COMMANDED: i64 = 120;
+// Captured cursor must move at least commanded * NUM/DEN to count as "tracking".
+// Below that the app is eating the motion (warp-to-centre or raw-input park).
+const WARP_CONVERGE_NUM: i64 = 1;
+const WARP_CONVERGE_DEN: i64 = 4;
+// Consecutive diverging windows to enter app_grab, converging windows to leave.
+const WARP_ENTER_STREAK: u32 = 3;
+const WARP_EXIT_STREAK: u32 = 2;
+
+/// Detects a remote app warping/parking the pointer for mouselook *without
+/// hiding the cursor* (many XWayland/Proton FPS titles): the client keeps
+/// commanding the cursor across the screen, but the real cursor — read back from
+/// the capture backend's cursor plane / metadata — does not follow (it snaps
+/// back to centre, or never moves). Both signals live on the server, so the
+/// comparison is local; the verdict (`app_grab`) ships to the client as a
+/// relative-capture trigger independent of cursor visibility.
+///
+/// Gated by `ST_WARP_DETECT` until live-validated (`0`/`false`/`no`/`off`
+/// disables; verdict then stays false). Conservative thresholds + hysteresis
+/// keep desktop false-positives rare; the failure mode (a wrongly-grabbed
+/// desktop pointer) is recoverable via the client's force-release and this
+/// escape hatch. Position-less backends (NVIDIA legacy cursor reports no
+/// CRTC_X/Y) never feed `observe_cursor`, so the detector stays inert there.
+struct WarpDetector {
+    enabled: bool,
+    /// Virtual position we have commanded the cursor to (stream coords): set
+    /// absolutely by MouseAbsolute, accumulated by MouseRelative. Anchored to the
+    /// first observed real cursor position.
+    commanded: Option<(i64, i64)>,
+    window_commanded_start: Option<(i64, i64)>,
+    window_captured_start: Option<(i64, i64)>,
+    window_samples: u32,
+    diverge_streak: u32,
+    converge_streak: u32,
+    app_grab: bool,
+}
+
+impl WarpDetector {
+    fn new() -> Self {
+        Self {
+            enabled: warp_detect_enabled(),
+            commanded: None,
+            window_commanded_start: None,
+            window_captured_start: None,
+            window_samples: 0,
+            diverge_streak: 0,
+            converge_streak: 0,
+            app_grab: false,
+        }
+    }
+
+    /// Drop all accumulated state (controller change, backend refresh, cursor
+    /// reset). Keeps `enabled`; clears the verdict.
+    fn reset(&mut self) {
+        self.commanded = None;
+        self.window_commanded_start = None;
+        self.window_captured_start = None;
+        self.window_samples = 0;
+        self.diverge_streak = 0;
+        self.converge_streak = 0;
+        self.app_grab = false;
+    }
+
+    fn observe_command_absolute(&mut self, sx: i64, sy: i64) {
+        if !self.enabled {
+            return;
+        }
+        self.commanded = Some((sx, sy));
+    }
+
+    fn observe_command_relative(&mut self, dx: i64, dy: i64) {
+        if !self.enabled {
+            return;
+        }
+        if let Some((cx, cy)) = self.commanded {
+            self.commanded = Some((cx + dx, cy + dy));
+        }
+    }
+
+    /// Feed one capture-reported cursor position (stream coords). Returns the
+    /// (possibly updated) verdict.
+    fn observe_cursor(&mut self, x: i32, y: i32) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let captured = (i64::from(x), i64::from(y));
+        // Anchor commanded to the real cursor on the first observation so a
+        // window opens from a consistent origin.
+        let commanded = *self.commanded.get_or_insert(captured);
+        if self.window_captured_start.is_none() {
+            self.window_captured_start = Some(captured);
+            self.window_commanded_start = Some(commanded);
+            self.window_samples = 0;
+        }
+        self.window_samples += 1;
+        if self.window_samples < WARP_WINDOW_SAMPLES {
+            return self.app_grab;
+        }
+
+        let (cmd0x, cmd0y) = self.window_commanded_start.unwrap_or(commanded);
+        let (cap0x, cap0y) = self.window_captured_start.unwrap_or(captured);
+        let cmd_net = (commanded.0 - cmd0x).abs() + (commanded.1 - cmd0y).abs();
+        let cap_net = (captured.0 - cap0x).abs() + (captured.1 - cap0y).abs();
+
+        if cmd_net >= WARP_MIN_COMMANDED {
+            // Enough commanded motion to judge this window.
+            if cap_net * WARP_CONVERGE_DEN < cmd_net * WARP_CONVERGE_NUM {
+                self.diverge_streak += 1;
+                self.converge_streak = 0;
+                if self.diverge_streak >= WARP_ENTER_STREAK {
+                    self.app_grab = true;
+                }
+            } else {
+                self.converge_streak += 1;
+                self.diverge_streak = 0;
+                if self.converge_streak >= WARP_EXIT_STREAK {
+                    self.app_grab = false;
+                }
+            }
+        }
+        // Idle window (cmd_net below threshold): hold the current verdict and
+        // touch no streaks, so an afk player stays captured and a stray
+        // false-positive only releases once real motion is seen to track.
+
+        // Open the next window from the current positions.
+        self.window_captured_start = Some(captured);
+        self.window_commanded_start = Some(commanded);
+        self.window_samples = 0;
+        self.app_grab
+    }
+}
+
+/// `ST_WARP_DETECT` escape hatch: default-on, disabled by `0`/`false`/`no`/`off`.
+fn warp_detect_enabled() -> bool {
+    match std::env::var("ST_WARP_DETECT") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
 static TRACE_CURSOR_UPDATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TRACE_CURSOR_SEND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
@@ -239,6 +388,7 @@ struct InputRuntimeInner {
     cursor_state_version: u64,
     stream_width: u32,
     stream_height: u32,
+    warp: WarpDetector,
 }
 
 enum InputBackend {
@@ -280,6 +430,7 @@ impl InputRuntime {
                 cursor_state_version: 0,
                 stream_width: 0,
                 stream_height: 0,
+                warp: WarpDetector::new(),
             }),
             media_dest_by_client: Mutex::new(HashMap::new()),
         })
@@ -393,6 +544,7 @@ impl InputRuntime {
         inner.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
         inner.cursor_shape = None;
         inner.cursor_state = CursorState::default();
+        inner.warp.reset();
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
         inner.stream_width = _stream_width;
@@ -489,6 +641,7 @@ impl InputRuntime {
         inner.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
         inner.cursor_shape = None;
         inner.cursor_state = CursorState::default();
+        inner.warp.reset();
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
         inner.stream_width = 0;
@@ -527,11 +680,16 @@ impl InputRuntime {
                     .map(|shape| shape.serial)
                     .unwrap_or(0)
             };
+            // Cursor hidden: the visibility-based relative path takes over, so
+            // clear any warp verdict and reset the detector window for a clean
+            // start when the cursor reappears.
+            inner.warp.reset();
             let next_state = CursorState {
                 serial,
                 x: cursor.x,
                 y: cursor.y,
                 visible: cursor.visible,
+                app_grab: false,
             };
             if inner.cursor_state != next_state {
                 inner.cursor_state = next_state;
@@ -614,24 +772,36 @@ impl InputRuntime {
             .unwrap_or(0);
         // Cropping moved the visible top-left by (crop_dx, crop_dy) within the
         // source buffer, so the reported on-screen position shifts to match.
+        let cursor_x = cursor.x + crop_dx as i32;
+        let cursor_y = cursor.y + crop_dy as i32;
+        // Feed the real on-screen position to the warp detector: if the client
+        // keeps commanding the cursor but this position does not follow, the app
+        // is doing mouselook without hiding the cursor → app_grab.
+        let app_grab = inner.warp.observe_cursor(cursor_x, cursor_y);
         let next_state = CursorState {
             serial,
-            x: cursor.x + crop_dx as i32,
-            y: cursor.y + crop_dy as i32,
+            x: cursor_x,
+            y: cursor_y,
             visible: cursor.visible,
+            app_grab,
         };
+        let app_grab_changed = inner.cursor_state.app_grab != next_state.app_grab;
         if inner.cursor_state != next_state {
             inner.cursor_state = next_state;
             inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+            if app_grab_changed {
+                eprintln!("[input][warp] app_grab={app_grab} (mouselook-without-hide detection)");
+            }
             if trace_enabled() {
                 let log_idx = TRACE_CURSOR_UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                 if log_idx < 12 {
                     eprintln!(
-                        "[trace][cursor] updated state serial={} pos=({}, {}) visible={}",
+                        "[trace][cursor] updated state serial={} pos=({}, {}) visible={} app_grab={}",
                         inner.cursor_state.serial,
                         inner.cursor_state.x,
                         inner.cursor_state.y,
-                        inner.cursor_state.visible
+                        inner.cursor_state.visible,
+                        inner.cursor_state.app_grab
                     );
                 }
             }
@@ -770,10 +940,18 @@ impl InputRuntime {
                 // real cursor metadata (PipeWire SPA_META_Cursor / XFixes), so
                 // there is a single source of truth and no feedback loop with
                 // the client's locally-drawn cursor.
+                let (sx, sy) = (
+                    i64::from(normalized_to_stream_coord(packet.x, inner.stream_width)),
+                    i64::from(normalized_to_stream_coord(packet.y, inner.stream_height)),
+                );
+                inner.warp.observe_command_absolute(sx, sy);
             }
             InputPacket::MouseRelative(packet) => {
                 inner.sync_buttons(packet.buttons);
                 inner.move_relative(packet.dx, packet.dy);
+                inner
+                    .warp
+                    .observe_command_relative(i64::from(packet.dx), i64::from(packet.dy));
             }
             InputPacket::MouseButtons(packet) => {
                 inner.sync_buttons(packet.buttons);
@@ -838,6 +1016,7 @@ impl InputRuntimeInner {
             x: target_x - hotspot_x,
             y: target_y - hotspot_y,
             visible: true,
+            app_grab: self.cursor_state.app_grab,
         };
         self.set_predicted_cursor_state(next_state);
     }
@@ -862,6 +1041,7 @@ impl InputRuntimeInner {
             x: target_x - hotspot_x,
             y: target_y - hotspot_y,
             visible: true,
+            app_grab: self.cursor_state.app_grab,
         };
         self.set_predicted_cursor_state(next_state);
     }
@@ -1036,7 +1216,6 @@ fn input_seq_is_newer(seq: u16, last_seq: u16) -> bool {
     delta != 0 && delta < 0x8000
 }
 
-#[cfg(test)]
 fn normalized_to_stream_coord(value: u16, span: u32) -> i32 {
     if span <= 1 {
         0
@@ -2945,6 +3124,73 @@ fn x11_key_name(key: KeyboardKey) -> Option<&'static std::ffi::CStr> {
 mod tests {
     use super::*;
 
+    /// Force-enabled detector regardless of `ST_WARP_DETECT` in the env.
+    fn enabled_warp() -> WarpDetector {
+        let mut w = WarpDetector::new();
+        w.enabled = true;
+        w.reset();
+        w
+    }
+
+    #[test]
+    fn warp_detector_disabled_never_grabs() {
+        let mut w = WarpDetector::new();
+        w.enabled = false;
+        let mut cx = 0i64;
+        for _ in 0..(WARP_WINDOW_SAMPLES * (WARP_ENTER_STREAK + 2)) {
+            cx += 60;
+            w.observe_command_absolute(cx, 0);
+            assert!(!w.observe_cursor(500, 500));
+        }
+        assert!(!w.app_grab);
+    }
+
+    #[test]
+    fn warp_detector_enters_then_exits() {
+        let mut w = enabled_warp();
+        // Diverge: client keeps commanding the cursor across the screen while the
+        // captured cursor is pinned (warp-to-centre / raw-input park).
+        let mut cx = 0i64;
+        for _ in 0..(WARP_WINDOW_SAMPLES * WARP_ENTER_STREAK) {
+            cx += 60;
+            w.observe_command_absolute(cx, 0);
+            w.observe_cursor(500, 500);
+        }
+        assert!(w.app_grab, "sustained divergence must grab");
+
+        // Converge: the app released — the captured cursor now tracks the
+        // commanded motion 1:1.
+        let mut pos = 500i64;
+        for _ in 0..(WARP_WINDOW_SAMPLES * WARP_EXIT_STREAK) {
+            cx += 60;
+            pos += 60;
+            w.observe_command_absolute(cx, 0);
+            w.observe_cursor(pos as i32, 500);
+        }
+        assert!(!w.app_grab, "tracking cursor must release");
+    }
+
+    #[test]
+    fn warp_detector_holds_verdict_while_idle() {
+        let mut w = enabled_warp();
+        let mut cx = 0i64;
+        for _ in 0..(WARP_WINDOW_SAMPLES * WARP_ENTER_STREAK) {
+            cx += 60;
+            w.observe_command_absolute(cx, 0);
+            w.observe_cursor(500, 500);
+        }
+        assert!(w.app_grab);
+        // Idle: barely any commanded motion. The verdict must not flip on its own
+        // (an afk player stays captured; a false positive only clears once real
+        // motion is seen to track).
+        for _ in 0..(WARP_WINDOW_SAMPLES * 4) {
+            cx += 2;
+            w.observe_command_absolute(cx, 0);
+            w.observe_cursor(500, 500);
+        }
+        assert!(w.app_grab, "idle must hold the existing verdict");
+    }
+
     fn predictive_cursor_inner() -> InputRuntimeInner {
         InputRuntimeInner {
             backend: InputBackend::Unavailable,
@@ -2973,11 +3219,13 @@ mod tests {
                 x: 10,
                 y: 20,
                 visible: true,
+                app_grab: false,
             },
             cursor_shape_version: 1,
             cursor_state_version: 1,
             stream_width: 1920,
             stream_height: 1080,
+            warp: WarpDetector::new(),
         }
     }
 

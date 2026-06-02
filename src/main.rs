@@ -61,9 +61,8 @@ use transport::{EncodedVideoFrame, UdpSender};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use st_protocol::{
-    control::OutputInfo, ClientDisplayInfo, ClockSyncPong, ControlMessage, ControllerState,
-    InputSession, SessionDebugInfo, StreamConfig, VideoChromaSampling, VideoCodec,
-    VideoCodecSupport,
+    control::OutputInfo, ClientDisplayInfo, ClockSyncPong, ControlMessage, InputSession,
+    SessionDebugInfo, StreamConfig, VideoChromaSampling, VideoCodec, VideoCodecSupport,
 };
 use std::net::SocketAddr;
 use std::sync::{
@@ -2912,11 +2911,6 @@ async fn handle_client(
     let suppressed_paths = clipboard::new_suppressed_paths();
     let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "server",
-        true,
-        {
-            let input = Arc::clone(&state.input);
-            move || input.controller_state_for(client_id) == ControllerState::OwnedByYou
-        },
         clipboard_control_tx,
         file_detect_tx,
         Arc::clone(&suppressed_paths),
@@ -3830,11 +3824,6 @@ fn handle_punched_client(
     let suppressed_paths = clipboard::new_suppressed_paths();
     let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
         "server-punched",
-        true,
-        {
-            let input = Arc::clone(&state.input);
-            move || input.controller_state_for(client_id) == ControllerState::OwnedByYou
-        },
         clipboard_control_tx,
         file_detect_tx,
         Arc::clone(&suppressed_paths),
