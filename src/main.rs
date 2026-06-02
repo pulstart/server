@@ -2154,6 +2154,10 @@ fn run_transport(
     // Server-side cap→send backlog (µs, EWMA) published for the bitrate controller
     // so it can react to WiFi bufferbloat that never shows up as packet loss.
     send_backlog_us: Arc<AtomicU32>,
+    // B3: shared cell holding the client's current UDP media destination. The
+    // input listener updates it when the client's source address changes (wifi
+    // switch / NAT rebind); this loop repoints the send socket to match.
+    media_dest: Arc<Mutex<SocketAddr>>,
 ) {
     let mut sender = match UdpSender::new(addr, crypto) {
         Ok(s) => s,
@@ -2162,6 +2166,7 @@ fn run_transport(
             return;
         }
     };
+    let mut current_dest = addr;
     let trace = trace_enabled();
     let interleave_audio = audio_interleave_enabled();
     let mut sent_video_units = 0usize;
@@ -2181,6 +2186,22 @@ fn run_transport(
     let mut backlog_seen = false;
     let hard_ceiling_us = max_queue_latency_us();
     while running.load(Ordering::SeqCst) {
+        // B3: relearn the client's UDP return path if it moved (cheap once-per-
+        // iteration check). Repoint the connected send socket so video follows
+        // the client across a wifi switch / NAT rebind without a reconnect.
+        let want_dest = *media_dest.lock().unwrap();
+        if want_dest != current_dest {
+            match sender.update_dest(want_dest) {
+                Ok(()) => {
+                    println!("[transport] media repointed {current_dest} -> {want_dest}");
+                    current_dest = want_dest;
+                    // The path changed underneath us — force a keyframe so the
+                    // client can resync without waiting for the next IDR.
+                    video_bc.request_keyframe();
+                }
+                Err(e) => eprintln!("[transport] repoint to {want_dest} failed: {e}"),
+            }
+        }
         // A2: pick up the latest adaptive FEC strength before sending.
         let pct = fec_pct.load(Ordering::Relaxed);
         if pct != last_fec_pct {
@@ -2800,6 +2821,13 @@ async fn handle_client(
     let transport_running = Arc::new(AtomicBool::new(true));
 
     let transport_addr = SocketAddr::new(addr.ip(), client_media_port(startup_prefs.display));
+    // B3: shared media-destination cell. Seeded from the declared address; the
+    // input listener relearns the live source address (input + media share one
+    // client socket) and the transport thread repoints to follow it.
+    let media_dest = Arc::new(Mutex::new(transport_addr));
+    state
+        .input
+        .register_media_dest(client_id, Arc::clone(&media_dest));
     sub.video_bc.request_keyframe();
     let vid_rx = sub.vid_rx;
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -2836,6 +2864,7 @@ async fn handle_client(
     };
     let audio_depth_shared = Arc::new(AtomicU8::new(audio_depth_init));
     let audio_depth_transport = Arc::clone(&audio_depth_shared);
+    let media_dest_transport = Arc::clone(&media_dest);
     let transport_handle = std::thread::spawn(move || {
         run_transport(
             transport_addr,
@@ -2849,6 +2878,7 @@ async fn handle_client(
             audio_depth_transport,
             dup_first_transport,
             send_backlog_transport,
+            media_dest_transport,
         );
     });
     if let Err(err) = stream
@@ -2887,6 +2917,15 @@ async fn handle_client(
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     let mut last_controller_state = controller_state;
     let mut last_config_generation = capture_state.generation();
+    // Direct-path liveness: the OS TCP keepalive default is ~2h, so a silent
+    // network drop (wifi off, NAT rebind, peer crash without RST) would leave
+    // this loop spinning on the 16ms read timeout forever, holding the
+    // broadcaster subscription, transport thread and input-control ownership.
+    // The client sends TransportFeedback (and clock-sync pings) over this TCP
+    // channel continuously while connected, so treat prolonged inbound silence
+    // as a dead client and tear down — mirroring the punched path's timeout.
+    const DIRECT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15);
+    let mut last_inbound = Instant::now();
     loop {
         if registered_client.disconnect_requested() {
             break;
@@ -2958,6 +2997,7 @@ async fn handle_client(
         {
             Ok(Ok(0)) | Ok(Err(_)) => break,
             Ok(Ok(n)) => {
+                last_inbound = Instant::now();
                 control_buf.extend_from_slice(&buf[..n]);
                 let mut consumed = 0usize;
                 while let Some((msg, used)) = ControlMessage::deserialize(&control_buf[consumed..])
@@ -3129,7 +3169,17 @@ async fn handle_client(
                     control_buf.drain(..consumed);
                 }
             }
-            Err(_) => {}
+            // Read timed out (no inbound bytes this tick) — normal. Use it to
+            // check for a dead client that stopped sending feedback entirely.
+            Err(_) => {
+                if last_inbound.elapsed() > DIRECT_INACTIVITY_TIMEOUT {
+                    println!(
+                        "[client {addr}] no control traffic for {}s — assuming disconnected",
+                        DIRECT_INACTIVITY_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -3139,6 +3189,7 @@ async fn handle_client(
     transport_running.store(false, Ordering::SeqCst);
     rate_control.unregister_client(sub.vid_sub_id);
     let _ = state.input.release_control(client_id);
+    state.input.unregister_media_dest(client_id);
 
     unsubscribe_and_maybe_stop_pipeline(
         &state,
@@ -3383,8 +3434,14 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
     };
     let listen_port = state.listen_port;
     let state = Arc::clone(&state);
+    // Retry a punch nonce a few times before giving up on it. A single failed
+    // attempt is often just a timing miss (the client wasn't probing yet, or
+    // its candidates hadn't propagated); consuming the nonce on the first
+    // failure meant no second chance until the client posted a brand-new nonce.
+    const MAX_PUNCH_ATTEMPTS: u32 = 3;
     std::thread::spawn(move || {
         let mut last_handled_punch_nonce = 0;
+        let mut punch_attempts: u32 = 0;
         loop {
             if state.control.shutdown_requested() {
                 break;
@@ -3434,6 +3491,7 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
             ) {
                 Ok(peer) => {
                     last_handled_punch_nonce = pending_punch_nonce;
+                    punch_attempts = 0;
                     println!("[hole-punch] Success! Peer confirmed at {peer}");
                     tunnel.set_punch_session_active(true);
                     let punched = Arc::new(st_protocol::reliable_udp::PunchedSocket::new(
@@ -3454,8 +3512,21 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                     });
                 }
                 Err(e) => {
-                    last_handled_punch_nonce = pending_punch_nonce;
-                    eprintln!("[hole-punch] Failed: {e}");
+                    punch_attempts += 1;
+                    eprintln!(
+                        "[hole-punch] Failed (attempt {punch_attempts}/{MAX_PUNCH_ATTEMPTS}): {e}"
+                    );
+                    if punch_attempts >= MAX_PUNCH_ATTEMPTS {
+                        // Give up on this nonce; the client must post a new one
+                        // (it re-attempts on its own connect retries).
+                        last_handled_punch_nonce = pending_punch_nonce;
+                        punch_attempts = 0;
+                        eprintln!(
+                            "[hole-punch] Giving up on nonce {pending_punch_nonce} after {MAX_PUNCH_ATTEMPTS} attempts"
+                        );
+                    }
+                    // Brief backoff; partner candidates refresh on the API poll
+                    // cadence, so the next attempt may pick up a fresher mapping.
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
@@ -3953,9 +4024,13 @@ fn handle_punched_client(
             }
             Some(PunchedMessage::Media(data)) => {
                 last_peer_activity = Instant::now();
-                // Demux input packets from the media channel.
+                // Demux input packets from the media channel. The punched peer
+                // address is fixed by the hole punch (no media_dest cell), so
+                // the relearn is a no-op here.
                 if let Some((header, packet)) = st_protocol::InputPacket::deserialize(&data) {
-                    state.input.handle_input_packet(header.seq, packet);
+                    state
+                        .input
+                        .handle_input_packet(header.seq, packet, punched.peer());
                 }
             }
             None => {}

@@ -2,8 +2,22 @@ use crate::server_control::ServerControl;
 use st_protocol::tunnel::{CryptoContext, TunnelKeys};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Shared ureq agent for all signaling calls. The default ureq agent has no
+/// read timeout, so a black-holed or slow API host would hang the registration
+/// thread forever. Bound connect/read/write so every signaling call fails fast.
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(10))
+            .timeout_write(Duration::from_secs(10))
+            .build()
+    })
+}
 
 /// Refresh STUN-derived candidates if they're older than this. UDP NAT
 /// mappings expire after ~30–120 s of silence, so 25 s gives margin to
@@ -440,7 +454,8 @@ pub fn start_api_registration(
                 "candidates": local_candidates,
             })
             .to_string();
-            let ok = ureq::post(&format!("{api_url}/api/register"))
+            let ok = http_agent()
+                .post(&format!("{api_url}/api/register"))
                 .set("Content-Type", "application/json")
                 .send_string(&body)
                 .is_ok();
@@ -458,7 +473,8 @@ pub fn start_api_registration(
                     "public_key": tunnel_state.public_key_b64(),
                 })
                 .to_string();
-                match ureq::post(&format!("{api_url}/api/key"))
+                match http_agent()
+                    .post(&format!("{api_url}/api/key"))
                     .set("Content-Type", "application/json")
                     .send_string(&key_body)
                 {
@@ -483,7 +499,8 @@ pub fn start_api_registration(
                     "candidates": local_candidates,
                 })
                 .to_string();
-                match ureq::post(&format!("{api_url}/api/candidates"))
+                match http_agent()
+                    .post(&format!("{api_url}/api/candidates"))
                     .set("Content-Type", "application/json")
                     .send_string(&cand_body)
                 {
@@ -509,9 +526,12 @@ pub fn start_api_registration(
                     Err(_) => tunnel_state.set_partner_candidates(Vec::new()),
                 }
 
-                let session_body = format!(r#"{{"token":"{token}"}}"#);
+                // Send our role so the API refreshes our last_seen (polling =
+                // liveness) and the host doesn't age out during a slow punch.
+                let session_body = format!(r#"{{"token":"{token}","role":"host"}}"#);
                 let mut client_joined = false;
-                match ureq::post(&format!("{api_url}/api/session"))
+                match http_agent()
+                    .post(&format!("{api_url}/api/session"))
                     .set("Content-Type", "application/json")
                     .send_string(&session_body)
                 {
@@ -571,7 +591,8 @@ pub fn start_api_registration(
             "peer_id": peer_id,
         })
         .to_string();
-        let _ = ureq::post(&format!("{api_url}/api/unregister"))
+        let _ = http_agent()
+            .post(&format!("{api_url}/api/unregister"))
             .set("Content-Type", "application/json")
             .send_string(&body);
         tunnel_state.connected.store(false, Ordering::Relaxed);

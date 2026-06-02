@@ -882,6 +882,19 @@ impl UdpSender {
         Ok(())
     }
 
+    /// Repoint the send socket at a new client address (B3 return-path relearn).
+    /// All egress paths (plain send, sendmmsg, io_uring) operate on this one
+    /// connected fd, so a single `connect()` retargets them together. No-op for
+    /// the punched backend, whose peer is fixed by the hole punch.
+    pub fn update_dest(&mut self, new_addr: SocketAddr) -> Result<(), String> {
+        if let SendBackend::Direct { socket, .. } = &self.backend {
+            socket
+                .connect(new_addr)
+                .map_err(|e| format!("reconnect UDP to {new_addr}: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Send a single NAL unit as sliced UDP packets (video).
     pub fn send_frame(
         &mut self,

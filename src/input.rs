@@ -7,12 +7,12 @@ use st_protocol::{
     KeyboardKey, KEYBOARD_STATE_BYTES, MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2,
     MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "linux")]
 use std::fs::{File, OpenOptions};
 #[cfg(target_os = "linux")]
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -55,6 +55,12 @@ pub struct InputRuntime {
     next_client_id: AtomicU32,
     active_controller_id: AtomicU32,
     inner: Mutex<InputRuntimeInner>,
+    /// Per-client UDP media-destination cells (B3 return-path relearn). The
+    /// transport thread for each client watches its cell and repoints its send
+    /// socket when the address changes; this listener updates the cell from the
+    /// live source address of the client's input packets (the client sends
+    /// input from the same socket it receives media on).
+    media_dest_by_client: Mutex<HashMap<u32, Arc<Mutex<SocketAddr>>>>,
 }
 
 fn trace_enabled() -> bool {
@@ -275,7 +281,38 @@ impl InputRuntime {
                 stream_width: 0,
                 stream_height: 0,
             }),
+            media_dest_by_client: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Register a per-client UDP media-destination cell (B3). The client's
+    /// transport thread shares this cell; the input listener updates it when the
+    /// client's UDP source address changes (wifi switch / NAT rebind).
+    pub fn register_media_dest(&self, client_id: u32, dest: Arc<Mutex<SocketAddr>>) {
+        self.media_dest_by_client
+            .lock()
+            .unwrap()
+            .insert(client_id, dest);
+    }
+
+    pub fn unregister_media_dest(&self, client_id: u32) {
+        self.media_dest_by_client.lock().unwrap().remove(&client_id);
+    }
+
+    /// Update a client's learned media return path from an observed input-packet
+    /// source address. No-op for clients without a registered cell (e.g. the
+    /// punched path, whose media destination is fixed by the hole punch).
+    fn observe_client_source(&self, client_id: u32, src: SocketAddr) {
+        if let Some(cell) = self.media_dest_by_client.lock().unwrap().get(&client_id) {
+            let mut dest = cell.lock().unwrap();
+            if *dest != src {
+                println!(
+                    "[input] client {client_id} return path moved {} -> {src}",
+                    *dest
+                );
+                *dest = src;
+            }
+        }
     }
 
     pub fn spawn_listener(self: &Arc<Self>, port: u16) {
@@ -679,9 +716,9 @@ impl InputRuntime {
         let mut buf = [0u8; 1500];
         loop {
             match socket.recv_from(&mut buf) {
-                Ok((n, _addr)) => {
+                Ok((n, src)) => {
                     if let Some((header, packet)) = InputPacket::deserialize(&buf[..n]) {
-                        self.handle_input_packet(header.seq, packet);
+                        self.handle_input_packet(header.seq, packet, src);
                     }
                 }
                 Err(err) => {
@@ -692,7 +729,7 @@ impl InputRuntime {
         }
     }
 
-    pub fn handle_input_packet(&self, seq: u16, packet: InputPacket) {
+    pub fn handle_input_packet(&self, seq: u16, packet: InputPacket, src: SocketAddr) {
         let mut inner = self.inner.lock().unwrap();
         let client_id = match packet {
             InputPacket::MouseAbsolute(packet) => packet.client_id,
@@ -706,6 +743,20 @@ impl InputRuntime {
         }
         if !inner.accept_input_seq(client_id, seq) {
             return;
+        }
+        // B3: relearn this client's media return path from its live UDP source
+        // (input and media share one client socket), so the transport repoints
+        // after a wifi switch / NAT rebind without a full reconnect.
+        self.observe_client_source(client_id, src);
+        // B5: implicit control grab — first client to send input takes control —
+        // but a stray/late/duplicate packet from a *non-owner* must not steal
+        // control from the active owner. Stealing would release the owner's held
+        // buttons/keys and hijack the session, so ignore non-owner input while
+        // someone else holds control (ownership frees on disconnect/idle-timeout).
+        if let Some(owner) = inner.controller_id {
+            if owner != client_id {
+                return;
+            }
         }
         inner.activate_controller(client_id);
         self.set_active_controller(Some(client_id));
