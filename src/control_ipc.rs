@@ -76,6 +76,10 @@ pub struct StateSnapshot {
     pub api_connected: Option<bool>,
     pub update_state: UpdateStateWire,
     pub clients: Vec<ClientSnapshot>,
+    /// Screen-wake request generation. The system-mode tray agent watches this
+    /// across snapshots and runs the in-session display wake when it increments.
+    #[serde(default)]
+    pub wake_generation: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -192,6 +196,7 @@ fn build_snapshot(
         api_connected: tunnel.as_ref().map(|t| t.is_connected()),
         update_state: update_state_to_wire(control.update_state()),
         clients,
+        wake_generation: control.wake_generation(),
     }
 }
 
@@ -453,6 +458,59 @@ mod tests {
         assert!(!snap.allow_new_connections);
 
         assert!(!client.request_disconnect(999).expect("disconnect unknown"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Regression guard for the screen-wake-on-connect path in system mode: the
+    // root service (no session env) cannot unblank the display itself, so it
+    // signals the in-session tray agent by bumping `wake_generation`. That
+    // counter must survive the JSON snapshot round trip over the control socket,
+    // and `request_wake()` must debounce so a reconnect burst doesn't spam the
+    // compositor. If this regresses, a blanked remote never wakes (the original
+    // "screen off => can't connect" bug) or wakes on every poll tick.
+    #[test]
+    fn wake_generation_propagates_and_debounces_over_socket() {
+        let tmp = std::env::temp_dir().join(format!("st-wake-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        std::env::set_var("XDG_STATE_HOME", &tmp);
+
+        let control = ServerControl::new();
+        let sock = tmp.join("wake.sock");
+
+        let server_control = Arc::clone(&control);
+        let server_sock = sock.clone();
+        std::thread::spawn(move || {
+            let _ = serve(server_control, None, &server_sock);
+        });
+
+        let mut client = None;
+        for _ in 0..200 {
+            if let Ok(c) = IpcClient::connect(&sock) {
+                client = Some(c);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut client = client.expect("connect to control socket");
+
+        let base = client.snapshot().expect("snapshot").wake_generation;
+
+        // First request bumps the generation, visible to the remote client.
+        control.request_wake();
+        assert_eq!(
+            client.snapshot().expect("snapshot 2").wake_generation,
+            base + 1,
+            "wake_generation must increment over the wire"
+        );
+
+        // A second request inside the debounce window must NOT bump again.
+        control.request_wake();
+        assert_eq!(
+            client.snapshot().expect("snapshot 3").wake_generation,
+            base + 1,
+            "back-to-back wake requests must debounce to a single bump"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

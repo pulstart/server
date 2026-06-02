@@ -170,6 +170,19 @@ pub fn run_tray_agent(socket: &std::path::Path) -> Result<(), String> {
 fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
     let mut last_version = control.ui_version();
     let mut last_api_connected = control.api_connected();
+
+    // Screen-wake actuation. Only the system-mode agent does this: it runs as a
+    // per-user process inside the graphical session, so it has the
+    // WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR (and DISPLAY)
+    // that the root service lacks, and can reach the compositor/screensaver to
+    // unblank the display. The per-user (Local) tray skips this — that server is
+    // already in-session and wakes the display directly on connect. Seed from the
+    // current generation so a counter that advanced before the agent started
+    // doesn't trigger a spurious wake on the first poll.
+    let wake_via_agent = control.is_system_agent();
+    let mut last_wake_gen = control.wake_generation();
+    let wake_in_progress = Arc::new(AtomicBool::new(false));
+
     let quit = Arc::new(AtomicBool::new(false));
     let handle = LinuxTray {
         control: control.clone(),
@@ -182,6 +195,22 @@ fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
     while !quit.load(Ordering::SeqCst) && !control.shutdown_requested() && !handle.is_closed() {
         // Remote handles pull a fresh snapshot here; Local is a no-op.
         control.refresh();
+        if wake_via_agent {
+            let gen = control.wake_generation();
+            if gen != last_wake_gen {
+                last_wake_gen = gen;
+                // Run the wake off the tray loop: kscreen-doctor/dbus-send can
+                // block for a moment and must not stall the menu. The guard keeps
+                // a slow wake from piling up if the counter bumps again meanwhile.
+                if !wake_in_progress.swap(true, Ordering::SeqCst) {
+                    let flag = Arc::clone(&wake_in_progress);
+                    thread::spawn(move || {
+                        crate::screen_wake::wake_display();
+                        flag.store(false, Ordering::SeqCst);
+                    });
+                }
+            }
+        }
         let version = control.ui_version();
         let api_connected = control.api_connected();
         if version != last_version || api_connected != last_api_connected {
@@ -229,6 +258,15 @@ impl ControlHandle {
         match self {
             ControlHandle::Local { control, .. } => control.ui_version(),
             ControlHandle::Remote(r) => r.cache().version,
+        }
+    }
+
+    /// Current screen-wake request generation. The system-mode agent compares
+    /// this across polls and wakes the display in-session when it increments.
+    fn wake_generation(&self) -> u64 {
+        match self {
+            ControlHandle::Local { control, .. } => control.wake_generation(),
+            ControlHandle::Remote(r) => r.cache().wake_generation,
         }
     }
 

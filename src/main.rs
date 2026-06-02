@@ -2167,6 +2167,11 @@ fn run_transport(
         }
     };
     let mut current_dest = addr;
+    // B1: send a liveness keepalive at least this often so the client can tell a
+    // dead UDP path from an idle one (static screen → no captured frames → no
+    // video sent). Reset whenever video is sent so active streams add nothing.
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
+    let mut last_keepalive = Instant::now();
     let trace = trace_enabled();
     let interleave_audio = audio_interleave_enabled();
     let mut sent_video_units = 0usize;
@@ -2201,6 +2206,13 @@ fn run_transport(
                 }
                 Err(e) => eprintln!("[transport] repoint to {want_dest} failed: {e}"),
             }
+        }
+        // B1: keepalive so the client's media-stall watchdog doesn't mistake an
+        // idle (static-screen) path for a dead one. Reset below on each video
+        // send, so an active stream never emits keepalives.
+        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            let _ = sender.send_keepalive();
+            last_keepalive = Instant::now();
         }
         // A2: pick up the latest adaptive FEC strength before sending.
         let pct = fec_pct.load(Ordering::Relaxed);
@@ -2315,6 +2327,8 @@ fn run_transport(
                         }
                         sent_video_units = sent_video_units.saturating_add(1);
                         last_video_activity = std::time::Instant::now();
+                        // B1: real video is liveness — defer the next keepalive.
+                        last_keepalive = std::time::Instant::now();
                         if let Err(e) = sender.send_frame(&frame, frame_now_us) {
                             eprintln!("[transport] video send error to {addr}: {e}");
                         }
@@ -2617,6 +2631,14 @@ async fn handle_client(
     let hardware_yuv444_codecs_for_setup = client_hardware_yuv444_codecs;
     let hdr_display_for_setup = client_hdr_display(startup_prefs.display);
     let setup = tokio::task::spawn_blocking(move || -> Result<PipelineSetup, String> {
+        // Wake the display on every client connect, before any first-frame wait.
+        // On Wayland (PipeWire / wlroots) and KMS the compositor/kernel stops
+        // driving frames when the monitor is in DPMS off, which would otherwise
+        // stall the first-frame recv until the 30s pipeline timeout. Fires on
+        // every connect (debounced in ServerControl) so a second client reaching
+        // a re-blanked display also wakes it, not only the first. Disable with
+        // ST_WAKE_ON_CONNECT=0.
+        trigger_screen_wake(&state2.control);
         // Wait for any previous pipeline stop to finish before starting a new one.
         // Without this, the new capture backend may fail because the old one still
         // holds exclusive resources (PipeWire portal session, KMS, etc.).
@@ -2636,12 +2658,6 @@ async fn handle_client(
             }
         }
         if pipeline.is_none() {
-            // Wake the local display before capture's first-frame wait.
-            // On Wayland (PipeWire / wlroots) and KMS, the compositor /
-            // kernel stops driving frames when the monitor is in DPMS off,
-            // which would stall `frame_rx.recv()` until the 30s timeout.
-            // Disable with `ST_WAKE_ON_CONNECT=0`.
-            screen_wake::wake_display();
             println!("[pipeline] Starting shared pipeline...");
             let (started, sub) = SharedPipeline::start(
                 requested_fps_for_setup,
@@ -4091,7 +4107,15 @@ fn run_punched_transport(
     let mut backlog_ewma_us: u32 = 0;
     let mut backlog_seen = false;
     let hard_ceiling_us = max_queue_latency_us();
+    // B1: keepalive cadence so the punched client's inactivity timeout doesn't
+    // fire on an idle (static-screen) path. Reset on each video send below.
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
+    let mut last_keepalive = Instant::now();
     while running.load(Ordering::SeqCst) {
+        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            let _ = sender.send_keepalive();
+            last_keepalive = Instant::now();
+        }
         let pct = fec_pct.load(Ordering::Relaxed);
         if pct != last_fec_pct {
             sender.set_fec_pct(pct);
@@ -4185,6 +4209,8 @@ fn run_punched_transport(
                                 );
                             }
                         }
+                        // B1: real video is liveness — defer the next keepalive.
+                        last_keepalive = Instant::now();
                         if let Err(e) = sender.send_frame(&frame, frame_now_us) {
                             eprintln!("[punched-transport] video send error: {e}");
                         }
@@ -4364,6 +4390,28 @@ fn parse_run_mode() -> RunMode {
         Ok("system") => RunMode::System,
         Ok("tray") => RunMode::Tray,
         _ => RunMode::Normal,
+    }
+}
+
+/// Wake the remote display when a client connects. Splits by run mode because
+/// only one side of the process tree has the session env needed to talk to the
+/// compositor/screensaver:
+/// - System mode (root service, no session bus): bump the wake counter so the
+///   per-user tray agent — which lives in the graphical session and has
+///   WAYLAND_DISPLAY/DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR — runs the actual
+///   unblank in-session. The root service calling `screen_wake` directly would
+///   only fail noisily as root.
+/// - Per-user / `cargo run`: this process is already in the session, so wake the
+///   display directly.
+///
+/// `screen_wake::wake_display` and `ServerControl::request_wake` both honor the
+/// `ST_WAKE_ON_CONNECT=0` / debounce escape hatches, so this is safe to call on
+/// every connect.
+fn trigger_screen_wake(control: &crate::server_control::ServerControl) {
+    if std::env::var_os("ST_SYSTEM_MODE").is_some() {
+        control.request_wake();
+    } else {
+        screen_wake::wake_display();
     }
 }
 

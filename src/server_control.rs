@@ -5,14 +5,20 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const CONFIG_FILENAME: &str = "st-server-config.json";
+
+/// Minimum gap between two screen-wake requests that actually bump the
+/// generation counter. A client reconnect loop or several clients connecting at
+/// once should not spawn a wake (kscreen-doctor/dbus-send) every poll tick — the
+/// first request in a burst is enough to unblank the display.
+const WAKE_DEBOUNCE_MS: u64 = 1_500;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedSettings {
@@ -223,6 +229,15 @@ pub struct ServerControl {
     token: Mutex<String>,
     /// Stable peer identifier, persisted across restarts.
     peer_id: String,
+    /// Monotonically increasing screen-wake request counter. The root system
+    /// service has no session env and cannot reach the compositor/screensaver to
+    /// unblank the display, so on each client connect it bumps this counter; the
+    /// per-user tray agent (which polls the control-socket snapshot and *does*
+    /// live in the user session) notices the increment and runs the actual wake
+    /// in-session. See `screen_wake` and `tray::run_linux_tray`.
+    wake_generation: AtomicU64,
+    /// Wall-clock millis of the last wake bump, for `WAKE_DEBOUNCE_MS`.
+    last_wake_request_ms: AtomicU64,
 }
 
 impl ServerControl {
@@ -246,7 +261,32 @@ impl ServerControl {
             forced_quality: AtomicU8::new(saved.quality_value()),
             token: Mutex::new(token),
             peer_id,
+            wake_generation: AtomicU64::new(0),
+            last_wake_request_ms: AtomicU64::new(0),
         })
+    }
+
+    /// Current screen-wake request generation. The tray agent compares this
+    /// across polls and wakes the display when it increments.
+    pub fn wake_generation(&self) -> u64 {
+        self.wake_generation.load(Ordering::SeqCst)
+    }
+
+    /// Request a screen wake. Bumps [`Self::wake_generation`] unless another
+    /// request landed within `WAKE_DEBOUNCE_MS`. Cheap and lock-free so it can be
+    /// called on every client connect; the actual unblank happens out-of-process
+    /// in the in-session tray agent.
+    pub fn request_wake(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_wake_request_ms.load(Ordering::SeqCst);
+        if last != 0 && now.saturating_sub(last) < WAKE_DEBOUNCE_MS {
+            return;
+        }
+        self.last_wake_request_ms.store(now, Ordering::SeqCst);
+        self.wake_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Returns the server authentication token.
