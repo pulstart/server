@@ -57,14 +57,21 @@ const WARP_EXIT_STREAK: u32 = 2;
 /// comparison is local; the verdict (`app_grab`) ships to the client as a
 /// relative-capture trigger independent of cursor visibility.
 ///
-/// Gated by `ST_WARP_DETECT` until live-validated (`0`/`false`/`no`/`off`
-/// disables; verdict then stays false). Conservative thresholds + hysteresis
-/// keep desktop false-positives rare; the failure mode (a wrongly-grabbed
-/// desktop pointer) is recoverable via the client's force-release and this
-/// escape hatch. Position-less backends (NVIDIA legacy cursor reports no
-/// CRTC_X/Y) never feed `observe_cursor`, so the detector stays inert there.
+/// **Opt-in** via `ST_WARP_DETECT=1` (`true`/`yes`/`on`); off by default until
+/// live-validated. The divergence metric cannot distinguish a real warp from a
+/// backend that simply reports a static/unavailable cursor position (e.g. KMS
+/// drivers with no CRTC_X/Y) — both look like "captured doesn't follow
+/// commanded" — so an unguarded detector hides the *desktop* cursor on such a
+/// backend. Guard: `position_trusted` requires first observing the captured
+/// cursor actually track commanded motion (a converging window) before any
+/// `app_grab=true` is allowed. A backend that never tracks is never trusted and
+/// never grabs. Recoverable regardless via the client's force-release.
 struct WarpDetector {
     enabled: bool,
+    /// Set once the captured cursor has been seen to follow commanded motion (a
+    /// converging window). Until then no warp verdict is allowed — this is what
+    /// stops a position-unreliable backend from hiding the desktop cursor.
+    position_trusted: bool,
     /// Virtual position we have commanded the cursor to (stream coords): set
     /// absolutely by MouseAbsolute, accumulated by MouseRelative. Anchored to the
     /// first observed real cursor position.
@@ -81,6 +88,7 @@ impl WarpDetector {
     fn new() -> Self {
         Self {
             enabled: warp_detect_enabled(),
+            position_trusted: false,
             commanded: None,
             window_commanded_start: None,
             window_captured_start: None,
@@ -92,8 +100,9 @@ impl WarpDetector {
     }
 
     /// Drop all accumulated state (controller change, backend refresh, cursor
-    /// reset). Keeps `enabled`; clears the verdict.
+    /// reset). Keeps `enabled`; clears the verdict and the position-trust latch.
     fn reset(&mut self) {
+        self.position_trusted = false;
         self.commanded = None;
         self.window_commanded_start = None;
         self.window_captured_start = None;
@@ -149,10 +158,16 @@ impl WarpDetector {
             if cap_net * WARP_CONVERGE_DEN < cmd_net * WARP_CONVERGE_NUM {
                 self.diverge_streak += 1;
                 self.converge_streak = 0;
-                if self.diverge_streak >= WARP_ENTER_STREAK {
+                // Only grab once the position source has proven itself by
+                // tracking at least once. A backend that reports a static or
+                // unavailable cursor position diverges forever but is never
+                // trusted, so it can never hide the desktop cursor.
+                if self.position_trusted && self.diverge_streak >= WARP_ENTER_STREAK {
                     self.app_grab = true;
                 }
             } else {
+                // Captured tracked commanded: the position source is live.
+                self.position_trusted = true;
                 self.converge_streak += 1;
                 self.diverge_streak = 0;
                 if self.converge_streak >= WARP_EXIT_STREAK {
@@ -172,14 +187,15 @@ impl WarpDetector {
     }
 }
 
-/// `ST_WARP_DETECT` escape hatch: default-on, disabled by `0`/`false`/`no`/`off`.
+/// `ST_WARP_DETECT`: **opt-in** (off by default until live-validated). Enabled by
+/// `1`/`true`/`yes`/`on`; anything else (incl. unset) keeps it off.
 fn warp_detect_enabled() -> bool {
     match std::env::var("ST_WARP_DETECT") {
-        Ok(v) => !matches!(
+        Ok(v) => matches!(
             v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
+            "1" | "true" | "yes" | "on"
         ),
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -3145,27 +3161,59 @@ mod tests {
         assert!(!w.app_grab);
     }
 
+    /// Drive converging windows (captured tracks commanded 1:1) until the
+    /// detector trusts the position source. Returns the next position cursor.
+    fn establish_trust(w: &mut WarpDetector, start: i64) -> i64 {
+        let mut p = start;
+        for _ in 0..(WARP_WINDOW_SAMPLES * WARP_EXIT_STREAK) {
+            p += 60;
+            w.observe_command_absolute(p, 0);
+            w.observe_cursor(p as i32, 0);
+        }
+        assert!(w.position_trusted, "tracking cursor must establish trust");
+        assert!(!w.app_grab);
+        p
+    }
+
     #[test]
-    fn warp_detector_enters_then_exits() {
+    fn warp_detector_untrusted_position_never_grabs() {
+        // Backend reports a static / unavailable cursor position: the client
+        // commands the cursor all over the desktop but the captured position
+        // never moves. Without trust this looks like a warp — it must NOT grab,
+        // or the desktop cursor would vanish. (The live regression guard.)
         let mut w = enabled_warp();
-        // Diverge: client keeps commanding the cursor across the screen while the
-        // captured cursor is pinned (warp-to-centre / raw-input park).
         let mut cx = 0i64;
-        for _ in 0..(WARP_WINDOW_SAMPLES * WARP_ENTER_STREAK) {
+        for _ in 0..(WARP_WINDOW_SAMPLES * (WARP_ENTER_STREAK + 5)) {
             cx += 60;
             w.observe_command_absolute(cx, 0);
             w.observe_cursor(500, 500);
         }
-        assert!(w.app_grab, "sustained divergence must grab");
+        assert!(!w.position_trusted);
+        assert!(!w.app_grab, "untrusted position must never grab");
+    }
 
-        // Converge: the app released — the captured cursor now tracks the
-        // commanded motion 1:1.
-        let mut pos = 500i64;
+    #[test]
+    fn warp_detector_enters_then_exits() {
+        let mut w = enabled_warp();
+        let mut cx = establish_trust(&mut w, 0);
+        let pin = cx; // captured parks here while the client keeps commanding
+
+        // Diverge: client commands the cursor across the screen, captured pinned
+        // (warp-to-centre / raw-input park).
+        for _ in 0..(WARP_WINDOW_SAMPLES * WARP_ENTER_STREAK) {
+            cx += 60;
+            w.observe_command_absolute(cx, 0);
+            w.observe_cursor(pin as i32, 0);
+        }
+        assert!(w.app_grab, "sustained divergence must grab once trusted");
+
+        // Converge: the app released — the captured cursor tracks again.
+        let mut pos = pin;
         for _ in 0..(WARP_WINDOW_SAMPLES * WARP_EXIT_STREAK) {
             cx += 60;
             pos += 60;
             w.observe_command_absolute(cx, 0);
-            w.observe_cursor(pos as i32, 500);
+            w.observe_cursor(pos as i32, 0);
         }
         assert!(!w.app_grab, "tracking cursor must release");
     }
@@ -3173,11 +3221,12 @@ mod tests {
     #[test]
     fn warp_detector_holds_verdict_while_idle() {
         let mut w = enabled_warp();
-        let mut cx = 0i64;
+        let mut cx = establish_trust(&mut w, 0);
+        let pin = cx;
         for _ in 0..(WARP_WINDOW_SAMPLES * WARP_ENTER_STREAK) {
             cx += 60;
             w.observe_command_absolute(cx, 0);
-            w.observe_cursor(500, 500);
+            w.observe_cursor(pin as i32, 0);
         }
         assert!(w.app_grab);
         // Idle: barely any commanded motion. The verdict must not flip on its own
@@ -3186,7 +3235,7 @@ mod tests {
         for _ in 0..(WARP_WINDOW_SAMPLES * 4) {
             cx += 2;
             w.observe_command_absolute(cx, 0);
-            w.observe_cursor(500, 500);
+            w.observe_cursor(pin as i32, 0);
         }
         assert!(w.app_grab, "idle must hold the existing verdict");
     }
