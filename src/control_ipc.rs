@@ -94,6 +94,7 @@ enum Req {
     BeginUpdateInstall,
     RequestShutdown,
     RequestDisconnect(usize),
+    SetGameMode(bool),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -240,6 +241,10 @@ fn handle_request(
             Resp::Ack
         }
         Req::RequestDisconnect(id) => Resp::Bool(control.request_disconnect(id)),
+        Req::SetGameMode(on) => {
+            control.set_session_game_mode(on);
+            Resp::Ack
+        }
     }
 }
 
@@ -366,6 +371,10 @@ impl IpcClient {
 
     pub fn set_allow_new_connections(&mut self, allow: bool) -> io::Result<()> {
         self.expect_ack(Req::SetAllowNewConnections(allow))
+    }
+
+    pub fn set_game_mode(&mut self, on: bool) -> io::Result<()> {
+        self.expect_ack(Req::SetGameMode(on))
     }
 
     pub fn set_forced_codec(&mut self, codec: u8) -> io::Result<()> {

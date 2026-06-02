@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
-    atomic::{AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 #[cfg(target_os = "windows")]
@@ -219,6 +219,12 @@ use crate::capture::CapturedCursor;
 pub struct InputRuntime {
     next_client_id: AtomicU32,
     active_controller_id: AtomicU32,
+    /// Session-sourced "game mode" hint: the in-session tray agent detected a
+    /// fullscreen game-class window focused (compositor query — root can't see
+    /// the session) and pushed it over the control socket. ORed into
+    /// `CursorState.app_grab` so the client enters relative capture. Works where
+    /// the warp detector can't (e.g. NVIDIA, no cursor-position readback).
+    game_mode: AtomicBool,
     inner: Mutex<InputRuntimeInner>,
     /// Per-client UDP media-destination cells (B3 return-path relearn). The
     /// transport thread for each client watches its cell and repoints its send
@@ -432,6 +438,7 @@ impl InputRuntime {
         Arc::new(Self {
             next_client_id: AtomicU32::new(1),
             active_controller_id: AtomicU32::new(0),
+            game_mode: AtomicBool::new(false),
             inner: Mutex::new(InputRuntimeInner {
                 backend: InputBackend::Unavailable,
                 backend_label: "unavailable".to_string(),
@@ -665,6 +672,24 @@ impl InputRuntime {
         self.set_active_controller(None);
     }
 
+    /// Set the session-sourced game-mode hint (pushed by the in-session tray
+    /// agent when a fullscreen game-class window is focused). ORed into
+    /// `CursorState.app_grab`. Forces an immediate cursor-state republish on a
+    /// real change, because a game that hides its cursor produces no capture
+    /// frames to recompute `app_grab` on (KMS returns no cursor framebuffer).
+    pub fn set_game_mode(&self, on: bool) {
+        if self.game_mode.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let desired = on || inner.warp.app_grab;
+        if inner.cursor_state.app_grab != desired {
+            inner.cursor_state.app_grab = desired;
+            inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+            eprintln!("[input] session game_mode={on} → app_grab={desired}");
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     pub fn update_cursor(&self, cursor: Option<&CapturedCursor>) {
         let Ok(mut inner) = self.inner.try_lock() else {
@@ -792,8 +817,10 @@ impl InputRuntime {
         let cursor_y = cursor.y + crop_dy as i32;
         // Feed the real on-screen position to the warp detector: if the client
         // keeps commanding the cursor but this position does not follow, the app
-        // is doing mouselook without hiding the cursor → app_grab.
-        let app_grab = inner.warp.observe_cursor(cursor_x, cursor_y);
+        // is doing mouselook without hiding the cursor → app_grab. ORed with the
+        // session-sourced game-mode hint (tray detected a fullscreen game).
+        let app_grab =
+            inner.warp.observe_cursor(cursor_x, cursor_y) || self.game_mode.load(Ordering::Relaxed);
         let next_state = CursorState {
             serial,
             x: cursor_x,

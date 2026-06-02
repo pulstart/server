@@ -238,6 +238,12 @@ pub struct ServerControl {
     wake_generation: AtomicU64,
     /// Wall-clock millis of the last wake bump, for `WAKE_DEBOUNCE_MS`.
     last_wake_request_ms: AtomicU64,
+    /// Sink for the session game-mode hint. The in-session tray agent pushes
+    /// game-mode over the control socket (or directly in per-user mode); the
+    /// service registers a hook here that forwards to `InputRuntime`. `None` when
+    /// no input runtime is wired (tests / IPC-only paths) — then it's a no-op.
+    #[allow(clippy::type_complexity)]
+    game_mode_hook: Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>,
 }
 
 impl ServerControl {
@@ -263,6 +269,7 @@ impl ServerControl {
             peer_id,
             wake_generation: AtomicU64::new(0),
             last_wake_request_ms: AtomicU64::new(0),
+            game_mode_hook: Mutex::new(None),
         })
     }
 
@@ -287,6 +294,21 @@ impl ServerControl {
         }
         self.last_wake_request_ms.store(now, Ordering::SeqCst);
         self.wake_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Register the sink that applies the session game-mode hint (wired to
+    /// `InputRuntime::set_game_mode` during setup). Called once.
+    pub fn set_game_mode_hook(&self, hook: Box<dyn Fn(bool) + Send + Sync>) {
+        *self.game_mode_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Apply a session game-mode hint (from the in-session tray agent, via the
+    /// control socket in system mode or directly in per-user mode). Forwards to
+    /// the registered hook; a no-op if none is wired.
+    pub fn set_session_game_mode(&self, on: bool) {
+        if let Some(hook) = self.game_mode_hook.lock().unwrap().as_ref() {
+            hook(on);
+        }
     }
 
     /// Returns the server authentication token.

@@ -27,6 +27,8 @@ mod encode_vt;
 #[cfg(target_os = "windows")]
 mod encode_win;
 mod file_transfer;
+#[cfg(target_os = "linux")]
+mod game_mode;
 mod input;
 #[cfg(target_os = "linux")]
 mod linux_uring;
@@ -4471,6 +4473,13 @@ fn main() {
 
     let tunnel_state = Some(Arc::new(api_client::ApiTunnelState::new()));
     let state = build_server_state(Arc::clone(&control), listen_port, tunnel_state.clone());
+
+    // Wire the session game-mode hint (tray agent → control socket → here) to the
+    // input runtime, which ORs it into CursorState.app_grab.
+    control.set_game_mode_hook(Box::new({
+        let input = Arc::clone(&state.input);
+        move |on| input.set_game_mode(on)
+    }));
 
     // System-wide mode: no tray in this process. Host the control socket so a
     // per-user `st-server --tray` agent can drive it, then run headless.

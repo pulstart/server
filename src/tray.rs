@@ -183,6 +183,15 @@ fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
     let mut last_wake_gen = control.wake_generation();
     let wake_in_progress = Arc::new(AtomicBool::new(false));
 
+    // Session game-mode detector: this agent lives in the user's graphical
+    // session, so it can ask the compositor whether a fullscreen game is focused
+    // and push that to the service (→ CursorState.app_grab → relative capture).
+    // Held for the tray's lifetime; dropping it stops the worker.
+    let _game_mode = crate::game_mode::start(Arc::new({
+        let control = control.clone();
+        move |on| control.set_game_mode(on)
+    }));
+
     let quit = Arc::new(AtomicBool::new(false));
     let handle = LinuxTray {
         control: control.clone(),
@@ -349,6 +358,15 @@ impl ControlHandle {
         match self {
             ControlHandle::Local { control, .. } => control.set_allow_new_connections(allow),
             ControlHandle::Remote(r) => r.with_client(|c| c.set_allow_new_connections(allow)),
+        }
+    }
+
+    /// Push a session game-mode hint (from the in-session detector) to the
+    /// service: directly in per-user mode, over the control socket in system mode.
+    fn set_game_mode(&self, on: bool) {
+        match self {
+            ControlHandle::Local { control, .. } => control.set_session_game_mode(on),
+            ControlHandle::Remote(r) => r.with_client(|c| c.set_game_mode(on)),
         }
     }
 
