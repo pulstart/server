@@ -138,6 +138,9 @@ type FnGraphicsResourceGetMappedEglFrame =
 type FnGraphicsUnregisterResource = unsafe extern "C" fn(CUgraphicsResource) -> CUresult;
 type FnMemcpy2D = unsafe extern "C" fn(*const CudaMemcpy2D) -> CUresult;
 type FnCtxSynchronize = unsafe extern "C" fn() -> CUresult;
+type FnMemAllocPitch =
+    unsafe extern "C" fn(*mut CUdeviceptr, *mut usize, usize, usize, u32) -> CUresult;
+type FnMemFree = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 
 struct CudaLib {
     _lib: Library,
@@ -148,6 +151,13 @@ struct CudaLib {
     unregister: FnGraphicsUnregisterResource,
     memcpy2d: FnMemcpy2D,
     ctx_sync: FnCtxSynchronize,
+    // Validated foundation for the GL→CUDA stabiliser readback-elimination path
+    // (exercised by tests via test_alloc_blue / make_frame_from_cuda_buffer);
+    // wired into the live capture pipeline in the follow-up stage.
+    #[allow(dead_code)]
+    mem_alloc_pitch: FnMemAllocPitch,
+    #[allow(dead_code)]
+    mem_free: FnMemFree,
 }
 
 impl CudaLib {
@@ -179,6 +189,8 @@ impl CudaLib {
                 sym::<FnGraphicsUnregisterResource>(&lib, b"cuGraphicsUnregisterResource\0")?;
             let memcpy2d = sym::<FnMemcpy2D>(&lib, b"cuMemcpy2D_v2\0")?;
             let ctx_sync = sym::<FnCtxSynchronize>(&lib, b"cuCtxSynchronize\0")?;
+            let mem_alloc_pitch = sym::<FnMemAllocPitch>(&lib, b"cuMemAllocPitch_v2\0")?;
+            let mem_free = sym::<FnMemFree>(&lib, b"cuMemFree_v2\0")?;
             Ok(Self {
                 _lib: lib,
                 ctx_push,
@@ -188,6 +200,8 @@ impl CudaLib {
                 unregister,
                 memcpy2d,
                 ctx_sync,
+                mem_alloc_pitch,
+                mem_free,
             })
         }
     }
@@ -465,6 +479,112 @@ impl CudaZeroCopy {
             unsafe { ffi::av_frame_free(&mut { frame }) };
         }
         self.track(result)
+    }
+
+    /// Wrap an external CUDA device buffer (BGRA, in the same primary context)
+    /// into an NVENC pool frame via a device→device copy. The buffer is produced
+    /// by the KMS stabiliser's GL→CUDA path on the capture thread; because both
+    /// it and NVENC share the device's primary context, the pointer is valid
+    /// here on the encode thread. Validated foundation, wired into the live
+    /// pipeline in the follow-up stage.
+    #[allow(dead_code)]
+    pub fn make_frame_from_cuda_buffer(
+        &mut self,
+        device_ptr: u64,
+        src_pitch: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<*mut ffi::AVFrame, String> {
+        let frame = self.alloc_pool_frame()?;
+        let dst_device = unsafe { (*frame).data[0] } as CUdeviceptr;
+        let dst_pitch = unsafe { (*frame).linesize[0] } as usize;
+
+        let copy = CudaMemcpy2D {
+            src_x_in_bytes: 0,
+            src_y: 0,
+            src_memory_type: CU_MEMORYTYPE_DEVICE,
+            src_host: std::ptr::null(),
+            src_device: device_ptr,
+            src_array: std::ptr::null_mut(),
+            src_pitch: src_pitch as usize,
+            dst_x_in_bytes: 0,
+            dst_y: 0,
+            dst_memory_type: CU_MEMORYTYPE_DEVICE,
+            dst_host: std::ptr::null_mut(),
+            dst_device,
+            dst_array: std::ptr::null_mut(),
+            dst_pitch,
+            width_in_bytes: width as usize * 4,
+            height: height as usize,
+        };
+        let result = self.run_copy(&copy).map(|()| frame);
+        if result.is_err() {
+            unsafe { ffi::av_frame_free(&mut { frame }) };
+        }
+        self.track(result)
+    }
+
+    /// Test-only: allocate a pitched device buffer in the shared primary context
+    /// and fill it with solid-blue BGRA, simulating what the stabiliser's GL→CUDA
+    /// path will hand the encoder. Returns `(device_ptr, pitch)`.
+    #[cfg(test)]
+    pub(crate) fn test_alloc_blue(&self, width: u32, height: u32) -> Result<(u64, u32), String> {
+        unsafe {
+            self.push_ctx()?;
+            let mut ptr: CUdeviceptr = 0;
+            let mut pitch: usize = 0;
+            let r = (self.cuda.mem_alloc_pitch)(
+                &mut ptr,
+                &mut pitch,
+                width as usize * 4,
+                height as usize,
+                16,
+            );
+            if r != CUDA_SUCCESS {
+                self.pop_ctx();
+                return Err(format!("cuMemAllocPitch failed ({r})"));
+            }
+            let mut host = vec![0u8; width as usize * 4 * height as usize];
+            for px in host.chunks_exact_mut(4) {
+                px[0] = 255; // B
+                px[3] = 255; // A
+            }
+            let copy = CudaMemcpy2D {
+                src_x_in_bytes: 0,
+                src_y: 0,
+                src_memory_type: CU_MEMORYTYPE_HOST,
+                src_host: host.as_ptr() as *const c_void,
+                src_device: 0,
+                src_array: std::ptr::null_mut(),
+                src_pitch: width as usize * 4,
+                dst_x_in_bytes: 0,
+                dst_y: 0,
+                dst_memory_type: CU_MEMORYTYPE_DEVICE,
+                dst_host: std::ptr::null_mut(),
+                dst_device: ptr,
+                dst_array: std::ptr::null_mut(),
+                dst_pitch: pitch,
+                width_in_bytes: width as usize * 4,
+                height: height as usize,
+            };
+            let r = (self.cuda.memcpy2d)(&copy);
+            let s = (self.cuda.ctx_sync)();
+            self.pop_ctx();
+            if r != CUDA_SUCCESS || s != CUDA_SUCCESS {
+                return Err(format!("fill blue failed (copy {r}, sync {s})"));
+            }
+            Ok((ptr, pitch as u32))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_free(&self, device_ptr: u64) {
+        unsafe {
+            if self.push_ctx().is_ok() {
+                let _ = (self.cuda.mem_free)(device_ptr);
+                self.pop_ctx();
+            }
+        }
     }
 
     /// Allocate one frame from the CUDA pool (`data[0]` = pitched CUdeviceptr).
@@ -799,13 +919,19 @@ fn setup_egl(
 /// (`ffmpeg-sys-next` does not bind that struct), which is stable public ABI.
 fn create_cuda_device() -> Result<(*mut ffi::AVBufferRef, CUcontext), String> {
     unsafe {
+        // AV_CUDA_USE_PRIMARY_CONTEXT: bind FFmpeg's NVENC to the device's CUDA
+        // *primary* context. The KMS stabiliser independently
+        // `cuDevicePrimaryCtxRetain`s the same context, so a GPU buffer it fills
+        // there (capture thread) is a valid device pointer in NVENC (encode
+        // thread) — the basis of the future GL→CUDA readback-elimination path.
+        const AV_CUDA_USE_PRIMARY_CONTEXT: i32 = 1;
         let mut device_ref: *mut ffi::AVBufferRef = std::ptr::null_mut();
         let ret = ffi::av_hwdevice_ctx_create(
             &mut device_ref,
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
             std::ptr::null(),
             std::ptr::null_mut(),
-            0,
+            AV_CUDA_USE_PRIMARY_CONTEXT,
         );
         if ret < 0 {
             return Err(format!(
@@ -1029,6 +1155,49 @@ mod tests {
         assert!(
             b as i32 > r as i32 + 40 && b as i32 > g as i32 + 40,
             "expected blue-dominant pixel, got B={b} G={g} R={r} (matrix or byte-order error?)"
+        );
+    }
+
+    /// Stage-1 proof for the GL→CUDA readback-elimination path: an external CUDA
+    /// device buffer (allocated outside FFmpeg's pool, in the shared *primary*
+    /// context — exactly what the stabiliser will produce) encodes through NVENC
+    /// and decodes back colour-correct. Validates the primary-context sharing
+    /// model and `make_frame_from_cuda_buffer` before the pipeline integration.
+    #[test]
+    fn nvenc_cuda_encodes_external_device_buffer() {
+        if !live_enabled() {
+            return;
+        }
+        use crate::encode::NvencEncoder;
+        use crate::encode_config::{Codec, EncoderConfig};
+
+        let (w, h) = (320u32, 240u32);
+        let config = EncoderConfig::from_env_with_framerate_and_codec(w, h, 60, Codec::H264);
+        let mut enc = NvencEncoder::with_config(&config).expect("nvenc encoder");
+        assert!(enc.cuda_active(), "CUDA path should be active");
+
+        let (ptr, pitch) = enc
+            .cuda_test_alloc_blue(w, h)
+            .expect("alloc blue device buffer in primary context");
+        enc.reset_for_keyframe();
+        let mut nals = Vec::new();
+        for _ in 0..3 {
+            nals.extend(
+                enc.encode_cuda_buffer(ptr, pitch, w, h)
+                    .expect("encode external buffer")
+                    .into_iter()
+                    .map(|u| u.data),
+            );
+        }
+        nals.extend(enc.flush().into_iter().map(|u| u.data));
+        enc.cuda_test_free(ptr);
+
+        let bitstream: Vec<u8> = nals.concat();
+        let (b, g, r) = decode_center_bgr(&bitstream, w, h).expect("decode centre pixel");
+        eprintln!("[test] external-buffer decoded centre BGR = ({b},{g},{r})");
+        assert!(
+            b as i32 > r as i32 + 40 && b as i32 > g as i32 + 40,
+            "external CUDA buffer should encode blue-dominant, got B={b} G={g} R={r}"
         );
     }
 

@@ -500,6 +500,15 @@ impl NvencEncoder {
             }
         };
 
+        unsafe { self.send_owned_cuda_frame(frame_ptr) }
+    }
+
+    /// Stamp pts/colorspace/keyframe onto an owned CUDA `AVFrame`, send it to
+    /// NVENC, and free it. Shared by the live encode path and tests.
+    unsafe fn send_owned_cuda_frame(
+        &mut self,
+        frame_ptr: *mut ffi::AVFrame,
+    ) -> Result<Vec<EncodedUnit>, String> {
         unsafe {
             (*frame_ptr).pts = self.frame_index;
             self.frame_index += 1;
@@ -514,6 +523,41 @@ impl NvencEncoder {
             ffi::av_frame_free(&mut { frame_ptr });
             result
         }
+    }
+
+    /// Test-only: allocate a solid-blue device buffer in the shared primary
+    /// context (as the stabiliser GL→CUDA path will) and return `(ptr, pitch)`.
+    #[cfg(test)]
+    pub(crate) fn cuda_test_alloc_blue(&self, w: u32, h: u32) -> Result<(u64, u32), String> {
+        self.cuda
+            .as_ref()
+            .ok_or("cuda path not active")?
+            .test_alloc_blue(w, h)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cuda_test_free(&self, ptr: u64) {
+        if let Some(cuda) = self.cuda.as_ref() {
+            cuda.test_free(ptr);
+        }
+    }
+
+    /// Test-only: encode a frame sourced from an external CUDA device buffer,
+    /// exercising the exact path the stabiliser GL→CUDA output will take.
+    #[cfg(test)]
+    pub(crate) fn encode_cuda_buffer(
+        &mut self,
+        ptr: u64,
+        pitch: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<EncodedUnit>, String> {
+        let frame_ptr = self
+            .cuda
+            .as_mut()
+            .ok_or("cuda path not active")?
+            .make_frame_from_cuda_buffer(ptr, pitch, w, h)?;
+        unsafe { self.send_owned_cuda_frame(frame_ptr) }
     }
 
     unsafe fn send_and_receive(
