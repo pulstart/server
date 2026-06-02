@@ -19,17 +19,131 @@ use std::ptr;
 
 pub struct NvencEncoder {
     codec_ctx: *mut ffi::AVCodecContext,
-    scaler: scaling::Context,
     colorspace: Colorspace,
     frame_index: i64,
     force_keyframe_next: bool,
     width: u32,
     height: u32,
+    /// CPU read-back + `swscale` BGRA→NV12 scratch. `Some` unless the CUDA
+    /// zero-copy path took over (then conversion happens on the GPU in NVENC).
+    cpu: Option<CpuConvert>,
+    /// Zero-copy DMA-BUF path (EGL→CUDA→NVENC CUDA frames). `Some` only when
+    /// enabled (`ST_NVENC_CUDA` != 0), SDR/non-444, and validated end-to-end.
+    /// Boxed so it doesn't bloat the per-frame `EncoderKind` dispatch enum.
+    cuda: Option<Box<crate::encode_cuda::CudaZeroCopy>>,
+}
+
+/// CPU colour-convert scratch for the fallback (non-CUDA) NVENC path.
+struct CpuConvert {
+    scaler: scaling::Context,
     nv12_frame: VideoFrame,
     bgra_frame: VideoFrame,
+    width: u32,
+    height: u32,
 }
 
 unsafe impl Send for NvencEncoder {}
+
+impl CpuConvert {
+    /// Copy RAM pixel data into the pre-allocated BGRA frame.
+    fn fill_bgra_from_slice(&mut self, data: &[u8]) {
+        let dst_stride = self.bgra_frame.stride(0);
+        let src_stride = (self.width as usize) * 4;
+
+        if dst_stride == src_stride {
+            let total = src_stride * self.height as usize;
+            let usable = data.len().min(total);
+            self.bgra_frame.data_mut(0)[..usable].copy_from_slice(&data[..usable]);
+        } else {
+            for row in 0..self.height as usize {
+                let src_start = row * src_stride;
+                let src_end = src_start + src_stride;
+                let dst_start = row * dst_stride;
+                if src_end <= data.len() {
+                    self.bgra_frame.data_mut(0)[dst_start..dst_start + src_stride]
+                        .copy_from_slice(&data[src_start..src_end]);
+                }
+            }
+        }
+    }
+
+    /// Read DMA-BUF pixels directly into the pre-allocated BGRA frame via mmap.
+    /// Eliminates the intermediate Vec allocation that readback_dmabuf() creates.
+    fn fill_bgra_from_dmabuf(
+        &mut self,
+        planes: &[DmaBufPlane],
+        _drm_format: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+
+        if planes.is_empty() {
+            return Err("DMA-BUF has no planes".into());
+        }
+
+        let plane = &planes[0];
+        let pitch = plane.pitch as usize;
+        let row_bytes = (width as usize) * 4;
+        let total_size = plane.offset as usize + pitch * height as usize;
+
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total_size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                plane.fd.as_raw_fd(),
+                0,
+            )
+        };
+
+        if mapped == libc::MAP_FAILED {
+            return Err(format!(
+                "mmap DMA-BUF failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        // DMA-BUF sync: start CPU read
+        let sync_start: u64 = 5; // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+        let sync_end: u64 = 2 | 4; // DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
+
+        nix::ioctl_write_ptr_bad!(dma_buf_sync, 0x4008_6200u64, u64);
+
+        unsafe {
+            let _ = dma_buf_sync(plane.fd.as_raw_fd(), &sync_start);
+        }
+
+        // Copy directly from mmap'd buffer into pre-allocated BGRA frame
+        let src = (mapped as *const u8).wrapping_add(plane.offset as usize);
+        let dst_stride = self.bgra_frame.stride(0);
+
+        if pitch == dst_stride {
+            // Fast path: strides match exactly
+            let total = dst_stride * height as usize;
+            let src_slice = unsafe { std::slice::from_raw_parts(src, total) };
+            self.bgra_frame.data_mut(0)[..total].copy_from_slice(src_slice);
+        } else {
+            // Row-by-row copy handling stride differences
+            for row in 0..height as usize {
+                let src_row =
+                    unsafe { std::slice::from_raw_parts(src.add(row * pitch), row_bytes) };
+                let dst_start = row * dst_stride;
+                self.bgra_frame.data_mut(0)[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(src_row);
+            }
+        }
+
+        // End CPU read and unmap
+        unsafe {
+            let _ = dma_buf_sync(plane.fd.as_raw_fd(), &sync_end);
+            libc::munmap(mapped, total_size);
+        }
+
+        Ok(())
+    }
+}
 
 impl NvencEncoder {
     /// Create an NVENC encoder with the given configuration.
@@ -63,10 +177,35 @@ impl NvencEncoder {
             colorspace.sw_pixel_format()
         };
 
+        // Default-on zero-copy: import the captured DMA-BUF straight into a CUDA
+        // frame and let NVENC convert on the GPU (no CPU read-back/swscale). Only
+        // for 8-bit SDR/non-444 BGRA (the `sw_format = BGR0` NVENC input path);
+        // HDR/YUV444 stay on the CPU path. Any init/validation failure → CPU path.
+        let cuda = if !config.is_hdr()
+            && !config.is_yuv444()
+            && crate::encode_cuda::cuda_zero_copy_enabled()
+        {
+            match crate::encode_cuda::CudaZeroCopy::new(config.width, config.height) {
+                Ok(zc) => Some(Box::new(zc)),
+                Err(e) => {
+                    eprintln!("[nvenc-cuda] zero-copy unavailable, using CPU path: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         unsafe {
             (*ctx).width = config.width as i32;
             (*ctx).height = config.height as i32;
-            (*ctx).pix_fmt = sw_pix_fmt;
+            if let Some(zc) = cuda.as_ref() {
+                // NVENC reads BGR0 CUDA frames from VRAM and converts to NV12.
+                (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
+                (*ctx).hw_frames_ctx = ffi::av_buffer_ref(zc.frames_ctx_ref());
+            } else {
+                (*ctx).pix_fmt = sw_pix_fmt;
+            }
             (*ctx).time_base = ffi::AVRational {
                 num: 1,
                 den: config.framerate as i32,
@@ -235,75 +374,97 @@ impl NvencEncoder {
             ));
         }
 
+        let path_note = match cuda.as_ref() {
+            Some(zc) if zc.dmabuf_import_active() => {
+                "CUDA GPU convert; DMA-BUF imported zero-copy, RAM frames uploaded direct (no CPU swscale)"
+            }
+            Some(_) => {
+                "CUDA GPU convert; RAM frames uploaded to VRAM (no CPU swscale); DMA-BUF → CPU fallback"
+            }
+            None => "CPU readback (mmap + swscale)",
+        };
         println!(
-            "[nvenc] {codec_name} encoder opened ({}x{}, {}kbps, {}fps) — NOTE: DMA-BUF frames use CPU readback (mmap + swscale)",
+            "[nvenc] {codec_name} encoder opened ({}x{}, {}kbps, {}fps) — {path_note}",
             config.width, config.height, config.bitrate_kbps, config.framerate
         );
 
-        // BGRA → encoder software surface scaler
-        let dst_pixel = if config.is_yuv444() {
-            Pixel::YUV444P
-        } else if config.is_hdr() {
-            Pixel::P010LE
+        // CPU BGRA → encoder-surface scaler. Only built for the fallback path;
+        // in CUDA mode NVENC converts BGR0→NV12 on the GPU, so this full-res
+        // scratch is never allocated.
+        let cpu = if cuda.is_none() {
+            let dst_pixel = if config.is_yuv444() {
+                Pixel::YUV444P
+            } else if config.is_hdr() {
+                Pixel::P010LE
+            } else {
+                Pixel::NV12
+            };
+
+            let scaler = scaling::Context::get(
+                Pixel::BGRA,
+                config.width,
+                config.height,
+                dst_pixel,
+                config.width,
+                config.height,
+                scaling::Flags::FAST_BILINEAR,
+            )
+            .map_err(|e| format!("scaler: {e}"))?;
+
+            Some(CpuConvert {
+                scaler,
+                nv12_frame: VideoFrame::new(dst_pixel, config.width, config.height),
+                bgra_frame: VideoFrame::new(Pixel::BGRA, config.width, config.height),
+                width: config.width,
+                height: config.height,
+            })
         } else {
-            Pixel::NV12
+            None
         };
-
-        let scaler = scaling::Context::get(
-            Pixel::BGRA,
-            config.width,
-            config.height,
-            dst_pixel,
-            config.width,
-            config.height,
-            scaling::Flags::FAST_BILINEAR,
-        )
-        .map_err(|e| format!("scaler: {e}"))?;
-
-        let nv12_frame = VideoFrame::new(dst_pixel, config.width, config.height);
-        let bgra_frame = VideoFrame::new(Pixel::BGRA, config.width, config.height);
 
         Ok(Self {
             codec_ctx: ctx,
-            scaler,
             colorspace,
             frame_index: 0,
             force_keyframe_next: false,
             width: config.width,
             height: config.height,
-            nv12_frame,
-            bgra_frame,
+            cpu,
+            cuda,
         })
     }
 
-    /// Encode a captured frame, returning NAL unit buffers.
-    /// Supports RAM frames natively. DMA-BUF frames are read back via mmap
-    /// directly into the pre-allocated BGRA frame (single copy, no intermediate Vec).
+    /// Encode a captured frame, returning NAL unit buffers. When the CUDA
+    /// zero-copy path is active the DMA-BUF is imported straight into VRAM and
+    /// NVENC converts on-GPU; otherwise the frame is read back and converted on
+    /// the CPU.
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
-        match &frame.data {
-            FrameData::Ram(data) => {
-                // RAM path: single memcpy into pre-allocated BGRA frame
-                self.fill_bgra_from_slice(data);
-            }
-            FrameData::DmaBuf {
-                planes, drm_format, ..
-            } => {
-                // DMA-BUF path: mmap directly into bgra_frame (avoids intermediate Vec).
-                self.fill_bgra_from_dmabuf(planes, *drm_format, frame.width, frame.height)?;
-            }
+        if self.cuda.is_some() {
+            return self.encode_cuda(frame);
         }
 
-        // Scale BGRA → NV12 (reuses both frames)
-        self.scaler
-            .run(&self.bgra_frame, &mut self.nv12_frame)
-            .map_err(|e| format!("scale: {e}"))?;
-
-        self.nv12_frame.set_pts(Some(self.frame_index));
+        // Fill the BGRA scratch and convert to the encoder surface (CPU path).
+        let frame_ptr = {
+            let cpu = self
+                .cpu
+                .as_mut()
+                .ok_or("nvenc: neither CUDA nor CPU path initialised")?;
+            match &frame.data {
+                FrameData::Ram(data) => cpu.fill_bgra_from_slice(data),
+                FrameData::DmaBuf {
+                    planes, drm_format, ..
+                } => cpu.fill_bgra_from_dmabuf(planes, *drm_format, frame.width, frame.height)?,
+            }
+            cpu.scaler
+                .run(&cpu.bgra_frame, &mut cpu.nv12_frame)
+                .map_err(|e| format!("scale: {e}"))?;
+            cpu.nv12_frame.set_pts(Some(self.frame_index));
+            unsafe { cpu.nv12_frame.as_mut_ptr() }
+        };
         self.frame_index += 1;
 
-        // Apply colorspace metadata and send to encoder
+        // Apply colorspace metadata and send to encoder.
         unsafe {
-            let frame_ptr = self.nv12_frame.as_mut_ptr();
             self.colorspace.apply_to_frame(frame_ptr);
             if self.force_keyframe_next {
                 (*frame_ptr).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
@@ -315,103 +476,44 @@ impl NvencEncoder {
         }
     }
 
-    /// Copy RAM pixel data into the pre-allocated BGRA frame.
-    fn fill_bgra_from_slice(&mut self, data: &[u8]) {
-        let dst_stride = self.bgra_frame.stride(0);
-        let src_stride = (self.width as usize) * 4;
-
-        if dst_stride == src_stride {
-            let total = src_stride * self.height as usize;
-            let usable = data.len().min(total);
-            self.bgra_frame.data_mut(0)[..usable].copy_from_slice(&data[..usable]);
-        } else {
-            for row in 0..self.height as usize {
-                let src_start = row * src_stride;
-                let src_end = src_start + src_stride;
-                let dst_start = row * dst_stride;
-                if src_end <= data.len() {
-                    self.bgra_frame.data_mut(0)[dst_start..dst_start + src_stride]
-                        .copy_from_slice(&data[src_start..src_end]);
-                }
+    /// CUDA zero-copy encode: import/upload into a CUDA pool frame and send it.
+    fn encode_cuda(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
+        let made = {
+            let cuda = self.cuda.as_mut().expect("cuda path present");
+            match &frame.data {
+                FrameData::Ram(data) => cuda.make_frame_from_ram(data, frame.width, frame.height),
+                FrameData::DmaBuf {
+                    planes, drm_format, ..
+                } => cuda.make_frame_from_dmabuf(planes, *drm_format, frame.width, frame.height),
             }
-        }
-    }
-
-    /// Read DMA-BUF pixels directly into the pre-allocated BGRA frame via mmap.
-    /// Eliminates the intermediate Vec allocation that readback_dmabuf() creates.
-    fn fill_bgra_from_dmabuf(
-        &mut self,
-        planes: &[DmaBufPlane],
-        _drm_format: u32,
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
-        use std::os::fd::AsRawFd;
-
-        if planes.is_empty() {
-            return Err("DMA-BUF has no planes".into());
-        }
-
-        let plane = &planes[0];
-        let pitch = plane.pitch as usize;
-        let row_bytes = (width as usize) * 4;
-        let total_size = plane.offset as usize + pitch * height as usize;
-
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total_size,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                plane.fd.as_raw_fd(),
-                0,
-            )
+        };
+        let frame_ptr = match made {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                // A run of failures trips the session latch (see CudaZeroCopy);
+                // once disabled, force an encoder rebuild onto the CPU path.
+                if !crate::encode_cuda::cuda_zero_copy_enabled() {
+                    return Err(format!("nvenc cuda path disabled mid-stream: {e}"));
+                }
+                // Transient single-frame failure: skip this frame, don't wedge.
+                return Ok(Vec::new());
+            }
         };
 
-        if mapped == libc::MAP_FAILED {
-            return Err(format!(
-                "mmap DMA-BUF failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        // DMA-BUF sync: start CPU read
-        let sync_start: u64 = 5; // DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
-        let sync_end: u64 = 2 | 4; // DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
-
-        nix::ioctl_write_ptr_bad!(dma_buf_sync, 0x4008_6200u64, u64);
-
         unsafe {
-            let _ = dma_buf_sync(plane.fd.as_raw_fd(), &sync_start);
-        }
-
-        // Copy directly from mmap'd buffer into pre-allocated BGRA frame
-        let src = (mapped as *const u8).wrapping_add(plane.offset as usize);
-        let dst_stride = self.bgra_frame.stride(0);
-
-        if pitch == dst_stride {
-            // Fast path: strides match exactly
-            let total = dst_stride * height as usize;
-            let src_slice = unsafe { std::slice::from_raw_parts(src, total) };
-            self.bgra_frame.data_mut(0)[..total].copy_from_slice(src_slice);
-        } else {
-            // Row-by-row copy handling stride differences
-            for row in 0..height as usize {
-                let src_row =
-                    unsafe { std::slice::from_raw_parts(src.add(row * pitch), row_bytes) };
-                let dst_start = row * dst_stride;
-                self.bgra_frame.data_mut(0)[dst_start..dst_start + row_bytes]
-                    .copy_from_slice(src_row);
+            (*frame_ptr).pts = self.frame_index;
+            self.frame_index += 1;
+            self.colorspace.apply_to_frame(frame_ptr);
+            if self.force_keyframe_next {
+                (*frame_ptr).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                self.force_keyframe_next = false;
+            } else {
+                (*frame_ptr).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
             }
+            let result = self.send_and_receive(frame_ptr);
+            ffi::av_frame_free(&mut { frame_ptr });
+            result
         }
-
-        // End CPU read and unmap
-        unsafe {
-            let _ = dma_buf_sync(plane.fd.as_raw_fd(), &sync_end);
-            libc::munmap(mapped, total_size);
-        }
-
-        Ok(())
     }
 
     unsafe fn send_and_receive(
@@ -451,6 +553,12 @@ impl NvencEncoder {
         ffi::av_packet_free(&mut { pkt });
 
         Ok(nals)
+    }
+
+    /// Whether the CUDA zero-copy path is active (test/diagnostics).
+    #[cfg(test)]
+    pub(crate) fn cuda_active(&self) -> bool {
+        self.cuda.is_some()
     }
 
     /// Reset the encoder so the next frame is an IDR keyframe.
@@ -519,7 +627,7 @@ impl Drop for NvencEncoder {
     }
 }
 
-fn ffmpeg_err(code: i32) -> String {
+pub(crate) fn ffmpeg_err(code: i32) -> String {
     let mut buf = [0u8; 256];
     unsafe {
         ffi::av_strerror(code, buf.as_mut_ptr() as *mut i8, buf.len());

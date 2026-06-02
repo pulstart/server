@@ -16,6 +16,8 @@ mod control_ipc;
 #[cfg(target_os = "linux")]
 mod encode;
 mod encode_config;
+#[cfg(target_os = "linux")]
+mod encode_cuda;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod encode_sw;
 #[cfg(target_os = "linux")]
