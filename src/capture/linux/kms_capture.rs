@@ -662,6 +662,23 @@ fn kms_copy_enabled() -> bool {
     )
 }
 
+/// How long `start()` retries plane acquisition + the test capture before giving
+/// up. The display can be DPMS-off when a client connects: `trigger_screen_wake`
+/// fires just before the pipeline starts, but powering the monitor back on and
+/// having the compositor re-attach a scanout framebuffer to the plane is
+/// asynchronous (~1-2s; in system mode the wake is routed through the per-user
+/// tray agent's 100ms poll, slower still). Retrying for a bounded window lets a
+/// just-woken display come back instead of failing the whole pipeline start with
+/// "No active plane with framebuffer found". `ST_KMS_START_TIMEOUT_MS` overrides
+/// the window (0 = single immediate check, the pre-retry behavior).
+fn start_plane_timeout() -> Duration {
+    let ms = std::env::var("ST_KMS_START_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5000);
+    Duration::from_millis(ms)
+}
+
 /// Replace a captured scanout `FrameData::DmaBuf` with a private, stable copy.
 /// Borrows the source planes (the stabilizer imports + `glFinish`-copies them),
 /// so the original `frame` can be dropped by the caller afterwards. Non-DMA-BUF
@@ -796,26 +813,65 @@ impl CaptureBackend for KmsCapture {
             None => None,
         };
 
-        // Find an active plane to validate we can capture
-        let plane_handle = match target_crtc {
-            Some(crtc) => find_plane_for_crtc(&card, crtc)
-                .ok_or("No plane bound to the selected output's CRTC")?,
-            None => find_active_plane(&card)?,
+        // Acquire an active plane and validate a real capture, retrying for a
+        // bounded window. The display may be DPMS-off at connect time:
+        // `trigger_screen_wake` fires just before the pipeline starts, but waking
+        // the monitor (hardware powerup + the compositor re-attaching a scanout
+        // framebuffer to the plane) is asynchronous, and in system mode the wake
+        // is routed through the per-user tray agent's poll loop. A one-shot check
+        // would fail with "No active plane with framebuffer found" before the
+        // just-woken display comes back, failing the whole pipeline start. The
+        // runtime loop already tolerates transient plane loss; this gives startup
+        // the same resilience. ST_KMS_START_TIMEOUT_MS overrides the window.
+        let start_timeout = start_plane_timeout();
+        let deadline = Instant::now() + start_timeout;
+        let mut last_start_err: String;
+        let mut announced_wait = false;
+        let (plane_handle, cursor_handle, test_frame) = loop {
+            // Re-walk planes each attempt — a waking compositor re-binds the
+            // framebuffer to the plane mid-window, so a cached handle goes stale.
+            let plane = match target_crtc {
+                Some(crtc) => find_plane_for_crtc(&card, crtc),
+                None => find_active_plane(&card).ok(),
+            };
+            match plane {
+                Some(p) => {
+                    let cursor = find_cursor_plane(&card, p);
+                    // On Wayland, non-DRM-master processes can't read framebuffer
+                    // handles — the test capture proves the export actually works.
+                    match capture_frame(&card, p, cursor, None) {
+                        Ok(frame) => break (p, cursor, frame),
+                        Err(e) => {
+                            last_start_err =
+                                format!("KMS test capture failed (not DRM master?): {e}");
+                        }
+                    }
+                }
+                None => {
+                    last_start_err = match target_crtc {
+                        Some(_) => "No plane bound to the selected output's CRTC".into(),
+                        None => "No active plane with framebuffer found".into(),
+                    };
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(last_start_err);
+            }
+            if !announced_wait {
+                println!(
+                    "[kms] no capturable scanout plane yet (display waking from \
+                     DPMS-off?); retrying up to {start_timeout:?}"
+                );
+                announced_wait = true;
+            }
+            thread::sleep(Duration::from_millis(100));
         };
         println!("[kms] Found active plane: {plane_handle:?}");
-
-        // Find cursor plane for this CRTC
-        let cursor_handle = find_cursor_plane(&card, plane_handle);
         if let Some(ch) = cursor_handle {
             println!("[kms] Found cursor plane: {ch:?}");
         } else {
             println!("[kms] No cursor plane found (cursor may not be captured)");
         }
-
-        // Test-capture one frame to verify GEM handle export works.
-        // On Wayland, non-DRM-master processes can't read framebuffer handles.
-        let test_frame = capture_frame(&card, plane_handle, cursor_handle, None)
-            .map_err(|e| format!("KMS test capture failed (not DRM master?): {e}"))?;
         println!(
             "[kms] Test capture OK ({}x{})",
             test_frame.width, test_frame.height
