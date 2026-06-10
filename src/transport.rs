@@ -2,7 +2,7 @@ use st_protocol::packet::{
     audio_redundancy_header_size, serialize_audio_redundancy_header, AUDIO_REDUNDANCY_MAX_DEPTH,
     HEADER_SIZE,
 };
-use st_protocol::reliable_udp::PunchedSocket;
+use st_protocol::tcp_tunnel::TunnelLink;
 use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
 use st_protocol::{FrameSlicer, FrameTimingMeta, PacketHeader, PayloadType};
 use std::collections::VecDeque;
@@ -543,15 +543,17 @@ pub struct EncodedUnit {
     pub is_recovery: bool,
 }
 
-/// Backend for sending UDP data: either a direct socket or a punched socket.
+/// Backend for sending media: either a direct UDP socket or a tunnel link
+/// (hole-punched UDP or TCP fallback).
 enum SendBackend {
     /// Direct connection: raw UDP socket + optional encryption.
     Direct {
         socket: UdpSocket,
         crypto: Option<Arc<CryptoContext>>,
     },
-    /// Punched connection: all media goes through PunchedSocket::send_media().
-    Punched(Arc<PunchedSocket>),
+    /// Tunneled connection: all media goes through TunnelLink::send_media()
+    /// (PunchedSocket over UDP, or TcpTunnel for the TCP fallback).
+    Tunnel(Arc<dyn TunnelLink>),
 }
 
 /// B5: intra-frame packet pacing. Opt-in `ST_PACING`. A 4K IDR is 30-60 UDP
@@ -780,28 +782,38 @@ fn build_uring_send() -> Option<crate::linux_uring::UringSend> {
 }
 
 impl UdpSender {
-    /// Create a sender that uses a punched socket for media delivery.
-    pub fn from_punched(punched: Arc<PunchedSocket>) -> Self {
-        // Punched connections always use the safe (public internet) MTU
-        // minus crypto overhead (handled inside PunchedSocket) minus channel prefix.
-        let max_udp = SAFE_NETWORK_MAX_UDP
-            .saturating_sub(CRYPTO_OVERHEAD)
-            .saturating_sub(st_protocol::reliable_udp::PUNCHED_MEDIA_OVERHEAD);
+    /// Create a sender that delivers media through a tunnel link (hole-punched
+    /// UDP socket or TCP fallback tunnel).
+    pub fn from_tunnel(link: Arc<dyn TunnelLink>) -> Self {
+        let max_udp = link.max_media_payload();
+        let reliable = link.is_reliable();
         eprintln!(
-            "[transport] Punched UDP max payload {} bytes for {}",
+            "[transport] Tunnel media payload {} bytes for {} (reliable={})",
             max_udp,
-            punched.peer()
+            link.peer(),
+            reliable
         );
-        let peer = punched.peer();
+        let peer = link.peer();
+        // Loss-recovery extras (FEC parity, duplicate FrameStart, audio
+        // redundancy) are pure overhead on a reliable (TCP) link, so reliable
+        // links disable parity construction entirely (no per-frame XOR/RS pass).
+        let mut slicer = FrameSlicer::with_config(max_udp, env_fec_config());
+        if reliable {
+            slicer.set_parity_enabled(false);
+        }
         Self {
-            backend: SendBackend::Punched(punched),
-            slicer: FrameSlicer::with_config(max_udp, env_fec_config()),
+            backend: SendBackend::Tunnel(link),
+            slicer,
             max_datagram_size: max_udp,
             pacing: env_pacing(peer),
             frame_id: 0,
             audio_seq: 0,
-            audio_redundancy_depth: audio_redundancy_depth(),
-            dup_mode: dup_first_mode_from_env(),
+            audio_redundancy_depth: if reliable { 0 } else { audio_redundancy_depth() },
+            dup_mode: if reliable {
+                DupFirstMode::Off
+            } else {
+                dup_first_mode_from_env()
+            },
             dup_auto_active: false,
             audio_buf: Vec::with_capacity(1500),
             previous_audio: VecDeque::with_capacity(AUDIO_REDUNDANCY_MAX_DEPTH),
@@ -875,8 +887,8 @@ impl UdpSender {
                     socket.send(plaintext).map_err(|e| format!("send: {e}"))?;
                 }
             }
-            SendBackend::Punched(punched) => {
-                punched.send_media(plaintext)?;
+            SendBackend::Tunnel(link) => {
+                link.send_media(plaintext)?;
             }
         }
         Ok(())
@@ -1090,12 +1102,12 @@ impl UdpSender {
                     Ok(())
                 }
             }
-            SendBackend::Punched(punched) => {
+            SendBackend::Tunnel(link) => {
                 let _ = (encrypt_buf, encrypt_pool);
                 #[cfg(target_os = "linux")]
                 let _ = uring;
                 for pt in plaintexts.iter() {
-                    punched.send_media(pt)?;
+                    link.send_media(pt)?;
                 }
                 Ok(())
             }

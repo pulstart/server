@@ -30,9 +30,13 @@ pub struct ApiTunnelState {
     tunnel_keys: Mutex<TunnelKeys>,
     /// Derived ChaCha20 key, ready for CryptoContext creation.
     shared_key: Mutex<Option<[u8; 32]>>,
-    /// Cached CryptoContext (single instance shared across all callers so the
-    /// atomic nonce counter is never reset).
-    crypto: Mutex<Option<Arc<CryptoContext>>>,
+    /// Cached CryptoContext paired with the key it was built from. Keyed so a
+    /// re-derivation of the *same* key (e.g. after a transient signaling blip
+    /// invalidates and re-derives it) reuses the existing context instead of
+    /// building a fresh one with a reset nonce counter — which, since the
+    /// X25519 keypairs are process-lifetime, would reuse (key, nonce) pairs and
+    /// break ChaCha20-Poly1305 confidentiality across sessions.
+    crypto: Mutex<Option<([u8; 32], Arc<CryptoContext>)>>,
     /// Partner (client) NAT candidates from the API server.
     pub partner_candidates: Mutex<Vec<SocketAddr>>,
     /// Process-lifetime UDP socket used for STUN and punching.
@@ -48,8 +52,14 @@ pub struct ApiTunnelState {
     portmap_external: Mutex<Option<SocketAddr>>,
     /// Latest client punch-request nonce observed from the API server.
     pending_client_punch_nonce: AtomicU64,
+    /// Latest client TCP-relay-request nonce observed from the API server.
+    pending_client_relay_nonce: AtomicU64,
+    /// TCP relay port advertised by the API server (None = relay disabled).
+    relay_port: Mutex<Option<u16>>,
     /// True while a punched session is active on the shared socket.
     punch_session_active: AtomicBool,
+    /// True while a relayed TCP tunnel session is active.
+    relay_session_active: AtomicBool,
     /// Set when shared key, partner candidates, and a punch socket are all present.
     hole_punch_ready: AtomicBool,
     /// Whether the last API request succeeded.
@@ -68,23 +78,29 @@ impl ApiTunnelState {
             last_stun: Mutex::new(None),
             portmap_external: Mutex::new(None),
             pending_client_punch_nonce: AtomicU64::new(0),
+            pending_client_relay_nonce: AtomicU64::new(0),
+            relay_port: Mutex::new(None),
             punch_session_active: AtomicBool::new(false),
+            relay_session_active: AtomicBool::new(false),
             hole_punch_ready: AtomicBool::new(false),
             connected: AtomicBool::new(false),
         }
     }
 
-    /// Return the shared CryptoContext (same instance for all callers so the
-    /// atomic nonce counter is never reset).
+    /// Return the shared CryptoContext for the current shared key. The same
+    /// instance is reused for an unchanged key (across reconnects and transient
+    /// key invalidations) so the atomic nonce counter is monotonic for the
+    /// key's lifetime and is only reset when the key value genuinely changes.
     pub fn crypto_context(&self) -> Option<Arc<CryptoContext>> {
-        let cached = self.crypto.lock().unwrap();
-        if cached.is_some() {
-            return cached.clone();
-        }
-        drop(cached);
         let key = (*self.shared_key.lock().unwrap())?;
+        let mut cache = self.crypto.lock().unwrap();
+        if let Some((cached_key, ctx)) = cache.as_ref() {
+            if *cached_key == key {
+                return Some(Arc::clone(ctx));
+            }
+        }
         let ctx = Arc::new(CryptoContext::new(key, true));
-        *self.crypto.lock().unwrap() = Some(Arc::clone(&ctx));
+        *cache = Some((key, Arc::clone(&ctx)));
         Some(ctx)
     }
 
@@ -115,6 +131,31 @@ impl ApiTunnelState {
     pub fn update_pending_client_punch_nonce(&self, nonce: u64) {
         self.pending_client_punch_nonce
             .fetch_max(nonce, Ordering::Relaxed);
+    }
+
+    pub fn pending_client_relay_nonce(&self) -> u64 {
+        self.pending_client_relay_nonce.load(Ordering::Relaxed)
+    }
+
+    pub fn update_pending_client_relay_nonce(&self, nonce: u64) {
+        self.pending_client_relay_nonce
+            .fetch_max(nonce, Ordering::Relaxed);
+    }
+
+    pub fn relay_port(&self) -> Option<u16> {
+        *self.relay_port.lock().unwrap()
+    }
+
+    pub fn set_relay_port(&self, port: Option<u16>) {
+        *self.relay_port.lock().unwrap() = port;
+    }
+
+    pub fn is_relay_session_active(&self) -> bool {
+        self.relay_session_active.load(Ordering::Relaxed)
+    }
+
+    pub fn set_relay_session_active(&self, active: bool) {
+        self.relay_session_active.store(active, Ordering::Relaxed);
     }
 
     pub fn is_punch_session_active(&self) -> bool {
@@ -243,7 +284,10 @@ impl ApiTunnelState {
             let had_key = current.is_some();
             let has_key = shared_key.is_some();
             *current = shared_key;
-            *self.crypto.lock().unwrap() = None;
+            // Deliberately do NOT drop the cached CryptoContext here: a clear
+            // followed by re-deriving the same key must keep the same context
+            // (and its nonce counter). crypto_context() rebuilds only when the
+            // key value actually differs from the cached one.
             if has_key && !had_key {
                 println!("[api] Shared key derived");
             }
@@ -541,6 +585,10 @@ pub fn start_api_registration(
                                 client_joined = v["client_joined"].as_bool().unwrap_or(false);
                                 let punch_nonce = v["client_punch_nonce"].as_u64().unwrap_or(0);
                                 tunnel_state.update_pending_client_punch_nonce(punch_nonce);
+                                let relay_nonce = v["client_relay_nonce"].as_u64().unwrap_or(0);
+                                tunnel_state.update_pending_client_relay_nonce(relay_nonce);
+                                tunnel_state
+                                    .set_relay_port(v["relay_port"].as_u64().map(|p| p as u16));
                                 if !client_joined {
                                     tunnel_state.clear_partner_state();
                                 }

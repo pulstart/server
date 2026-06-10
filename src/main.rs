@@ -2565,6 +2565,72 @@ async fn wait_for_client_media_ready(
 // Client handler
 // ---------------------------------------------------------------------------
 
+enum TunnelDetect {
+    Tunnel,
+    Normal,
+}
+
+/// Concurrency cap on tunnel sessions (direct-preamble + relay), which run on
+/// dedicated OS threads rather than cheap tokio tasks. Bounds the cost of
+/// unauthenticated peers that open a tunnel connection and then stall through
+/// the auth window.
+static ACTIVE_TUNNEL_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+const MAX_TUNNEL_SESSIONS: usize = 64;
+
+/// RAII slot for a tunnel session. `acquire()` returns `None` when the cap is
+/// already reached, so the caller drops the connection instead of spawning.
+struct TunnelSessionSlot;
+
+impl TunnelSessionSlot {
+    fn acquire() -> Option<Self> {
+        let prev = ACTIVE_TUNNEL_SESSIONS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_TUNNEL_SESSIONS).then_some(n + 1)
+            });
+        prev.ok().map(|_| TunnelSessionSlot)
+    }
+}
+
+impl Drop for TunnelSessionSlot {
+    fn drop(&mut self) {
+        ACTIVE_TUNNEL_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Peek (without consuming) the first bytes of a fresh control connection to
+/// see whether the client requested TCP tunnel framing — the fallback used
+/// when its UDP path is blocked. Normal clients send a `ControlMessage`
+/// first, whose leading byte can never match the preamble, so the very first
+/// byte disambiguates instantly and never adds latency for them; only a
+/// matching-prefix connection waits for the rest of the preamble. The deadline
+/// is aligned with the auth budget (not a tight 750 ms) so a tunnel client on
+/// a high-RTT path — exactly where the TCP fallback is needed — is not
+/// misclassified as Normal when its preamble arrives one slow RTT late.
+async fn detect_tunnel_preamble(stream: &mut tokio::net::TcpStream) -> TunnelDetect {
+    use st_protocol::tcp_tunnel::TCP_TUNNEL_PREAMBLE;
+    let want = TCP_TUNNEL_PREAMBLE.len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut buf = [0u8; 8];
+    loop {
+        match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
+            Ok(Ok(0)) => return TunnelDetect::Normal,
+            Ok(Ok(n)) => {
+                let check = n.min(want);
+                if buf[..check] != TCP_TUNNEL_PREAMBLE[..check] {
+                    return TunnelDetect::Normal;
+                }
+                if n >= want {
+                    return TunnelDetect::Tunnel;
+                }
+                // Matching prefix but incomplete — peek returns the same bytes
+                // immediately, so yield briefly while the rest arrives.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(Err(_)) | Err(_) => return TunnelDetect::Normal,
+        }
+    }
+}
+
 async fn handle_client(
     mut stream: tokio::net::TcpStream,
     addr: SocketAddr,
@@ -2572,6 +2638,41 @@ async fn handle_client(
 ) {
     println!("Client connected: {addr}");
     let _ = stream.set_nodelay(true);
+
+    // TCP media fallback: clients whose UDP path is blocked open the same
+    // control port but lead with a tunnel preamble; the whole session
+    // (control + media) then runs over this one TCP connection using the
+    // tunnel framing, through the same handler as hole-punched sessions.
+    if matches!(detect_tunnel_preamble(&mut stream).await, TunnelDetect::Tunnel) {
+        // Bound concurrent tunnel sessions before committing OS threads, so a
+        // flood of preamble-then-silence connections can't exhaust threads/FDs.
+        let Some(slot) = TunnelSessionSlot::acquire() else {
+            eprintln!("[tcp-tunnel] Rejecting {addr}: tunnel session cap reached");
+            return;
+        };
+        let mut preamble = [0u8; st_protocol::tcp_tunnel::TCP_TUNNEL_PREAMBLE.len()];
+        if stream.read_exact(&mut preamble).await.is_err() {
+            return;
+        }
+        println!("[tcp-tunnel] Client {addr} requested TCP tunnel mode");
+        let std_stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[tcp-tunnel] into_std failed for {addr}: {e}");
+                return;
+            }
+        };
+        let _ = std_stream.set_nonblocking(false);
+        let state2 = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _slot = slot; // released when the session ends
+            match st_protocol::tcp_tunnel::TcpTunnel::new(std_stream, None, Vec::new()) {
+                Ok(tunnel) => handle_punched_client(Arc::new(tunnel), state2),
+                Err(e) => eprintln!("[tcp-tunnel] setup failed for {addr}: {e}"),
+            }
+        });
+        return;
+    }
 
     // Authenticate before anything else
     match authenticate_client(&mut stream, &state.control.token()).await {
@@ -3459,7 +3560,9 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                 break;
             }
             let pending_punch_nonce = tunnel.pending_client_punch_nonce();
-            if pending_punch_nonce <= last_handled_punch_nonce || tunnel.is_punch_session_active() {
+            // `!=` not `<=`: a restarted client restarts its nonce counter at 1,
+            // which a high-water gate would ignore against this long-lived host.
+            if pending_punch_nonce == last_handled_punch_nonce || tunnel.is_punch_session_active() {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -3506,9 +3609,9 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                     punch_attempts = 0;
                     println!("[hole-punch] Success! Peer confirmed at {peer}");
                     tunnel.set_punch_session_active(true);
-                    let punched = Arc::new(st_protocol::reliable_udp::PunchedSocket::new(
-                        socket, peer, crypto,
-                    ));
+                    let punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink> = Arc::new(
+                        st_protocol::reliable_udp::PunchedSocket::new(socket, peer, crypto),
+                    );
                     let state2 = Arc::clone(&state);
                     let tunnel2 = Arc::clone(&tunnel);
                     // Run the punched-client handler in a blocking thread.
@@ -3546,15 +3649,104 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
     });
 }
 
-/// Handle a client connection over a hole-punched UDP socket.
-/// All control and media traffic flows through the single PunchedSocket.
+/// TCP-relay background task: when the client posts a relay nonce via the API
+/// server (meaning both direct TCP and UDP hole punching failed on its side),
+/// dial the relay, complete pairing, and run the standard tunnel session over
+/// an end-to-end encrypted TCP tunnel. The relay only ever sees ciphertext.
+fn spawn_relay_task(state: Arc<ServerState>, api_url: String) {
+    use st_protocol::tcp_tunnel::{connect_relay, resolve_relay_addr};
+    let tunnel = match state.tunnel_state.clone() {
+        Some(t) => t,
+        None => return,
+    };
+    let state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let mut last_handled_relay_nonce = 0u64;
+        loop {
+            if state.control.shutdown_requested() {
+                break;
+            }
+            let pending = tunnel.pending_client_relay_nonce();
+            // Compare for inequality, not `<=`: the client's nonce counter
+            // restarts at 1 each app launch, so a `<=` high-water gate would
+            // ignore every request from a restarted client against this
+            // long-lived host process. Any nonce we have not already acted on
+            // is a fresh request.
+            if pending == last_handled_relay_nonce || tunnel.is_relay_session_active() {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            let Some(crypto) = tunnel.crypto_context() else {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            };
+            let relay_addr = match resolve_relay_addr(
+                &api_url,
+                tunnel.relay_port(),
+                std::env::var("ST_RELAY_ADDR").ok(),
+            ) {
+                Some(addr) => addr,
+                None => {
+                    eprintln!("[relay] Client requested relay but no relay address is available");
+                    last_handled_relay_nonce = pending;
+                    continue;
+                }
+            };
+            println!("[relay] Client requested TCP relay; dialing {relay_addr}...");
+            last_handled_relay_nonce = pending;
+            match connect_relay(
+                &relay_addr,
+                "host",
+                &state.control.token(),
+                Duration::from_secs(45),
+            ) {
+                Ok(stream) => {
+                    match st_protocol::tcp_tunnel::TcpTunnel::new(stream, Some(crypto), Vec::new())
+                    {
+                        Ok(tcp_tunnel) => {
+                            // Bound concurrent tunnel sessions like the direct
+                            // path; drop the pairing if we are already at cap.
+                            let Some(slot) = TunnelSessionSlot::acquire() else {
+                                eprintln!("[relay] tunnel session cap reached; dropping relay pair");
+                                continue;
+                            };
+                            println!("[relay] Paired with client via {relay_addr}");
+                            tunnel.set_relay_session_active(true);
+                            let state2 = Arc::clone(&state);
+                            let tunnel2 = Arc::clone(&tunnel);
+                            std::thread::spawn(move || {
+                                let _slot = slot;
+                                struct ActiveRelayGuard(Arc<api_client::ApiTunnelState>);
+                                impl Drop for ActiveRelayGuard {
+                                    fn drop(&mut self) {
+                                        self.0.set_relay_session_active(false);
+                                    }
+                                }
+                                let _guard = ActiveRelayGuard(tunnel2);
+                                handle_punched_client(Arc::new(tcp_tunnel), state2);
+                            });
+                        }
+                        Err(e) => eprintln!("[relay] Tunnel setup failed: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("[relay] {e}"),
+            }
+        }
+    });
+}
+
+/// Handle a client connection over a tunnel link: a hole-punched UDP socket
+/// or a TCP fallback tunnel (direct upgrade or API-server relay). All control
+/// and media traffic flows through the single link.
 fn handle_punched_client(
-    punched: Arc<st_protocol::reliable_udp::PunchedSocket>,
+    punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink>,
     state: Arc<ServerState>,
 ) {
     use st_protocol::reliable_udp::PunchedMessage;
     let peer = punched.peer();
-    println!("[punched] Client connected via hole-punch: {peer}");
+    let reliable = punched.is_reliable();
+    let tag = if reliable { "tcp-tunnel" } else { "punched" };
+    println!("[{tag}] Client connected: {peer}");
 
     // Set short read timeout for the handshake phase.
     let _ = punched.set_read_timeout(Some(Duration::from_millis(100)));
@@ -3577,17 +3769,17 @@ fn handle_punched_client(
                 } else {
                     let resp = ControlMessage::AuthResult(false).serialize();
                     let _ = punched.send_control(&resp);
-                    eprintln!("[punched] Auth failed from {peer}");
+                    eprintln!("[{tag}] Auth failed from {peer}");
                     return;
                 }
             }
         }
     }
     if !authenticated {
-        eprintln!("[punched] Auth timeout from {peer}");
+        eprintln!("[{tag}] Auth timeout from {peer}");
         return;
     }
-    println!("[punched] Client {peer} authenticated");
+    println!("[{tag}] Client {peer} authenticated");
 
     // --- Read ClientDisplayInfo ---
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -3606,7 +3798,7 @@ fn handle_punched_client(
     let _client_display = match client_display {
         Some(d) => d,
         None => {
-            eprintln!("[punched] Timeout waiting for ClientDisplayInfo from {peer}");
+            eprintln!("[{tag}] Timeout waiting for ClientDisplayInfo from {peer}");
             return;
         }
     };
@@ -3707,7 +3899,7 @@ fn handle_punched_client(
     let (sub, stream_config, rate_control, session_debug, capture_state) = match setup {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[punched] Pipeline error for {peer}: {e}");
+            eprintln!("[{tag}] Pipeline error for {peer}: {e}");
             let _ = punched.send_control(&ControlMessage::Error(e).serialize());
             return;
         }
@@ -3756,7 +3948,7 @@ fn handle_punched_client(
         }
     }
     if !ready {
-        eprintln!("[punched] Timeout waiting for ClientReadyForMedia from {peer}");
+        eprintln!("[{tag}] Timeout waiting for ClientReadyForMedia from {peer}");
         rate_control.unregister_client(sub.vid_sub_id);
         let _ = state.input.release_control(client_id);
         unsubscribe_and_maybe_stop_pipeline(
@@ -3782,8 +3974,14 @@ fn handle_punched_client(
     let punched_transport = Arc::clone(&punched);
     let video_bc = Arc::clone(&sub.video_bc);
     // A2: adaptive FEC strength shared from the control loop to the sender.
+    // Reliable (TCP) links pin every loss-recovery knob to zero — there is no
+    // packet loss to recover from, so the extra bytes are pure overhead.
     let mut fec_controller = adaptive_bitrate::FecController::from_env();
-    let fec_pct_shared = Arc::new(AtomicU16::new(fec_controller.current_pct()));
+    let fec_pct_shared = Arc::new(AtomicU16::new(if reliable {
+        0
+    } else {
+        fec_controller.current_pct()
+    }));
     let fec_pct_transport = Arc::clone(&fec_pct_shared);
     // Duplicate-FrameStart utility controller (A/B probe).
     let mut dup_first_controller = adaptive_bitrate::DupFirstController::new();
@@ -3797,7 +3995,9 @@ fn handle_punched_client(
     let audio_redundancy_max = transport::configured_audio_redundancy_depth() as u8;
     let mut audio_redundancy_controller =
         adaptive_bitrate::AudioRedundancyController::new(audio_redundancy_max);
-    let audio_depth_init = if audio_redundancy_adaptive {
+    let audio_depth_init = if reliable {
+        0
+    } else if audio_redundancy_adaptive {
         audio_redundancy_controller.current_depth()
     } else {
         audio_redundancy_max
@@ -3820,7 +4020,7 @@ fn handle_punched_client(
     });
 
     let _ = punched.send_control(&ControlMessage::StreamStarted.serialize());
-    println!("[punched] Client {peer} subscribed (transport started)");
+    println!("[{tag}] Client {peer} subscribed (transport started)");
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
     let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
     let suppressed_paths = clipboard::new_suppressed_paths();
@@ -3860,7 +4060,7 @@ fn handle_punched_client(
         }
         if last_peer_activity.elapsed() > PUNCHED_INACTIVITY_TIMEOUT {
             println!(
-                "[punched] No traffic from {peer} for {}s — treating as disconnected",
+                "[{tag}] No traffic from {peer} for {}s — treating as disconnected",
                 PUNCHED_INACTIVITY_TIMEOUT.as_secs()
             );
             break;
@@ -3907,17 +4107,21 @@ fn handle_punched_client(
                             audio_enabled.store(enabled, Ordering::Relaxed);
                         }
                         ControlMessage::TransportFeedback(fb) => {
-                            // A2: drive RS FEC strength from the same loss signal.
-                            let fec_pct = fec_controller.apply_feedback(&fb);
-                            fec_pct_shared.store(fec_pct, Ordering::Relaxed);
-                            // E5: adapt audio-redundancy depth from the same loss.
-                            if audio_redundancy_adaptive {
-                                let depth = audio_redundancy_controller.apply_feedback(&fb);
-                                audio_depth_shared.store(depth, Ordering::Relaxed);
+                            // Loss-recovery controllers stay parked at zero on
+                            // reliable (TCP) links — nothing to recover from.
+                            if !reliable {
+                                // A2: drive RS FEC strength from the same loss signal.
+                                let fec_pct = fec_controller.apply_feedback(&fb);
+                                fec_pct_shared.store(fec_pct, Ordering::Relaxed);
+                                // E5: adapt audio-redundancy depth from the same loss.
+                                if audio_redundancy_adaptive {
+                                    let depth = audio_redundancy_controller.apply_feedback(&fb);
+                                    audio_depth_shared.store(depth, Ordering::Relaxed);
+                                }
+                                // Duplicate-FrameStart A/B: keep it only while it helps.
+                                let dup_on = dup_first_controller.apply_feedback(&fb);
+                                dup_first_shared.store(dup_on, Ordering::Relaxed);
                             }
-                            // Duplicate-FrameStart A/B: keep it only while it helps.
-                            let dup_on = dup_first_controller.apply_feedback(&fb);
-                            dup_first_shared.store(dup_on, Ordering::Relaxed);
                             // Bufferbloat: feed the server-side cap→send backlog.
                             bitrate_controller
                                 .note_send_backlog_us(send_backlog_shared.load(Ordering::Relaxed));
@@ -4063,14 +4267,14 @@ fn handle_punched_client(
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         sub.aud_sub_id,
     );
-    println!("[punched] Client {peer} disconnected");
+    println!("[{tag}] Client {peer} disconnected");
 }
 
 /// Per-client transport loop for punched connections.
 // Same adaptive-control Arc set as run_transport, over the punched socket.
 #[allow(clippy::too_many_arguments)]
 fn run_punched_transport(
-    punched: Arc<st_protocol::reliable_udp::PunchedSocket>,
+    punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink>,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     aud_rx: Option<Receiver<Arc<Vec<u8>>>>,
@@ -4086,7 +4290,7 @@ fn run_punched_transport(
     send_backlog_us: Arc<AtomicU32>,
 ) {
     let peer = punched.peer();
-    let mut sender = UdpSender::from_punched(punched);
+    let mut sender = UdpSender::from_tunnel(punched);
     let trace = trace_enabled();
     let interleave_audio = audio_interleave_enabled();
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
@@ -4244,11 +4448,11 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
 
     // Spawn API server registration
     const API_SERVER_URL: &str = "https://st-api.kubemaxx.io";
+    let api_url = std::env::var("ST_API_URL")
+        .unwrap_or_else(|_| API_SERVER_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
     {
-        let api_url = std::env::var("ST_API_URL")
-            .unwrap_or_else(|_| API_SERVER_URL.to_string())
-            .trim_end_matches('/')
-            .to_string();
         let tunnel = state
             .tunnel_state
             .clone()
@@ -4260,7 +4464,7 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
         // this is a quiet no-op.
         api_client::start_port_mapping(Arc::clone(&state.control), Arc::clone(&tunnel));
         api_client::start_api_registration(
-            api_url,
+            api_url.clone(),
             Arc::clone(&state.control),
             state.listen_port,
             tunnel,
@@ -4269,6 +4473,10 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
 
     // Spawn hole-punch background task.
     spawn_hole_punch_task(Arc::clone(&state));
+
+    // Spawn TCP-relay fallback task (dials the API server's relay when the
+    // client signals that both direct TCP and UDP hole punching failed).
+    spawn_relay_task(Arc::clone(&state), api_url);
 
     // Handle Ctrl+C so the API thread can unregister cleanly.
     {

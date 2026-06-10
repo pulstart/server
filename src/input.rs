@@ -3334,6 +3334,7 @@ mod tests {
                 keyboard: true,
                 separate_cursor: true,
                 hover_capture: true,
+                cursor_position_reliable: true,
             },
             controller_id: Some(1),
             last_input_seq_by_client: BTreeMap::new(),
