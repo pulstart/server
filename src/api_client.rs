@@ -1,7 +1,10 @@
 use crate::server_control::ServerControl;
-use st_protocol::tunnel::{CryptoContext, TunnelKeys};
+use rand::{rngs::OsRng, RngCore};
+use st_protocol::tunnel::{
+    derive_session_key, CryptoContext, SessionKeyContext, TunnelKeys, TunnelMode,
+};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,22 +26,37 @@ fn http_agent() -> &'static ureq::Agent {
 /// mappings expire after ~30–120 s of silence, so 25 s gives margin to
 /// re-probe before the partner sees a dead public ip:port.
 const STUN_REFRESH_TTL: Duration = Duration::from_secs(25);
+const MAX_API_TOKEN_LEN: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRequest {
+    pub session_id: String,
+    pub generation: u64,
+    pub owner_peer_id: String,
+    pub owner_lease_id: String,
+    pub partner_peer_id: String,
+    pub partner_lease_id: String,
+    pub context: String,
+}
+
+#[derive(Clone)]
+struct PartnerSnapshot {
+    peer_id: String,
+    lease_id: String,
+    shared_secret: [u8; 32],
+    candidates: Vec<SocketAddr>,
+}
 
 /// Shared state produced by the API registration thread.
 /// The server runtime reads this to set up encrypted tunnels for incoming clients.
 pub struct ApiTunnelState {
+    /// Random process lease, distinct from the persisted stable peer ID.
+    lease_id: String,
     tunnel_keys: Mutex<TunnelKeys>,
-    /// Derived ChaCha20 key, ready for CryptoContext creation.
-    shared_key: Mutex<Option<[u8; 32]>>,
-    /// Cached CryptoContext paired with the key it was built from. Keyed so a
-    /// re-derivation of the *same* key (e.g. after a transient signaling blip
-    /// invalidates and re-derives it) reuses the existing context instead of
-    /// building a fresh one with a reset nonce counter — which, since the
-    /// X25519 keypairs are process-lifetime, would reuse (key, nonce) pairs and
-    /// break ChaCha20-Poly1305 confidentiality across sessions.
+    /// Key, candidates, and identity from one validated partner lease.
+    partner: Mutex<Option<PartnerSnapshot>>,
+    /// Request-scoped context cache for idempotent signaling retries.
     crypto: Mutex<Option<([u8; 32], Arc<CryptoContext>)>>,
-    /// Partner (client) NAT candidates from the API server.
-    pub partner_candidates: Mutex<Vec<SocketAddr>>,
     /// Process-lifetime UDP socket used for STUN and punching.
     punch_socket: Mutex<Option<UdpSocket>>,
     /// Local candidates advertised to the API server.
@@ -50,10 +68,9 @@ pub struct ApiTunnelState {
     /// rule that survives idle periods AND works on symmetric NATs.
     /// Refreshed periodically by `spawn_port_mapping_task`.
     portmap_external: Mutex<Option<SocketAddr>>,
-    /// Latest client punch-request nonce observed from the API server.
-    pending_client_punch_nonce: AtomicU64,
-    /// Latest client TCP-relay-request nonce observed from the API server.
-    pending_client_relay_nonce: AtomicU64,
+    /// Latest client requests, including the process generation that owns them.
+    pending_client_punch: Mutex<Option<PendingRequest>>,
+    pending_client_relay: Mutex<Option<PendingRequest>>,
     /// TCP relay port advertised by the API server (None = relay disabled).
     relay_port: Mutex<Option<u16>>,
     /// True while a punched session is active on the shared socket.
@@ -68,17 +85,19 @@ pub struct ApiTunnelState {
 
 impl ApiTunnelState {
     pub fn new() -> Self {
+        let mut lease = [0u8; 32];
+        OsRng.fill_bytes(&mut lease);
         Self {
+            lease_id: base64_encode(&lease),
             tunnel_keys: Mutex::new(TunnelKeys::generate()),
-            shared_key: Mutex::new(None),
+            partner: Mutex::new(None),
             crypto: Mutex::new(None),
-            partner_candidates: Mutex::new(Vec::new()),
             punch_socket: Mutex::new(None),
             local_candidates: Mutex::new(Vec::new()),
             last_stun: Mutex::new(None),
             portmap_external: Mutex::new(None),
-            pending_client_punch_nonce: AtomicU64::new(0),
-            pending_client_relay_nonce: AtomicU64::new(0),
+            pending_client_punch: Mutex::new(None),
+            pending_client_relay: Mutex::new(None),
             relay_port: Mutex::new(None),
             punch_session_active: AtomicBool::new(false),
             relay_session_active: AtomicBool::new(false),
@@ -87,12 +106,32 @@ impl ApiTunnelState {
         }
     }
 
-    /// Return the shared CryptoContext for the current shared key. The same
-    /// instance is reused for an unchanged key (across reconnects and transient
-    /// key invalidations) so the atomic nonce counter is monotonic for the
-    /// key's lifetime and is only reset when the key value genuinely changes.
-    pub fn crypto_context(&self) -> Option<Arc<CryptoContext>> {
-        let key = (*self.shared_key.lock().unwrap())?;
+    pub fn crypto_context(
+        &self,
+        request: &PendingRequest,
+        mode: TunnelMode,
+    ) -> Option<Arc<CryptoContext>> {
+        let partner = self.partner.lock().unwrap().clone()?;
+        if partner.peer_id != request.owner_peer_id
+            || partner.lease_id != request.owner_lease_id
+            || request.partner_lease_id != self.lease_id
+        {
+            return None;
+        }
+        let key = derive_session_key(
+            &partner.shared_secret,
+            &SessionKeyContext {
+                request_context: &request.context,
+                session_id: &request.session_id,
+                mode,
+                generation: request.generation,
+                host_peer_id: &request.partner_peer_id,
+                host_lease_id: &request.partner_lease_id,
+                client_peer_id: &request.owner_peer_id,
+                client_lease_id: &request.owner_lease_id,
+            },
+        )
+        .ok()?;
         let mut cache = self.crypto.lock().unwrap();
         if let Some((cached_key, ctx)) = cache.as_ref() {
             if *cached_key == key {
@@ -102,6 +141,13 @@ impl ApiTunnelState {
         let ctx = Arc::new(CryptoContext::new(key, true));
         *cache = Some((key, Arc::clone(&ctx)));
         Some(ctx)
+    }
+
+    pub fn partner_candidates(&self, request: &PendingRequest) -> Option<Vec<SocketAddr>> {
+        let partner = self.partner.lock().unwrap();
+        let partner = partner.as_ref()?;
+        (partner.peer_id == request.owner_peer_id && partner.lease_id == request.owner_lease_id)
+            .then(|| partner.candidates.clone())
     }
 
     /// Clone the process-lifetime punch socket for one hole-punch attempt/session.
@@ -124,22 +170,24 @@ impl ApiTunnelState {
         self.hole_punch_ready.load(Ordering::Relaxed)
     }
 
-    pub fn pending_client_punch_nonce(&self) -> u64 {
-        self.pending_client_punch_nonce.load(Ordering::Relaxed)
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
     }
 
-    pub fn update_pending_client_punch_nonce(&self, nonce: u64) {
-        self.pending_client_punch_nonce
-            .fetch_max(nonce, Ordering::Relaxed);
+    pub fn pending_client_punch(&self) -> Option<PendingRequest> {
+        self.pending_client_punch.lock().unwrap().clone()
     }
 
-    pub fn pending_client_relay_nonce(&self) -> u64 {
-        self.pending_client_relay_nonce.load(Ordering::Relaxed)
+    pub fn update_pending_client_punch(&self, request: Option<PendingRequest>) {
+        *self.pending_client_punch.lock().unwrap() = request;
     }
 
-    pub fn update_pending_client_relay_nonce(&self, nonce: u64) {
-        self.pending_client_relay_nonce
-            .fetch_max(nonce, Ordering::Relaxed);
+    pub fn pending_client_relay(&self) -> Option<PendingRequest> {
+        self.pending_client_relay.lock().unwrap().clone()
+    }
+
+    pub fn update_pending_client_relay(&self, request: Option<PendingRequest>) {
+        *self.pending_client_relay.lock().unwrap() = request;
     }
 
     pub fn relay_port(&self) -> Option<u16> {
@@ -246,63 +294,51 @@ impl ApiTunnelState {
         base64_encode(&keys.public_key_bytes())
     }
 
-    pub fn update_shared_key_from_partner_b64(&self, partner_b64: Option<&str>) {
-        let Some(partner_b64) = partner_b64 else {
-            self.set_shared_key(None);
-            return;
-        };
-        let Some(partner_bytes) = base64_decode(partner_b64) else {
-            self.set_shared_key(None);
-            return;
-        };
+    fn shared_secret_from_partner_b64(&self, partner_b64: &str) -> Option<[u8; 32]> {
+        let partner_bytes = base64_decode(partner_b64)?;
         if partner_bytes.len() != 32 {
-            self.set_shared_key(None);
-            return;
+            return None;
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&partner_bytes);
-        let shared = {
+        Some({
             let keys = self.tunnel_keys.lock().unwrap();
             keys.derive_shared_key(&arr)
-        };
-        self.set_shared_key(Some(shared));
+        })
     }
 
-    pub fn set_partner_candidates(&self, candidates: Vec<SocketAddr>) {
-        *self.partner_candidates.lock().unwrap() = candidates;
+    fn set_partner_snapshot(
+        &self,
+        peer_id: String,
+        lease_id: String,
+        shared_secret: [u8; 32],
+        candidates: Vec<SocketAddr>,
+    ) {
+        *self.partner.lock().unwrap() = Some(PartnerSnapshot {
+            peer_id,
+            lease_id,
+            shared_secret,
+            candidates,
+        });
         self.update_hole_punch_ready();
     }
 
     pub fn clear_partner_state(&self) {
-        self.set_partner_candidates(Vec::new());
-        self.set_shared_key(None);
-    }
-
-    fn set_shared_key(&self, shared_key: Option<[u8; 32]>) {
-        let mut current = self.shared_key.lock().unwrap();
-        if *current != shared_key {
-            let had_key = current.is_some();
-            let has_key = shared_key.is_some();
-            *current = shared_key;
-            // Deliberately do NOT drop the cached CryptoContext here: a clear
-            // followed by re-deriving the same key must keep the same context
-            // (and its nonce counter). crypto_context() rebuilds only when the
-            // key value actually differs from the cached one.
-            if has_key && !had_key {
-                println!("[api] Shared key derived");
-            }
-        }
-        drop(current);
+        *self.partner.lock().unwrap() = None;
         self.update_hole_punch_ready();
     }
 
     /// Check and update hole_punch_ready based on current state.
     pub fn update_hole_punch_ready(&self) {
-        let has_key = self.shared_key.lock().unwrap().is_some();
-        let has_candidates = !self.partner_candidates.lock().unwrap().is_empty();
+        let has_partner = self
+            .partner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|partner| !partner.candidates.is_empty());
         let has_socket = self.punch_socket.lock().unwrap().is_some();
         self.hole_punch_ready
-            .store(has_key && has_candidates && has_socket, Ordering::Relaxed);
+            .store(has_partner && has_socket, Ordering::Relaxed);
     }
 }
 
@@ -312,6 +348,146 @@ fn retry_secs(consecutive_failures: u32) -> u64 {
         1 => 30,
         _ => 60,
     }
+}
+
+fn parse_pending_request(
+    value: &serde_json::Value,
+    session_id: &str,
+    host_peer_id: &str,
+    host_lease_id: &str,
+) -> Option<PendingRequest> {
+    if session_id.is_empty()
+        || value["expected_partner_peer_id"].as_str()? != host_peer_id
+        || value["partner_peer_id"].as_str()? != host_peer_id
+        || value["partner_lease_id"].as_str()? != host_lease_id
+    {
+        return None;
+    }
+    Some(PendingRequest {
+        session_id: session_id.to_string(),
+        generation: value["generation"]
+            .as_u64()
+            .filter(|generation| *generation != 0)?,
+        owner_peer_id: value["owner_peer_id"].as_str()?.to_string(),
+        owner_lease_id: value["owner_lease_id"].as_str()?.to_string(),
+        partner_peer_id: value["partner_peer_id"].as_str()?.to_string(),
+        partner_lease_id: value["partner_lease_id"].as_str()?.to_string(),
+        context: value["context"].as_str()?.to_string(),
+    })
+}
+
+fn unregister_api_peer(api_url: &str, token: &str, peer_id: &str, lease_id: &str) -> bool {
+    let body = serde_json::json!({
+        "token": token,
+        "role": "host",
+        "peer_id": peer_id,
+        "lease_id": lease_id,
+    })
+    .to_string();
+    http_agent()
+        .post(&format!("{api_url}/api/unregister"))
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+        .is_ok()
+}
+
+fn post_api_value(
+    api_url: &str,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> Option<serde_json::Value> {
+    http_agent()
+        .post(&format!("{api_url}/api/{endpoint}"))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .ok()?
+        .into_string()
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+/// Exchange a live client relay request for the host's short-lived one-use ticket.
+pub enum RelayClaimError {
+    Terminal(String),
+    Transient(String),
+}
+
+fn relay_conflict_is_terminal(message: &str) -> bool {
+    [
+        "ownership changed",
+        "partner identity changed",
+        "partner process lease changed",
+        "different live peer",
+        "newer process lease",
+        "live process lease",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+pub fn claim_relay_ticket(
+    api_url: &str,
+    token: &str,
+    peer_id: &str,
+    lease_id: &str,
+    request: &PendingRequest,
+) -> Result<String, RelayClaimError> {
+    let body = serde_json::json!({
+        "token": token,
+        "role": "host",
+        "peer_id": peer_id,
+        "lease_id": lease_id,
+        "expected_partner_peer_id": request.owner_peer_id,
+        "expected_partner_lease_id": request.owner_lease_id,
+        "generation": request.generation,
+        "mode": "join",
+    })
+    .to_string();
+    let response = http_agent()
+        .post(&format!("{api_url}/api/relay"))
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+        .map_err(|error| match error {
+            ureq::Error::Status(409, response) => {
+                let status_text = response.status_text().to_string();
+                let detail = response
+                    .into_string()
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .and_then(|value| value["error"].as_str().map(str::to_string))
+                    .unwrap_or(status_text);
+                let message = format!("claim relay ticket: {detail}");
+                if relay_conflict_is_terminal(&detail) {
+                    RelayClaimError::Terminal(message)
+                } else {
+                    RelayClaimError::Transient(message)
+                }
+            }
+            error => RelayClaimError::Transient(format!("claim relay ticket: {error}")),
+        })?;
+    let text = response
+        .into_string()
+        .map_err(|error| RelayClaimError::Transient(format!("read relay response: {error}")))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| RelayClaimError::Transient(format!("parse relay response: {error}")))?;
+    if value["session_id"].as_str() != Some(request.session_id.as_str())
+        || value["mode"].as_str() != Some("relay")
+        || value["generation"].as_u64() != Some(request.generation)
+        || value["owner_peer_id"].as_str() != Some(request.owner_peer_id.as_str())
+        || value["owner_lease_id"].as_str() != Some(request.owner_lease_id.as_str())
+        || value["partner_peer_id"].as_str() != Some(peer_id)
+        || value["partner_lease_id"].as_str() != Some(lease_id)
+        || value["context"].as_str() != Some(request.context.as_str())
+    {
+        return Err(RelayClaimError::Terminal(
+            "relay response did not match the lease-bound session signal".into(),
+        ));
+    }
+    value["ticket"]
+        .as_str()
+        .filter(|ticket| !ticket.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| RelayClaimError::Transient("API server returned no relay ticket".into()))
 }
 
 /// Sleep for `secs` seconds, but wake early if shutdown is requested.
@@ -472,8 +648,10 @@ pub fn start_api_registration(
             eprintln!("[api] Failed to prepare punch socket: {e}");
         }
         let peer_id = control.peer_id().to_string();
+        let lease_id = tunnel_state.lease_id().to_string();
         let hostname = get_hostname();
         let mut failures: u32 = 0;
+        let mut registered_token: Option<String> = None;
 
         loop {
             if control.shutdown_requested() {
@@ -481,6 +659,29 @@ pub fn start_api_registration(
             }
 
             let token = control.token();
+            if registered_token
+                .as_deref()
+                .is_some_and(|registered| registered != token)
+            {
+                let old_token = registered_token
+                    .take()
+                    .expect("registered token disappeared during credential rotation");
+                if !unregister_api_peer(&api_url, &old_token, &peer_id, &lease_id) {
+                    eprintln!("[api] Failed to unregister previous token; it will expire");
+                }
+                tunnel_state.connected.store(false, Ordering::Relaxed);
+                tunnel_state.clear_partner_state();
+                tunnel_state.update_pending_client_punch(None);
+                tunnel_state.update_pending_client_relay(None);
+            }
+            if token.is_empty() || token.len() > MAX_API_TOKEN_LEN {
+                tunnel_state.connected.store(false, Ordering::Relaxed);
+                eprintln!("[api] Token must contain 1..={MAX_API_TOKEN_LEN} bytes");
+                if interruptible_sleep(&control, 10) {
+                    break;
+                }
+                continue;
+            }
             let local_candidates = match tunnel_state.ensure_punch_socket(listen_port) {
                 Ok(candidates) => candidates,
                 Err(e) => {
@@ -494,8 +695,10 @@ pub fn start_api_registration(
                 "token": token,
                 "role": "host",
                 "peer_id": peer_id,
+                "lease_id": lease_id,
                 "hostname": hostname,
                 "candidates": local_candidates,
+                "public_key": tunnel_state.public_key_b64(),
             })
             .to_string();
             let ok = http_agent()
@@ -510,96 +713,114 @@ pub fn start_api_registration(
                 }
                 failures = 0;
                 tunnel_state.connected.store(true, Ordering::Relaxed);
+                registered_token = Some(token.clone());
 
-                let key_body = serde_json::json!({
-                    "token": token,
-                    "role": "host",
-                    "public_key": tunnel_state.public_key_b64(),
-                })
-                .to_string();
-                match http_agent()
-                    .post(&format!("{api_url}/api/key"))
-                    .set("Content-Type", "application/json")
-                    .send_string(&key_body)
-                {
-                    Ok(resp) => {
-                        if let Ok(text) = resp.into_string() {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                tunnel_state
-                                    .update_shared_key_from_partner_b64(v["partner_key"].as_str());
-                            } else {
-                                tunnel_state.set_shared_key(None);
-                            }
-                        } else {
-                            tunnel_state.set_shared_key(None);
-                        }
-                    }
-                    Err(_) => tunnel_state.set_shared_key(None),
+                let discovery =
+                    post_api_value(&api_url, "session", serde_json::json!({"token": token}));
+                let client_identity = discovery.as_ref().and_then(|value| {
+                    Some((
+                        value["client"]["peer_id"].as_str()?.to_string(),
+                        value["client"]["lease_id"].as_str()?.to_string(),
+                    ))
+                });
+                let client_joined = client_identity.is_some();
+                if let Some(value) = discovery.as_ref() {
+                    tunnel_state.set_relay_port(value["relay_port"].as_u64().map(|p| p as u16));
                 }
 
-                let cand_body = serde_json::json!({
-                    "token": token,
-                    "role": "host",
-                    "candidates": local_candidates,
-                })
-                .to_string();
-                match http_agent()
-                    .post(&format!("{api_url}/api/candidates"))
-                    .set("Content-Type", "application/json")
-                    .send_string(&cand_body)
-                {
-                    Ok(resp) => {
-                        if let Ok(text) = resp.into_string() {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                let addrs: Vec<SocketAddr> = v["partner_candidates"]
-                                    .as_array()
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|value| value.as_str()?.parse().ok())
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                tunnel_state.set_partner_candidates(addrs);
-                            } else {
-                                tunnel_state.set_partner_candidates(Vec::new());
-                            }
-                        } else {
-                            tunnel_state.set_partner_candidates(Vec::new());
+                let synchronized = client_identity.and_then(|(client_peer_id, client_lease_id)| {
+                    let session = post_api_value(
+                        &api_url,
+                        "session",
+                        serde_json::json!({
+                            "token": token,
+                            "role": "host",
+                            "peer_id": peer_id,
+                            "lease_id": lease_id,
+                            "expected_partner_peer_id": client_peer_id,
+                            "expected_partner_lease_id": client_lease_id,
+                        }),
+                    )?;
+                    if session["client"]["peer_id"].as_str() != Some(&client_peer_id)
+                        || session["client"]["lease_id"].as_str() != Some(&client_lease_id)
+                    {
+                        return None;
+                    }
+                    let key = post_api_value(
+                        &api_url,
+                        "key",
+                        serde_json::json!({
+                            "token": token,
+                            "role": "host",
+                            "peer_id": peer_id,
+                            "lease_id": lease_id,
+                            "expected_partner_peer_id": client_peer_id,
+                            "expected_partner_lease_id": client_lease_id,
+                            "public_key": tunnel_state.public_key_b64(),
+                        }),
+                    )?;
+                    let candidates = post_api_value(
+                        &api_url,
+                        "candidates",
+                        serde_json::json!({
+                            "token": token,
+                            "role": "host",
+                            "peer_id": peer_id,
+                            "lease_id": lease_id,
+                            "expected_partner_peer_id": client_peer_id,
+                            "expected_partner_lease_id": client_lease_id,
+                            "candidates": local_candidates,
+                        }),
+                    )?;
+                    for response in [&key, &candidates] {
+                        if response["partner_peer_id"].as_str() != Some(&client_peer_id)
+                            || response["partner_lease_id"].as_str() != Some(&client_lease_id)
+                        {
+                            return None;
                         }
                     }
-                    Err(_) => tunnel_state.set_partner_candidates(Vec::new()),
-                }
+                    let shared_secret = tunnel_state
+                        .shared_secret_from_partner_b64(key["partner_key"].as_str()?)?;
+                    let addrs = candidates["partner_candidates"]
+                        .as_array()?
+                        .iter()
+                        .filter_map(|value| value.as_str()?.parse().ok())
+                        .collect();
+                    Some((
+                        session,
+                        client_peer_id,
+                        client_lease_id,
+                        shared_secret,
+                        addrs,
+                    ))
+                });
 
-                // Send our role so the API refreshes our last_seen (polling =
-                // liveness) and the host doesn't age out during a slow punch.
-                let session_body = format!(r#"{{"token":"{token}","role":"host"}}"#);
-                let mut client_joined = false;
-                match http_agent()
-                    .post(&format!("{api_url}/api/session"))
-                    .set("Content-Type", "application/json")
-                    .send_string(&session_body)
+                if let Some((session, client_peer_id, client_lease_id, shared_secret, addrs)) =
+                    synchronized
                 {
-                    Ok(resp) => {
-                        if let Ok(text) = resp.into_string() {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                client_joined = v["client_joined"].as_bool().unwrap_or(false);
-                                let punch_nonce = v["client_punch_nonce"].as_u64().unwrap_or(0);
-                                tunnel_state.update_pending_client_punch_nonce(punch_nonce);
-                                let relay_nonce = v["client_relay_nonce"].as_u64().unwrap_or(0);
-                                tunnel_state.update_pending_client_relay_nonce(relay_nonce);
-                                tunnel_state
-                                    .set_relay_port(v["relay_port"].as_u64().map(|p| p as u16));
-                                if !client_joined {
-                                    tunnel_state.clear_partner_state();
-                                }
-                            } else {
-                                tunnel_state.clear_partner_state();
-                            }
-                        } else {
-                            tunnel_state.clear_partner_state();
-                        }
-                    }
-                    Err(_) => tunnel_state.clear_partner_state(),
+                    let session_id = session["session_id"].as_str().unwrap_or_default();
+                    tunnel_state.set_partner_snapshot(
+                        client_peer_id,
+                        client_lease_id,
+                        shared_secret,
+                        addrs,
+                    );
+                    tunnel_state.update_pending_client_punch(parse_pending_request(
+                        &session["client_punch_request"],
+                        session_id,
+                        &peer_id,
+                        &lease_id,
+                    ));
+                    tunnel_state.update_pending_client_relay(parse_pending_request(
+                        &session["client_relay_request"],
+                        session_id,
+                        &peer_id,
+                        &lease_id,
+                    ));
+                } else {
+                    tunnel_state.clear_partner_state();
+                    tunnel_state.update_pending_client_punch(None);
+                    tunnel_state.update_pending_client_relay(None);
                 }
 
                 // Poll cadence:
@@ -632,17 +853,11 @@ pub fn start_api_registration(
             }
         }
 
-        let token = control.token();
-        let body = serde_json::json!({
-            "token": token,
-            "role": "host",
-            "peer_id": peer_id,
-        })
-        .to_string();
-        let _ = http_agent()
-            .post(&format!("{api_url}/api/unregister"))
-            .set("Content-Type", "application/json")
-            .send_string(&body);
+        if let Some(token) = registered_token {
+            if !unregister_api_peer(&api_url, &token, &peer_id, &lease_id) {
+                eprintln!("[api] Failed to unregister from API server");
+            }
+        }
         tunnel_state.connected.store(false, Ordering::Relaxed);
         println!("[api] Unregistered from API server");
     });
@@ -656,4 +871,61 @@ fn get_hostname() -> String {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| "unknown".to_string())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_json() -> serde_json::Value {
+        serde_json::json!({
+            "generation": 7,
+            "owner_peer_id": "client-peer",
+            "owner_lease_id": "client-lease",
+            "expected_partner_peer_id": "host-peer",
+            "partner_peer_id": "host-peer",
+            "partner_lease_id": "host-lease",
+            "context": "request-context",
+        })
+    }
+
+    #[test]
+    fn absent_request_stays_absent() {
+        assert!(parse_pending_request(
+            &serde_json::Value::Null,
+            "session",
+            "host-peer",
+            "host-lease"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn api_session_generation_distinguishes_restart_requests() {
+        let before = parse_pending_request(
+            &request_json(),
+            "api-session-before",
+            "host-peer",
+            "host-lease",
+        )
+        .unwrap();
+        let after = parse_pending_request(
+            &request_json(),
+            "api-session-after",
+            "host-peer",
+            "host-lease",
+        )
+        .unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn only_relay_ownership_conflicts_are_terminal() {
+        assert!(relay_conflict_is_terminal(
+            "relay request generation or ownership changed"
+        ));
+        assert!(relay_conflict_is_terminal("partner process lease changed"));
+        assert!(!relay_conflict_is_terminal("no live partner relay request"));
+        assert!(!relay_conflict_is_terminal("relay disabled"));
+    }
 }

@@ -439,8 +439,10 @@ fn capture_xfixes_cursor(display: *mut x11_ffi::Display) -> Option<CapturedCurso
     }
 
     let ci = unsafe { &*cursor_image };
-    let w = ci.width as usize;
-    let h = ci.height as usize;
+    let (w, h) = (ci.width as usize, ci.height as usize);
+    let (x, y) = (ci.x - ci.xhot as i32, ci.y - ci.yhot as i32);
+    let (hotspot_x, hotspot_y) = (ci.xhot, ci.yhot);
+    let shape_serial = ci.cursor_serial;
     let pixel_count = w * h;
 
     if pixel_count == 0 {
@@ -457,21 +459,17 @@ fn capture_xfixes_cursor(display: *mut x11_ffi::Display) -> Option<CapturedCurso
         pixels.extend_from_slice(&argb.to_ne_bytes());
     }
 
-    // Position: XFixes reports the cursor hotspot position on screen
-    let x = ci.x - ci.xhot as i32;
-    let y = ci.y - ci.yhot as i32;
-
     unsafe { x11_ffi::XFree(cursor_image as *mut _) };
 
     Some(CapturedCursor {
         pixels: pixels.into(),
         x,
         y,
-        hotspot_x: ci.xhot,
-        hotspot_y: ci.yhot,
+        hotspot_x,
+        hotspot_y,
         width: w as u32,
         height: h as u32,
-        shape_serial: ci.cursor_serial as u64,
+        shape_serial,
         visible: true,
     })
 }

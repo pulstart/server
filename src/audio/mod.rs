@@ -75,9 +75,10 @@ pub fn set_realtime_priority(role: &str) {
 
 use crate::broadcast::Broadcaster;
 use crate::encode_config::AudioConfig;
-use crossbeam_channel::{unbounded, Sender};
+use crate::transport::EncodedAudioPacket;
+use crossbeam_channel::{unbounded, Receiver, RecvError, Sender};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::thread;
@@ -90,6 +91,7 @@ pub struct AudioPipeline {
     encode_handle: Option<thread::JoinHandle<()>>,
     relay_handle: Option<thread::JoinHandle<()>>,
     sample_tx: Option<Sender<capture::AudioSamples>>,
+    next_source_seq: Arc<AtomicU64>,
     config: Option<AudioConfig>,
     capture_active: bool,
 }
@@ -102,6 +104,7 @@ impl AudioPipeline {
             encode_handle: None,
             relay_handle: None,
             sample_tx: None,
+            next_source_seq: Arc::new(AtomicU64::new(0)),
             config: None,
             capture_active: false,
         }
@@ -112,7 +115,7 @@ impl AudioPipeline {
     pub fn start(
         &mut self,
         config: AudioConfig,
-        broadcaster: Arc<Broadcaster<Vec<u8>>>,
+        broadcaster: Arc<Broadcaster<EncodedAudioPacket>>,
     ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("Audio pipeline already running".into());
@@ -147,18 +150,8 @@ impl AudioPipeline {
         let relay_handle = thread::spawn(move || {
             let mut backlog_logs = 0usize;
             while relay_running.load(Ordering::SeqCst) {
-                match packet_rx.recv() {
-                    Ok(mut packet) => {
-                        let mut dropped_packets = 0usize;
-                        while packet_rx.len() > max_packet_backlog {
-                            match packet_rx.try_recv() {
-                                Ok(newer) => {
-                                    packet = newer;
-                                    dropped_packets += 1;
-                                }
-                                Err(_) => break,
-                            }
-                        }
+                match recv_with_backlog_limit(&packet_rx, max_packet_backlog) {
+                    Ok((packet, dropped_packets)) => {
                         if relay_trace && dropped_packets > 0 && backlog_logs < 12 {
                             eprintln!(
                                 "[trace][audio] relay dropped {} stale encoded packet(s)",
@@ -166,7 +159,7 @@ impl AudioPipeline {
                             );
                             backlog_logs += 1;
                         }
-                        broadcaster.broadcast(packet.data);
+                        broadcaster.broadcast(packet);
                     }
                     Err(_) => break,
                 }
@@ -200,7 +193,12 @@ impl AudioPipeline {
             "[audio] Auto-detect using source: {}",
             monitor_source.as_deref().unwrap_or("default")
         );
-        if let Err(err) = self.capture.start(config, monitor_source, sample_tx) {
+        if let Err(err) = self.capture.start(
+            config,
+            monitor_source,
+            sample_tx,
+            Arc::clone(&self.next_source_seq),
+        ) {
             eprintln!("[audio] Capture start failed: {err}");
             self.capture_active = false;
             return;
@@ -226,5 +224,68 @@ impl AudioPipeline {
     #[allow(dead_code)]
     pub fn has_active_capture(&self) -> bool {
         self.capture_active
+    }
+}
+
+pub(super) fn recv_with_backlog_limit<T>(
+    rx: &Receiver<T>,
+    max_backlog: usize,
+) -> Result<(T, usize), RecvError> {
+    let mut item = rx.recv()?;
+    let mut dropped = 0;
+    while rx.len() > max_backlog {
+        match rx.try_recv() {
+            Ok(newer) => {
+                item = newer;
+                dropped += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((item, dropped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recv_with_backlog_limit, Broadcaster, EncodedAudioPacket};
+    use crossbeam_channel::unbounded;
+
+    fn packet(source_seq: u64) -> EncodedAudioPacket {
+        EncodedAudioPacket {
+            source_seq,
+            data: vec![source_seq as u8],
+        }
+    }
+
+    #[test]
+    fn relay_backlog_drop_preserves_source_gap() {
+        let (tx, rx) = unbounded();
+        tx.send(packet(10)).unwrap();
+        let (first, dropped) = recv_with_backlog_limit(&rx, 1).unwrap();
+        assert_eq!(first.source_seq, 10);
+        assert_eq!(dropped, 0);
+
+        for seq in 11..=14 {
+            tx.send(packet(seq)).unwrap();
+        }
+        let (next, dropped) = recv_with_backlog_limit(&rx, 1).unwrap();
+        assert_eq!(dropped, 2);
+        assert_eq!(next.source_seq, 13);
+        assert_eq!(next.source_seq - first.source_seq, 3);
+    }
+
+    #[test]
+    fn broadcaster_eviction_preserves_source_gap() {
+        let broadcaster = Broadcaster::new();
+        let (_, rx) = broadcaster.subscribe(1).unwrap();
+
+        broadcaster.broadcast(packet(20));
+        let first = rx.recv().unwrap();
+        broadcaster.broadcast(packet(21));
+        broadcaster.broadcast(packet(22));
+        let next = rx.recv().unwrap();
+
+        assert_eq!(first.source_seq, 20);
+        assert_eq!(next.source_seq, 22);
     }
 }

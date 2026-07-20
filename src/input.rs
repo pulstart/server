@@ -1,11 +1,12 @@
 #[cfg(target_os = "linux")]
 use crate::capture::linux::{active_remote_desktop_session, RemoteDesktopPortalSession};
+use rand::{rngs::OsRng, RngCore};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use st_protocol::MOUSE_WHEEL_STEP_UNITS;
 use st_protocol::{
-    ControlMessage, ControllerState, CursorShape, CursorState, InputCapabilities, InputPacket,
-    KeyboardKey, KEYBOARD_STATE_BYTES, MOUSE_BUTTON_EXTRA1, MOUSE_BUTTON_EXTRA2,
-    MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
+    ControlMessage, ControllerState, CursorShape, CursorState, InputCapabilities, InputCredential,
+    InputPacket, KeyboardKey, KEYBOARD_STATE_BYTES, MAX_TEXT_INPUT_BYTES, MOUSE_BUTTON_EXTRA1,
+    MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
 };
 use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "linux")]
@@ -17,15 +18,17 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::POINT;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    VIRTUAL_KEY,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -34,6 +37,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const MAX_CURSOR_SHAPE_RGBA_BYTES: usize = u16::MAX as usize - 16;
+const TEXT_INPUT_RATE_WINDOW: Duration = Duration::from_secs(1);
+const TEXT_INPUT_RATE_BYTES: usize = 16 * 1024;
+const TEXT_INPUT_RATE_MESSAGES: u32 = 32;
+
+pub fn generate_input_credential() -> InputCredential {
+    let mut bytes = [0u8; st_protocol::INPUT_CREDENTIAL_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    InputCredential::from_bytes(bytes)
+}
 
 // ---- Warp / mouselook-without-hide detector (ST_WARP_DETECT) ----------------
 // Cursor observations accumulated before a window is judged.
@@ -226,12 +238,65 @@ pub struct InputRuntime {
     /// the warp detector can't (e.g. NVIDIA, no cursor-position readback).
     game_mode: AtomicBool,
     inner: Mutex<InputRuntimeInner>,
-    /// Per-client UDP media-destination cells (B3 return-path relearn). The
-    /// transport thread for each client watches its cell and repoints its send
-    /// socket when the address changes; this listener updates the cell from the
-    /// live source address of the client's input packets (the client sends
-    /// input from the same socket it receives media on).
-    media_dest_by_client: Mutex<HashMap<u32, Arc<Mutex<SocketAddr>>>>,
+    active_clients: Mutex<HashMap<u32, ActiveInputClient>>,
+}
+
+enum ActiveInputClient {
+    Direct {
+        credential: InputCredential,
+        source_ip: std::net::IpAddr,
+        media_dest: Arc<Mutex<SocketAddr>>,
+        text_rate: TextInputRateLimiter,
+    },
+    Tunnel {
+        credential: InputCredential,
+        text_rate: TextInputRateLimiter,
+    },
+}
+
+struct TextInputRateLimiter {
+    window_started: Instant,
+    bytes: usize,
+    messages: u32,
+}
+
+impl Default for TextInputRateLimiter {
+    fn default() -> Self {
+        Self {
+            window_started: Instant::now(),
+            bytes: 0,
+            messages: 0,
+        }
+    }
+}
+
+impl TextInputRateLimiter {
+    fn allow(&mut self, bytes: usize, now: Instant) -> bool {
+        if now.duration_since(self.window_started) >= TEXT_INPUT_RATE_WINDOW {
+            self.window_started = now;
+            self.bytes = 0;
+            self.messages = 0;
+        }
+        if self.messages >= TEXT_INPUT_RATE_MESSAGES
+            || self.bytes.saturating_add(bytes) > TEXT_INPUT_RATE_BYTES
+        {
+            return false;
+        }
+        self.messages += 1;
+        self.bytes += bytes;
+        true
+    }
+}
+
+pub struct RegisteredInputClient {
+    runtime: Arc<InputRuntime>,
+    client_id: u32,
+}
+
+impl Drop for RegisteredInputClient {
+    fn drop(&mut self) {
+        self.runtime.unregister_client(self.client_id);
+    }
 }
 
 fn trace_enabled() -> bool {
@@ -455,38 +520,65 @@ impl InputRuntime {
                 stream_height: 0,
                 warp: WarpDetector::new(),
             }),
-            media_dest_by_client: Mutex::new(HashMap::new()),
+            active_clients: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Register a per-client UDP media-destination cell (B3). The client's
-    /// transport thread shares this cell; the input listener updates it when the
-    /// client's UDP source address changes (wifi switch / NAT rebind).
-    pub fn register_media_dest(&self, client_id: u32, dest: Arc<Mutex<SocketAddr>>) {
-        self.media_dest_by_client
-            .lock()
-            .unwrap()
-            .insert(client_id, dest);
-    }
-
-    pub fn unregister_media_dest(&self, client_id: u32) {
-        self.media_dest_by_client.lock().unwrap().remove(&client_id);
-    }
-
-    /// Update a client's learned media return path from an observed input-packet
-    /// source address. No-op for clients without a registered cell (e.g. the
-    /// punched path, whose media destination is fixed by the hole punch).
-    fn observe_client_source(&self, client_id: u32, src: SocketAddr) {
-        if let Some(cell) = self.media_dest_by_client.lock().unwrap().get(&client_id) {
-            let mut dest = cell.lock().unwrap();
-            if *dest != src {
-                println!(
-                    "[input] client {client_id} return path moved {} -> {src}",
-                    *dest
-                );
-                *dest = src;
-            }
+    /// Register an authenticated direct client before its startup bundle is sent.
+    /// Input may update the UDP port, but it must come from the TCP peer's IP.
+    pub fn register_direct_client(
+        self: &Arc<Self>,
+        client_id: u32,
+        credential: InputCredential,
+        source_ip: std::net::IpAddr,
+        media_dest: Arc<Mutex<SocketAddr>>,
+    ) -> RegisteredInputClient {
+        self.active_clients.lock().unwrap().insert(
+            client_id,
+            ActiveInputClient::Direct {
+                credential,
+                source_ip,
+                media_dest,
+                text_rate: TextInputRateLimiter::default(),
+            },
+        );
+        RegisteredInputClient {
+            runtime: Arc::clone(self),
+            client_id,
         }
+    }
+
+    pub fn register_tunnel_client(
+        self: &Arc<Self>,
+        client_id: u32,
+        credential: InputCredential,
+    ) -> RegisteredInputClient {
+        self.active_clients.lock().unwrap().insert(
+            client_id,
+            ActiveInputClient::Tunnel {
+                credential,
+                text_rate: TextInputRateLimiter::default(),
+            },
+        );
+        RegisteredInputClient {
+            runtime: Arc::clone(self),
+            client_id,
+        }
+    }
+
+    fn unregister_client(&self, client_id: u32) {
+        // Keep the lock order identical to packet handling so a packet cannot
+        // recreate sequence state after its registration has been removed.
+        let mut active_clients = self.active_clients.lock().unwrap();
+        active_clients.remove(&client_id);
+        let mut inner = self.inner.lock().unwrap();
+        inner.last_input_seq_by_client.remove(&client_id);
+        if inner.controller_id == Some(client_id) {
+            inner.release_all_inputs();
+            inner.controller_id = None;
+            inner.warp.reset();
+        }
+        self.set_active_controller(inner.controller_id);
     }
 
     pub fn spawn_listener(self: &Arc<Self>, port: u16) {
@@ -512,6 +604,37 @@ impl InputRuntime {
 
     pub fn capabilities(&self) -> InputCapabilities {
         self.inner.lock().unwrap().capabilities
+    }
+
+    pub fn handle_text_input(&self, client_id: u32, text: &str) -> bool {
+        if text.is_empty() || text.len() > MAX_TEXT_INPUT_BYTES || text.contains('\0') {
+            return false;
+        }
+
+        let mut active_clients = self.active_clients.lock().unwrap();
+        let text_rate = match active_clients.get_mut(&client_id) {
+            Some(ActiveInputClient::Direct { text_rate, .. })
+            | Some(ActiveInputClient::Tunnel { text_rate, .. }) => text_rate,
+            None => return false,
+        };
+        if !text_rate.allow(text.len(), Instant::now()) {
+            return false;
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        drop(active_clients);
+        if !inner.capabilities.keyboard
+            || !inner.capabilities.text_input
+            || matches!(inner.backend, InputBackend::Unavailable)
+        {
+            return false;
+        }
+        if inner.controller_id.is_some_and(|owner| owner != client_id) {
+            return false;
+        }
+        inner.activate_controller(client_id);
+        self.set_active_controller(Some(client_id));
+        inner.inject_text(text)
     }
 
     pub fn backend_label(&self) -> String {
@@ -607,6 +730,7 @@ impl InputRuntime {
                         separate_cursor: true,
                         hover_capture: true,
                         cursor_position_reliable: true,
+                        text_input: true,
                     };
                 }
                 Err(err) => {
@@ -633,6 +757,7 @@ impl InputRuntime {
                         separate_cursor: true,
                         hover_capture: true,
                         cursor_position_reliable: true,
+                        text_input: true,
                     };
                 }
                 Err(err) => {
@@ -974,8 +1099,9 @@ impl InputRuntime {
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((n, src)) => {
-                    if let Some((header, packet)) = InputPacket::deserialize(&buf[..n]) {
-                        self.handle_input_packet(header.seq, packet, src);
+                    if let Some((header, credential, packet)) = InputPacket::deserialize(&buf[..n])
+                    {
+                        self.handle_input_packet(header.seq, credential, packet, src);
                     }
                 }
                 Err(err) => {
@@ -986,25 +1112,88 @@ impl InputRuntime {
         }
     }
 
-    pub fn handle_input_packet(&self, seq: u16, packet: InputPacket, src: SocketAddr) {
-        let mut inner = self.inner.lock().unwrap();
-        let client_id = match packet {
-            InputPacket::MouseAbsolute(packet) => packet.client_id,
-            InputPacket::MouseRelative(packet) => packet.client_id,
-            InputPacket::MouseButtons(packet) => packet.client_id,
-            InputPacket::MouseWheel(packet) => packet.client_id,
-            InputPacket::KeyboardState(packet) => packet.client_id,
-        };
-        if matches!(inner.backend, InputBackend::Unavailable) {
+    pub fn handle_input_packet(
+        &self,
+        seq: u16,
+        credential: InputCredential,
+        packet: InputPacket,
+        src: SocketAddr,
+    ) {
+        self.handle_registered_input_packet(
+            seq,
+            credential,
+            packet,
+            InputPacketSource::Direct(src),
+        );
+    }
+
+    pub fn handle_tunnel_input_packet(
+        &self,
+        seq: u16,
+        credential: InputCredential,
+        packet: InputPacket,
+        client_id: u32,
+    ) {
+        if input_packet_client_id(&packet) != client_id {
             return;
         }
+        self.handle_registered_input_packet(seq, credential, packet, InputPacketSource::Tunnel);
+    }
+
+    fn handle_registered_input_packet(
+        &self,
+        seq: u16,
+        credential: InputCredential,
+        packet: InputPacket,
+        source: InputPacketSource,
+    ) {
+        let client_id = input_packet_client_id(&packet);
+        let active_clients = self.active_clients.lock().unwrap();
+        let credential_matches = match active_clients.get(&client_id) {
+            Some(ActiveInputClient::Direct {
+                credential: expected,
+                ..
+            })
+            | Some(ActiveInputClient::Tunnel {
+                credential: expected,
+                ..
+            }) => *expected == credential,
+            None => false,
+        };
+        if !credential_matches {
+            return;
+        }
+        let media_dest = match (active_clients.get(&client_id), source) {
+            (
+                Some(ActiveInputClient::Direct {
+                    source_ip,
+                    media_dest,
+                    ..
+                }),
+                InputPacketSource::Direct(src),
+            ) if *source_ip == src.ip() => Some((Arc::clone(media_dest), src)),
+            (Some(ActiveInputClient::Tunnel { .. }), InputPacketSource::Tunnel) => None,
+            _ => return,
+        };
+
+        let mut inner = self.inner.lock().unwrap();
         if !inner.accept_input_seq(client_id, seq) {
             return;
         }
-        // B3: relearn this client's media return path from its live UDP source
-        // (input and media share one client socket), so the transport repoints
-        // after a wifi switch / NAT rebind without a full reconnect.
-        self.observe_client_source(client_id, src);
+        if let Some((cell, src)) = media_dest {
+            let mut dest = cell.lock().unwrap();
+            if *dest != src {
+                println!(
+                    "[input] client {client_id} return path moved {} -> {src}",
+                    *dest
+                );
+                *dest = src;
+            }
+        }
+        drop(active_clients);
+        if matches!(inner.backend, InputBackend::Unavailable) {
+            return;
+        }
         // B5: implicit control grab — first client to send input takes control —
         // but a stray/late/duplicate packet from a *non-owner* must not steal
         // control from the active owner. Stealing would release the owner's held
@@ -1014,6 +1203,9 @@ impl InputRuntime {
             if owner != client_id {
                 return;
             }
+        } else if input_packet_is_neutral(&packet) {
+            // Bootstrap snapshots establish the return path but must not claim control.
+            return;
         }
         inner.activate_controller(client_id);
         self.set_active_controller(Some(client_id));
@@ -1051,6 +1243,22 @@ impl InputRuntime {
                 inner.sync_keyboard(packet.pressed);
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InputPacketSource {
+    Direct(SocketAddr),
+    Tunnel,
+}
+
+fn input_packet_client_id(packet: &InputPacket) -> u32 {
+    match packet {
+        InputPacket::MouseAbsolute(packet) => packet.client_id,
+        InputPacket::MouseRelative(packet) => packet.client_id,
+        InputPacket::MouseButtons(packet) => packet.client_id,
+        InputPacket::MouseWheel(packet) => packet.client_id,
+        InputPacket::KeyboardState(packet) => packet.client_id,
     }
 }
 
@@ -1263,10 +1471,92 @@ impl InputRuntimeInner {
     }
 
     fn sync_keyboard(&mut self, next: [u8; KEYBOARD_STATE_BYTES]) {
+        for_each_keyboard_transition(self.keyboard_state, next, |key, now_pressed| {
+            self.inject_key(key, now_pressed);
+        });
+        self.keyboard_state = next;
+    }
+
+    fn inject_text(&mut self, _text: &str) -> bool {
+        let held_modifiers: Vec<_> = KEYBOARD_MODIFIERS
+            .into_iter()
+            .filter(|key| keyboard_state_contains(&self.keyboard_state, *key))
+            .collect();
+        for key in held_modifiers.iter().rev() {
+            self.inject_key(*key, false);
+        }
+        let injected = match &mut self.backend {
+            #[cfg(target_os = "windows")]
+            InputBackend::Windows(controller) => controller.text(_text),
+            #[cfg(target_os = "macos")]
+            InputBackend::Macos(controller) => controller.text(_text),
+            _ => false,
+        };
+        for key in held_modifiers {
+            self.inject_key(key, true);
+        }
+        injected
+    }
+
+    fn inject_key(&mut self, key: KeyboardKey, pressed: bool) {
+        match &mut self.backend {
+            InputBackend::Unavailable => {}
+            #[cfg(target_os = "linux")]
+            InputBackend::X11(controller) => controller.key(key, pressed),
+            #[cfg(target_os = "linux")]
+            InputBackend::Uinput(controller) => controller.key(key, pressed),
+            #[cfg(target_os = "linux")]
+            InputBackend::PortalRemoteDesktop(controller) => {
+                if let Some(code) = linux_key_code(key) {
+                    if let Err(e) = controller.notify_keyboard_keycode(code, pressed) {
+                        log_portal_error("notify_keyboard_keycode", e);
+                    }
+                }
+            }
+            #[cfg(target_os = "windows")]
+            InputBackend::Windows(controller) => controller.key(key, pressed),
+            #[cfg(target_os = "macos")]
+            InputBackend::Macos(controller) => controller.key(key, pressed),
+        }
+    }
+}
+
+const KEYBOARD_MODIFIERS: [KeyboardKey; 8] = [
+    KeyboardKey::LeftShift,
+    KeyboardKey::LeftCtrl,
+    KeyboardKey::LeftAlt,
+    KeyboardKey::LeftMeta,
+    KeyboardKey::RightShift,
+    KeyboardKey::RightCtrl,
+    KeyboardKey::RightAlt,
+    KeyboardKey::RightMeta,
+];
+
+fn keyboard_state_contains(state: &[u8; KEYBOARD_STATE_BYTES], key: KeyboardKey) -> bool {
+    let (byte, bit) = key.bit();
+    state[byte] & bit != 0
+}
+
+fn input_packet_is_neutral(packet: &InputPacket) -> bool {
+    match packet {
+        InputPacket::MouseButtons(packet) => packet.buttons == 0,
+        InputPacket::KeyboardState(packet) => packet.pressed.iter().all(|byte| *byte == 0),
+        _ => false,
+    }
+}
+
+fn for_each_keyboard_transition(
+    previous: [u8; KEYBOARD_STATE_BYTES],
+    next: [u8; KEYBOARD_STATE_BYTES],
+    mut transition: impl FnMut(KeyboardKey, bool),
+) {
+    // Release ordinary keys before modifiers, then press modifiers before ordinary keys.
+    // This preserves chord semantics even when an intermediate UDP snapshot is lost.
+    for phase in 0..4 {
         for index in 0..KeyboardKey::COUNT {
             let byte = index / 8;
             let bit = 1 << (index % 8);
-            let was_pressed = self.keyboard_state[byte] & bit != 0;
+            let was_pressed = previous[byte] & bit != 0;
             let now_pressed = next[byte] & bit != 0;
             if was_pressed == now_pressed {
                 continue;
@@ -1274,27 +1564,27 @@ impl InputRuntimeInner {
             let Some(key) = KeyboardKey::from_u8(index as u8) else {
                 continue;
             };
-            match &mut self.backend {
-                InputBackend::Unavailable => {}
-                #[cfg(target_os = "linux")]
-                InputBackend::X11(controller) => controller.key(key, now_pressed),
-                #[cfg(target_os = "linux")]
-                InputBackend::Uinput(controller) => controller.key(key, now_pressed),
-                #[cfg(target_os = "linux")]
-                InputBackend::PortalRemoteDesktop(controller) => {
-                    if let Some(code) = linux_key_code(key) {
-                        if let Err(e) = controller.notify_keyboard_keycode(code, now_pressed) {
-                            log_portal_error("notify_keyboard_keycode", e);
-                        }
-                    }
-                }
-                #[cfg(target_os = "windows")]
-                InputBackend::Windows(controller) => controller.key(key, now_pressed),
-                #[cfg(target_os = "macos")]
-                InputBackend::Macos(controller) => controller.key(key, now_pressed),
+            let modifier = matches!(
+                key,
+                KeyboardKey::LeftShift
+                    | KeyboardKey::LeftCtrl
+                    | KeyboardKey::LeftAlt
+                    | KeyboardKey::LeftMeta
+                    | KeyboardKey::RightShift
+                    | KeyboardKey::RightCtrl
+                    | KeyboardKey::RightAlt
+                    | KeyboardKey::RightMeta
+            );
+            let in_phase = match phase {
+                0 => !now_pressed && !modifier,
+                1 => !now_pressed && modifier,
+                2 => now_pressed && modifier,
+                _ => now_pressed && !modifier,
+            };
+            if in_phase {
+                transition(key, now_pressed);
             }
         }
-        self.keyboard_state = next;
     }
 }
 
@@ -1471,6 +1761,20 @@ impl WindowsInputController {
     }
 
     fn key(&mut self, key: KeyboardKey, pressed: bool) {
+        if let Some(virtual_key) = windows_key_virtual_key(key) {
+            self.send_keyboard(KEYBDINPUT {
+                wVk: VIRTUAL_KEY(virtual_key),
+                wScan: 0,
+                dwFlags: if pressed {
+                    Default::default()
+                } else {
+                    KEYEVENTF_KEYUP
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            });
+            return;
+        }
         let Some((scan_code, extended)) = windows_key_scan_code(key) else {
             return;
         };
@@ -1488,6 +1792,30 @@ impl WindowsInputController {
             time: 0,
             dwExtraInfo: 0,
         });
+    }
+
+    fn text(&mut self, text: &str) -> bool {
+        let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
+        for unit in text.encode_utf16() {
+            for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+                inputs.push(INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0),
+                            wScan: unit,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+        }
+        if inputs.is_empty() {
+            return false;
+        }
+        unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) as usize == inputs.len() }
     }
 
     fn refresh_virtual_screen(&mut self) {
@@ -1519,6 +1847,14 @@ impl WindowsInputController {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_key_virtual_key(key: KeyboardKey) -> Option<u16> {
+    match key {
+        KeyboardKey::Pause => Some(0x13),
+        _ => None,
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn windows_virtual_screen_metrics() -> (i32, i32, i32, i32) {
     unsafe {
@@ -1540,7 +1876,7 @@ fn normalize_windows_absolute(coord: i32, span: i32) -> i32 {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn windows_key_scan_code(key: KeyboardKey) -> Option<(u16, bool)> {
     Some(match key {
         KeyboardKey::Escape => (0x01, false),
@@ -1625,6 +1961,50 @@ fn windows_key_scan_code(key: KeyboardKey) -> Option<(u16, bool)> {
         KeyboardKey::RightCtrl => (0x1D, true),
         KeyboardKey::RightAlt => (0x38, true),
         KeyboardKey::RightMeta => (0x5C, true),
+        KeyboardKey::CapsLock => (0x3A, false),
+        KeyboardKey::NumLock => (0x45, false),
+        KeyboardKey::ScrollLock => (0x46, false),
+        KeyboardKey::PrintScreen => (0x37, true),
+        KeyboardKey::Application => (0x5D, true),
+        KeyboardKey::Numpad0 => (0x52, false),
+        KeyboardKey::Numpad1 => (0x4F, false),
+        KeyboardKey::Numpad2 => (0x50, false),
+        KeyboardKey::Numpad3 => (0x51, false),
+        KeyboardKey::Numpad4 => (0x4B, false),
+        KeyboardKey::Numpad5 => (0x4C, false),
+        KeyboardKey::Numpad6 => (0x4D, false),
+        KeyboardKey::Numpad7 => (0x47, false),
+        KeyboardKey::Numpad8 => (0x48, false),
+        KeyboardKey::Numpad9 => (0x49, false),
+        KeyboardKey::NumpadDecimal => (0x53, false),
+        KeyboardKey::NumpadDivide => (0x35, true),
+        KeyboardKey::NumpadMultiply => (0x37, false),
+        KeyboardKey::NumpadSubtract => (0x4A, false),
+        KeyboardKey::NumpadAdd => (0x4E, false),
+        KeyboardKey::NumpadEnter => (0x1C, true),
+        KeyboardKey::NumpadEquals => (0x59, false),
+        KeyboardKey::NumpadComma => (0x7E, false),
+        KeyboardKey::F13 => (0x64, false),
+        KeyboardKey::F14 => (0x65, false),
+        KeyboardKey::F15 => (0x66, false),
+        KeyboardKey::F16 => (0x67, false),
+        KeyboardKey::F17 => (0x68, false),
+        KeyboardKey::F18 => (0x69, false),
+        KeyboardKey::F19 => (0x6A, false),
+        KeyboardKey::F20 => (0x6B, false),
+        KeyboardKey::F21 => (0x6C, false),
+        KeyboardKey::F22 => (0x6D, false),
+        KeyboardKey::F23 => (0x6E, false),
+        KeyboardKey::F24 => (0x76, false),
+        KeyboardKey::VolumeMute => (0x20, true),
+        KeyboardKey::VolumeDown => (0x2E, true),
+        KeyboardKey::VolumeUp => (0x30, true),
+        KeyboardKey::MediaPrevious => (0x10, true),
+        KeyboardKey::MediaNext => (0x19, true),
+        KeyboardKey::MediaPlayPause => (0x22, true),
+        KeyboardKey::MediaStop => (0x24, true),
+        KeyboardKey::IntlBackslash => (0x56, false),
+        KeyboardKey::Pause => return None,
     })
 }
 
@@ -1657,6 +2037,7 @@ fn select_linux_backend(
                     separate_cursor: true,
                     hover_capture: true,
                     cursor_position_reliable: true,
+                    text_input: false,
                 },
                 "x11/xtest",
             )),
@@ -1671,6 +2052,7 @@ fn select_linux_backend(
                         hover_capture: false,
                         // Capture is still X11/XFixes → real cursor position.
                         cursor_position_reliable: true,
+                        text_input: false,
                     },
                     "uinput(rel)",
                 )),
@@ -1687,6 +2069,7 @@ fn select_linux_backend(
                     separate_cursor: false,
                     hover_capture: true,
                     cursor_position_reliable: false,
+                    text_input: false,
                 },
                 "x11/xtest",
             )),
@@ -1700,6 +2083,7 @@ fn select_linux_backend(
                         separate_cursor: false,
                         hover_capture: false,
                         cursor_position_reliable: false,
+                        text_input: false,
                     },
                     "uinput(rel)",
                 )),
@@ -1716,6 +2100,7 @@ fn select_linux_backend(
                     separate_cursor: false,
                     hover_capture: false,
                     cursor_position_reliable: false,
+                    text_input: false,
                 },
                 "uinput(rel)",
             )
@@ -1732,6 +2117,7 @@ fn select_linux_backend(
                         separate_cursor: true,
                         hover_capture: true,
                         cursor_position_reliable: true,
+                        text_input: false,
                     },
                     "portal/remote-desktop",
                 ))
@@ -1748,6 +2134,7 @@ fn select_linux_backend(
                             hover_capture: absolute,
                             // PipeWire SPA_META_Cursor → real cursor position.
                             cursor_position_reliable: true,
+                            text_input: false,
                         },
                         if absolute {
                             "uinput(abs+rel)"
@@ -1771,6 +2158,7 @@ fn select_linux_backend(
                     // KMS cursor plane reports (0,0) on NVIDIA's legacy plane —
                     // a separate cursor image but no usable position.
                     cursor_position_reliable: false,
+                    text_input: false,
                 },
                 if absolute {
                     "uinput(abs+rel)"
@@ -1794,6 +2182,7 @@ fn select_linux_backend(
                     separate_cursor: false,
                     hover_capture: false,
                     cursor_position_reliable: false,
+                    text_input: false,
                 },
                 "uinput(rel)",
             )
@@ -2011,6 +2400,94 @@ const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
 #[cfg(target_os = "linux")]
 const KEY_RIGHTALT: u16 = 100;
+#[cfg(target_os = "linux")]
+const KEY_KPASTERISK: u16 = 55;
+#[cfg(target_os = "linux")]
+const KEY_CAPSLOCK: u16 = 58;
+#[cfg(target_os = "linux")]
+const KEY_NUMLOCK: u16 = 69;
+#[cfg(target_os = "linux")]
+const KEY_SCROLLLOCK: u16 = 70;
+#[cfg(target_os = "linux")]
+const KEY_KP7: u16 = 71;
+#[cfg(target_os = "linux")]
+const KEY_KP8: u16 = 72;
+#[cfg(target_os = "linux")]
+const KEY_KP9: u16 = 73;
+#[cfg(target_os = "linux")]
+const KEY_KPMINUS: u16 = 74;
+#[cfg(target_os = "linux")]
+const KEY_KP4: u16 = 75;
+#[cfg(target_os = "linux")]
+const KEY_KP5: u16 = 76;
+#[cfg(target_os = "linux")]
+const KEY_KP6: u16 = 77;
+#[cfg(target_os = "linux")]
+const KEY_KPPLUS: u16 = 78;
+#[cfg(target_os = "linux")]
+const KEY_KP1: u16 = 79;
+#[cfg(target_os = "linux")]
+const KEY_KP2: u16 = 80;
+#[cfg(target_os = "linux")]
+const KEY_KP3: u16 = 81;
+#[cfg(target_os = "linux")]
+const KEY_KP0: u16 = 82;
+#[cfg(target_os = "linux")]
+const KEY_KPDOT: u16 = 83;
+#[cfg(target_os = "linux")]
+const KEY_102ND: u16 = 86;
+#[cfg(target_os = "linux")]
+const KEY_KPENTER: u16 = 96;
+#[cfg(target_os = "linux")]
+const KEY_KPSLASH: u16 = 98;
+#[cfg(target_os = "linux")]
+const KEY_SYSRQ: u16 = 99;
+#[cfg(target_os = "linux")]
+const KEY_MUTE: u16 = 113;
+#[cfg(target_os = "linux")]
+const KEY_VOLUMEDOWN: u16 = 114;
+#[cfg(target_os = "linux")]
+const KEY_VOLUMEUP: u16 = 115;
+#[cfg(target_os = "linux")]
+const KEY_KPEQUAL: u16 = 117;
+#[cfg(target_os = "linux")]
+const KEY_PAUSE: u16 = 119;
+#[cfg(target_os = "linux")]
+const KEY_KPCOMMA: u16 = 121;
+#[cfg(target_os = "linux")]
+const KEY_MENU: u16 = 139;
+#[cfg(target_os = "linux")]
+const KEY_NEXTSONG: u16 = 163;
+#[cfg(target_os = "linux")]
+const KEY_PLAYPAUSE: u16 = 164;
+#[cfg(target_os = "linux")]
+const KEY_PREVIOUSSONG: u16 = 165;
+#[cfg(target_os = "linux")]
+const KEY_STOPCD: u16 = 166;
+#[cfg(target_os = "linux")]
+const KEY_F13: u16 = 183;
+#[cfg(target_os = "linux")]
+const KEY_F14: u16 = 184;
+#[cfg(target_os = "linux")]
+const KEY_F15: u16 = 185;
+#[cfg(target_os = "linux")]
+const KEY_F16: u16 = 186;
+#[cfg(target_os = "linux")]
+const KEY_F17: u16 = 187;
+#[cfg(target_os = "linux")]
+const KEY_F18: u16 = 188;
+#[cfg(target_os = "linux")]
+const KEY_F19: u16 = 189;
+#[cfg(target_os = "linux")]
+const KEY_F20: u16 = 190;
+#[cfg(target_os = "linux")]
+const KEY_F21: u16 = 191;
+#[cfg(target_os = "linux")]
+const KEY_F22: u16 = 192;
+#[cfg(target_os = "linux")]
+const KEY_F23: u16 = 193;
+#[cfg(target_os = "linux")]
+const KEY_F24: u16 = 194;
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -2110,8 +2587,8 @@ impl UinputMouseController {
             ui_set_keybit(fd, BTN_MIDDLE as _).map_err(|e| format!("UI_SET_KEYBIT middle: {e}"))?;
             ui_set_keybit(fd, BTN_SIDE as _).map_err(|e| format!("UI_SET_KEYBIT side: {e}"))?;
             ui_set_keybit(fd, BTN_EXTRA as _).map_err(|e| format!("UI_SET_KEYBIT extra: {e}"))?;
-            for key in SUPPORTED_KEYBOARD_KEYS {
-                if let Some(code) = linux_key_code(key) {
+            for wire_id in 0..KeyboardKey::COUNT as u8 {
+                if let Some(code) = KeyboardKey::from_u8(wire_id).and_then(linux_key_code) {
                     ui_set_keybit(fd, code as _)
                         .map_err(|e| format!("UI_SET_KEYBIT keyboard {code}: {e}"))?;
                 }
@@ -2375,92 +2852,6 @@ fn linux_button_code(button: u32) -> Option<u16> {
 }
 
 #[cfg(target_os = "linux")]
-const SUPPORTED_KEYBOARD_KEYS: [KeyboardKey; 82] = [
-    KeyboardKey::Escape,
-    KeyboardKey::Tab,
-    KeyboardKey::Backspace,
-    KeyboardKey::Enter,
-    KeyboardKey::Space,
-    KeyboardKey::Insert,
-    KeyboardKey::Delete,
-    KeyboardKey::Home,
-    KeyboardKey::End,
-    KeyboardKey::PageUp,
-    KeyboardKey::PageDown,
-    KeyboardKey::ArrowUp,
-    KeyboardKey::ArrowDown,
-    KeyboardKey::ArrowLeft,
-    KeyboardKey::ArrowRight,
-    KeyboardKey::Minus,
-    KeyboardKey::Equals,
-    KeyboardKey::OpenBracket,
-    KeyboardKey::CloseBracket,
-    KeyboardKey::Backslash,
-    KeyboardKey::Semicolon,
-    KeyboardKey::Quote,
-    KeyboardKey::Backtick,
-    KeyboardKey::Comma,
-    KeyboardKey::Period,
-    KeyboardKey::Slash,
-    KeyboardKey::Num0,
-    KeyboardKey::Num1,
-    KeyboardKey::Num2,
-    KeyboardKey::Num3,
-    KeyboardKey::Num4,
-    KeyboardKey::Num5,
-    KeyboardKey::Num6,
-    KeyboardKey::Num7,
-    KeyboardKey::Num8,
-    KeyboardKey::Num9,
-    KeyboardKey::A,
-    KeyboardKey::B,
-    KeyboardKey::C,
-    KeyboardKey::D,
-    KeyboardKey::E,
-    KeyboardKey::F,
-    KeyboardKey::G,
-    KeyboardKey::H,
-    KeyboardKey::I,
-    KeyboardKey::J,
-    KeyboardKey::K,
-    KeyboardKey::L,
-    KeyboardKey::M,
-    KeyboardKey::N,
-    KeyboardKey::O,
-    KeyboardKey::P,
-    KeyboardKey::Q,
-    KeyboardKey::R,
-    KeyboardKey::S,
-    KeyboardKey::T,
-    KeyboardKey::U,
-    KeyboardKey::V,
-    KeyboardKey::W,
-    KeyboardKey::X,
-    KeyboardKey::Y,
-    KeyboardKey::Z,
-    KeyboardKey::F1,
-    KeyboardKey::F2,
-    KeyboardKey::F3,
-    KeyboardKey::F4,
-    KeyboardKey::F5,
-    KeyboardKey::F6,
-    KeyboardKey::F7,
-    KeyboardKey::F8,
-    KeyboardKey::F9,
-    KeyboardKey::F10,
-    KeyboardKey::F11,
-    KeyboardKey::F12,
-    KeyboardKey::LeftShift,
-    KeyboardKey::LeftCtrl,
-    KeyboardKey::LeftAlt,
-    KeyboardKey::LeftMeta,
-    KeyboardKey::RightShift,
-    KeyboardKey::RightCtrl,
-    KeyboardKey::RightAlt,
-    KeyboardKey::RightMeta,
-];
-
-#[cfg(target_os = "linux")]
 fn linux_key_code(key: KeyboardKey) -> Option<u16> {
     Some(match key {
         KeyboardKey::Escape => KEY_ESC,
@@ -2545,6 +2936,50 @@ fn linux_key_code(key: KeyboardKey) -> Option<u16> {
         KeyboardKey::RightCtrl => KEY_RIGHTCTRL,
         KeyboardKey::RightAlt => KEY_RIGHTALT,
         KeyboardKey::RightMeta => KEY_RIGHTMETA,
+        KeyboardKey::CapsLock => KEY_CAPSLOCK,
+        KeyboardKey::NumLock => KEY_NUMLOCK,
+        KeyboardKey::ScrollLock => KEY_SCROLLLOCK,
+        KeyboardKey::PrintScreen => KEY_SYSRQ,
+        KeyboardKey::Pause => KEY_PAUSE,
+        KeyboardKey::Application => KEY_MENU,
+        KeyboardKey::Numpad0 => KEY_KP0,
+        KeyboardKey::Numpad1 => KEY_KP1,
+        KeyboardKey::Numpad2 => KEY_KP2,
+        KeyboardKey::Numpad3 => KEY_KP3,
+        KeyboardKey::Numpad4 => KEY_KP4,
+        KeyboardKey::Numpad5 => KEY_KP5,
+        KeyboardKey::Numpad6 => KEY_KP6,
+        KeyboardKey::Numpad7 => KEY_KP7,
+        KeyboardKey::Numpad8 => KEY_KP8,
+        KeyboardKey::Numpad9 => KEY_KP9,
+        KeyboardKey::NumpadDecimal => KEY_KPDOT,
+        KeyboardKey::NumpadDivide => KEY_KPSLASH,
+        KeyboardKey::NumpadMultiply => KEY_KPASTERISK,
+        KeyboardKey::NumpadSubtract => KEY_KPMINUS,
+        KeyboardKey::NumpadAdd => KEY_KPPLUS,
+        KeyboardKey::NumpadEnter => KEY_KPENTER,
+        KeyboardKey::NumpadEquals => KEY_KPEQUAL,
+        KeyboardKey::NumpadComma => KEY_KPCOMMA,
+        KeyboardKey::F13 => KEY_F13,
+        KeyboardKey::F14 => KEY_F14,
+        KeyboardKey::F15 => KEY_F15,
+        KeyboardKey::F16 => KEY_F16,
+        KeyboardKey::F17 => KEY_F17,
+        KeyboardKey::F18 => KEY_F18,
+        KeyboardKey::F19 => KEY_F19,
+        KeyboardKey::F20 => KEY_F20,
+        KeyboardKey::F21 => KEY_F21,
+        KeyboardKey::F22 => KEY_F22,
+        KeyboardKey::F23 => KEY_F23,
+        KeyboardKey::F24 => KEY_F24,
+        KeyboardKey::VolumeMute => KEY_MUTE,
+        KeyboardKey::VolumeDown => KEY_VOLUMEDOWN,
+        KeyboardKey::VolumeUp => KEY_VOLUMEUP,
+        KeyboardKey::MediaPrevious => KEY_PREVIOUSSONG,
+        KeyboardKey::MediaNext => KEY_NEXTSONG,
+        KeyboardKey::MediaPlayPause => KEY_PLAYPAUSE,
+        KeyboardKey::MediaStop => KEY_STOPCD,
+        KeyboardKey::IntlBackslash => KEY_102ND,
     })
 }
 
@@ -2577,6 +3012,11 @@ extern "C" {
         virtual_key: u16,
         key_down: bool,
     ) -> *mut std::ffi::c_void;
+    fn CGEventKeyboardSetUnicodeString(
+        event: *mut std::ffi::c_void,
+        string_length: usize,
+        unicode_string: *const u16,
+    );
     fn CGEventCreateScrollWheelEvent(
         source: *mut std::ffi::c_void,
         units: u32,
@@ -2711,6 +3151,30 @@ impl MacosMouseController {
         }
     }
 
+    fn text(&mut self, text: &str) -> bool {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        if utf16.is_empty() {
+            return false;
+        }
+        let down = unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, true) };
+        if down.is_null() {
+            return false;
+        }
+        unsafe {
+            CGEventKeyboardSetUnicodeString(down, utf16.len(), utf16.as_ptr());
+            CGEventPost(KCG_HID_EVENT_TAP, down);
+            CFRelease(down);
+        }
+        let up = unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, false) };
+        if !up.is_null() {
+            unsafe {
+                CGEventPost(KCG_HID_EVENT_TAP, up);
+                CFRelease(up);
+            }
+        }
+        true
+    }
+
     fn post_move_event(&mut self) {
         let (event_type, mouse_button) = if self.button_mask & MOUSE_BUTTON_PRIMARY != 0 {
             (KCG_EVENT_LEFT_MOUSE_DRAGGED, 0)
@@ -2811,7 +3275,7 @@ fn macos_button_event(button: u32, pressed: bool) -> (u32, u32) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn macos_key_code(key: KeyboardKey) -> Option<u16> {
     Some(match key {
         KeyboardKey::A => 0,
@@ -2896,6 +3360,50 @@ fn macos_key_code(key: KeyboardKey) -> Option<u16> {
         KeyboardKey::ArrowRight => 124,
         KeyboardKey::ArrowDown => 125,
         KeyboardKey::ArrowUp => 126,
+        KeyboardKey::CapsLock => 57,
+        KeyboardKey::Application => 110,
+        KeyboardKey::Numpad0 => 82,
+        KeyboardKey::Numpad1 => 83,
+        KeyboardKey::Numpad2 => 84,
+        KeyboardKey::Numpad3 => 85,
+        KeyboardKey::Numpad4 => 86,
+        KeyboardKey::Numpad5 => 87,
+        KeyboardKey::Numpad6 => 88,
+        KeyboardKey::Numpad7 => 89,
+        KeyboardKey::Numpad8 => 91,
+        KeyboardKey::Numpad9 => 92,
+        KeyboardKey::NumpadDecimal => 65,
+        KeyboardKey::NumpadDivide => 75,
+        KeyboardKey::NumpadMultiply => 67,
+        KeyboardKey::NumpadSubtract => 78,
+        KeyboardKey::NumpadAdd => 69,
+        KeyboardKey::NumpadEnter => 76,
+        KeyboardKey::NumpadEquals => 81,
+        KeyboardKey::NumpadComma => 95,
+        KeyboardKey::F13 => 105,
+        KeyboardKey::F14 => 107,
+        KeyboardKey::F15 => 113,
+        KeyboardKey::F16 => 106,
+        KeyboardKey::F17 => 64,
+        KeyboardKey::F18 => 79,
+        KeyboardKey::F19 => 80,
+        KeyboardKey::F20 => 90,
+        KeyboardKey::VolumeMute => 74,
+        KeyboardKey::VolumeDown => 73,
+        KeyboardKey::VolumeUp => 72,
+        KeyboardKey::IntlBackslash => 10,
+        KeyboardKey::NumLock
+        | KeyboardKey::ScrollLock
+        | KeyboardKey::PrintScreen
+        | KeyboardKey::Pause
+        | KeyboardKey::F21
+        | KeyboardKey::F22
+        | KeyboardKey::F23
+        | KeyboardKey::F24
+        | KeyboardKey::MediaPrevious
+        | KeyboardKey::MediaNext
+        | KeyboardKey::MediaPlayPause
+        | KeyboardKey::MediaStop => return None,
     })
 }
 
@@ -3217,12 +3725,61 @@ fn x11_key_name(key: KeyboardKey) -> Option<&'static std::ffi::CStr> {
         KeyboardKey::RightCtrl => c"Control_R",
         KeyboardKey::RightAlt => c"Alt_R",
         KeyboardKey::RightMeta => c"Super_R",
+        KeyboardKey::CapsLock => c"Caps_Lock",
+        KeyboardKey::NumLock => c"Num_Lock",
+        KeyboardKey::ScrollLock => c"Scroll_Lock",
+        KeyboardKey::PrintScreen => c"Print",
+        KeyboardKey::Pause => c"Pause",
+        KeyboardKey::Application => c"Menu",
+        KeyboardKey::Numpad0 => c"KP_0",
+        KeyboardKey::Numpad1 => c"KP_1",
+        KeyboardKey::Numpad2 => c"KP_2",
+        KeyboardKey::Numpad3 => c"KP_3",
+        KeyboardKey::Numpad4 => c"KP_4",
+        KeyboardKey::Numpad5 => c"KP_5",
+        KeyboardKey::Numpad6 => c"KP_6",
+        KeyboardKey::Numpad7 => c"KP_7",
+        KeyboardKey::Numpad8 => c"KP_8",
+        KeyboardKey::Numpad9 => c"KP_9",
+        KeyboardKey::NumpadDecimal => c"KP_Decimal",
+        KeyboardKey::NumpadDivide => c"KP_Divide",
+        KeyboardKey::NumpadMultiply => c"KP_Multiply",
+        KeyboardKey::NumpadSubtract => c"KP_Subtract",
+        KeyboardKey::NumpadAdd => c"KP_Add",
+        KeyboardKey::NumpadEnter => c"KP_Enter",
+        KeyboardKey::NumpadEquals => c"KP_Equal",
+        KeyboardKey::NumpadComma => c"KP_Separator",
+        KeyboardKey::F13 => c"F13",
+        KeyboardKey::F14 => c"F14",
+        KeyboardKey::F15 => c"F15",
+        KeyboardKey::F16 => c"F16",
+        KeyboardKey::F17 => c"F17",
+        KeyboardKey::F18 => c"F18",
+        KeyboardKey::F19 => c"F19",
+        KeyboardKey::F20 => c"F20",
+        KeyboardKey::F21 => c"F21",
+        KeyboardKey::F22 => c"F22",
+        KeyboardKey::F23 => c"F23",
+        KeyboardKey::F24 => c"F24",
+        KeyboardKey::VolumeMute => c"XF86AudioMute",
+        KeyboardKey::VolumeDown => c"XF86AudioLowerVolume",
+        KeyboardKey::VolumeUp => c"XF86AudioRaiseVolume",
+        KeyboardKey::MediaPrevious => c"XF86AudioPrev",
+        KeyboardKey::MediaNext => c"XF86AudioNext",
+        KeyboardKey::MediaPlayPause => c"XF86AudioPlay",
+        KeyboardKey::MediaStop => c"XF86AudioStop",
+        // XKeysymToKeycode("less") may resolve the top-row comma key instead of
+        // the physical ISO <LSGT> key. This backend lacks an XKB key-name lookup.
+        KeyboardKey::IntlBackslash => return None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CREDENTIAL: InputCredential = InputCredential::from_bytes([0x31; 16]);
+    const WRONG_CREDENTIAL: InputCredential = InputCredential::from_bytes([0x32; 16]);
 
     /// Force-enabled detector regardless of `ST_WARP_DETECT` in the env.
     fn enabled_warp() -> WarpDetector {
@@ -3335,6 +3892,7 @@ mod tests {
                 separate_cursor: true,
                 hover_capture: true,
                 cursor_position_reliable: true,
+                text_input: false,
             },
             controller_id: Some(1),
             last_input_seq_by_client: BTreeMap::new(),
@@ -3375,6 +3933,346 @@ mod tests {
         assert!(input_seq_is_newer(11, 10));
         assert!(input_seq_is_newer(0, u16::MAX));
         assert!(input_seq_is_newer(2, u16::MAX));
+    }
+
+    #[test]
+    fn neutral_bootstrap_relearns_media_port_without_claiming_control() {
+        let runtime = InputRuntime::new();
+        let initial = SocketAddr::from(([127, 0, 0, 1], 5000));
+        let live = SocketAddr::from(([127, 0, 0, 1], 61000));
+        let media_dest = Arc::new(Mutex::new(initial));
+        let registration =
+            runtime.register_direct_client(1, CREDENTIAL, initial.ip(), Arc::clone(&media_dest));
+
+        runtime.handle_input_packet(
+            7,
+            CREDENTIAL,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: 0,
+            }),
+            live,
+        );
+
+        assert_eq!(*media_dest.lock().unwrap(), live);
+        {
+            let inner = runtime.inner.lock().unwrap();
+            assert_eq!(inner.controller_id, None);
+            assert_eq!(inner.last_input_seq_by_client.get(&1), Some(&7));
+        }
+
+        drop(registration);
+        assert!(!runtime.active_clients.lock().unwrap().contains_key(&1));
+        runtime.handle_input_packet(
+            8,
+            CREDENTIAL,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: 0,
+            }),
+            SocketAddr::from(([127, 0, 0, 1], 62000)),
+        );
+        assert_eq!(*media_dest.lock().unwrap(), live);
+        assert!(!runtime
+            .inner
+            .lock()
+            .unwrap()
+            .last_input_seq_by_client
+            .contains_key(&1));
+    }
+
+    #[test]
+    fn unknown_or_wrong_ip_input_does_not_allocate_sequence_or_relearn_destination() {
+        let runtime = InputRuntime::new();
+        let initial = SocketAddr::from(([127, 0, 0, 1], 5000));
+        let media_dest = Arc::new(Mutex::new(initial));
+        let _registration =
+            runtime.register_direct_client(1, CREDENTIAL, initial.ip(), Arc::clone(&media_dest));
+
+        runtime.handle_input_packet(
+            1,
+            CREDENTIAL,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 99,
+                buttons: 0,
+            }),
+            SocketAddr::from(([127, 0, 0, 1], 61000)),
+        );
+        runtime.handle_input_packet(
+            2,
+            CREDENTIAL,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: 0,
+            }),
+            SocketAddr::from(([127, 0, 0, 2], 61000)),
+        );
+        runtime.handle_input_packet(
+            3,
+            WRONG_CREDENTIAL,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: 0,
+            }),
+            SocketAddr::from(([127, 0, 0, 1], 62000)),
+        );
+
+        assert_eq!(*media_dest.lock().unwrap(), initial);
+        let inner = runtime.inner.lock().unwrap();
+        assert!(!inner.last_input_seq_by_client.contains_key(&99));
+        assert!(!inner.last_input_seq_by_client.contains_key(&1));
+    }
+
+    #[test]
+    fn wrong_credential_is_rejected_before_sequence_and_destination_updates() {
+        let runtime = InputRuntime::new();
+        let initial = SocketAddr::from(([127, 0, 0, 1], 5000));
+        let forged_source = SocketAddr::from(([127, 0, 0, 1], 61000));
+        let media_dest = Arc::new(Mutex::new(initial));
+        let _registration =
+            runtime.register_direct_client(1, CREDENTIAL, initial.ip(), Arc::clone(&media_dest));
+
+        runtime.handle_input_packet(
+            55,
+            WRONG_CREDENTIAL,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: 0,
+            }),
+            forged_source,
+        );
+
+        assert_eq!(*media_dest.lock().unwrap(), initial);
+        assert!(!runtime
+            .inner
+            .lock()
+            .unwrap()
+            .last_input_seq_by_client
+            .contains_key(&1));
+    }
+
+    #[test]
+    fn registration_drop_releases_owned_input_and_controller_state() {
+        let runtime = InputRuntime::new();
+        let registration = runtime.register_tunnel_client(7, CREDENTIAL);
+        {
+            let mut inner = runtime.inner.lock().unwrap();
+            inner.controller_id = Some(7);
+            inner.button_mask = MOUSE_BUTTON_PRIMARY;
+            let (byte, bit) = KeyboardKey::A.bit();
+            inner.keyboard_state[byte] = bit;
+        }
+        runtime.set_active_controller(Some(7));
+
+        drop(registration);
+
+        let inner = runtime.inner.lock().unwrap();
+        assert_eq!(inner.controller_id, None);
+        assert_eq!(inner.button_mask, 0);
+        assert_eq!(inner.keyboard_state, [0; KEYBOARD_STATE_BYTES]);
+        assert_eq!(runtime.active_controller_id.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn neutral_packet_classification_excludes_motion() {
+        assert!(input_packet_is_neutral(&InputPacket::MouseButtons(
+            st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: 0,
+            },
+        )));
+        assert!(input_packet_is_neutral(&InputPacket::KeyboardState(
+            st_protocol::KeyboardStateInput {
+                client_id: 1,
+                pressed: [0; KEYBOARD_STATE_BYTES],
+            },
+        )));
+        assert!(!input_packet_is_neutral(&InputPacket::MouseRelative(
+            st_protocol::MouseRelativeInput {
+                client_id: 1,
+                dx: 1,
+                dy: 0,
+                buttons: 0,
+            },
+        )));
+    }
+
+    #[test]
+    fn keyboard_chords_press_modifiers_first_and_release_them_last() {
+        let mut chord = [0u8; KEYBOARD_STATE_BYTES];
+        for key in [
+            KeyboardKey::A,
+            KeyboardKey::LeftShift,
+            KeyboardKey::LeftCtrl,
+        ] {
+            let (byte, bit) = key.bit();
+            chord[byte] |= bit;
+        }
+
+        let mut down = Vec::new();
+        for_each_keyboard_transition([0; KEYBOARD_STATE_BYTES], chord, |key, pressed| {
+            down.push((key, pressed));
+        });
+        assert_eq!(
+            down,
+            vec![
+                (KeyboardKey::LeftShift, true),
+                (KeyboardKey::LeftCtrl, true),
+                (KeyboardKey::A, true),
+            ]
+        );
+
+        let mut up = Vec::new();
+        for_each_keyboard_transition(chord, [0; KEYBOARD_STATE_BYTES], |key, pressed| {
+            up.push((key, pressed));
+        });
+        assert_eq!(
+            up,
+            vec![
+                (KeyboardKey::A, false),
+                (KeyboardKey::LeftShift, false),
+                (KeyboardKey::LeftCtrl, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_input_rate_limit_bounds_messages_and_bytes_then_resets() {
+        let start = Instant::now();
+        let mut message_limited = TextInputRateLimiter {
+            window_started: start,
+            bytes: 0,
+            messages: 0,
+        };
+        for _ in 0..TEXT_INPUT_RATE_MESSAGES {
+            assert!(message_limited.allow(1, start));
+        }
+        assert!(!message_limited.allow(1, start));
+        assert!(message_limited.allow(1, start + TEXT_INPUT_RATE_WINDOW));
+
+        let mut byte_limited = TextInputRateLimiter {
+            window_started: start,
+            bytes: 0,
+            messages: 0,
+        };
+        for _ in 0..(TEXT_INPUT_RATE_BYTES / MAX_TEXT_INPUT_BYTES) {
+            assert!(byte_limited.allow(MAX_TEXT_INPUT_BYTES, start));
+        }
+        assert!(!byte_limited.allow(1, start));
+    }
+
+    #[test]
+    fn text_input_requires_registration_capability_and_nonempty_safe_payload() {
+        let runtime = InputRuntime::new();
+        assert!(!runtime.handle_text_input(1, "text"));
+        let _registration = runtime.register_tunnel_client(1, CREDENTIAL);
+        assert!(!runtime.handle_text_input(1, ""));
+        assert!(!runtime.handle_text_input(1, "a\0b"));
+        assert!(!runtime.handle_text_input(1, &"x".repeat(MAX_TEXT_INPUT_BYTES + 1)));
+        assert!(!runtime.handle_text_input(1, "still unavailable"));
+        assert_eq!(runtime.inner.lock().unwrap().controller_id, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expanded_linux_keys_preserve_physical_identity() {
+        for wire_id in 0..KeyboardKey::COUNT as u8 {
+            let key = KeyboardKey::from_u8(wire_id).unwrap();
+            assert!(linux_key_code(key).is_some(), "missing Linux key {key:?}");
+            assert_eq!(
+                x11_key_name(key).is_none(),
+                key == KeyboardKey::IntlBackslash,
+                "unexpected X11 support result for {key:?}"
+            );
+        }
+        assert_ne!(
+            linux_key_code(KeyboardKey::Num1),
+            linux_key_code(KeyboardKey::Numpad1)
+        );
+        assert_ne!(
+            linux_key_code(KeyboardKey::Enter),
+            linux_key_code(KeyboardKey::NumpadEnter)
+        );
+        assert_eq!(linux_key_code(KeyboardKey::CapsLock), Some(KEY_CAPSLOCK));
+        assert_eq!(linux_key_code(KeyboardKey::Application), Some(KEY_MENU));
+        assert_eq!(
+            linux_key_code(KeyboardKey::MediaPlayPause),
+            Some(KEY_PLAYPAUSE)
+        );
+        assert_eq!(linux_key_code(KeyboardKey::IntlBackslash), Some(KEY_102ND));
+        assert_ne!(
+            x11_key_name(KeyboardKey::Num1),
+            x11_key_name(KeyboardKey::Numpad1)
+        );
+    }
+
+    #[test]
+    fn expanded_windows_keys_preserve_physical_identity() {
+        for wire_id in 0..KeyboardKey::COUNT as u8 {
+            let key = KeyboardKey::from_u8(wire_id).unwrap();
+            assert!(
+                windows_key_virtual_key(key).is_some() || windows_key_scan_code(key).is_some(),
+                "missing Windows key {key:?}"
+            );
+        }
+        assert_ne!(
+            windows_key_scan_code(KeyboardKey::Num1),
+            windows_key_scan_code(KeyboardKey::Numpad1)
+        );
+        assert_ne!(
+            windows_key_scan_code(KeyboardKey::Enter),
+            windows_key_scan_code(KeyboardKey::NumpadEnter)
+        );
+        assert_eq!(windows_key_virtual_key(KeyboardKey::Pause), Some(0x13));
+        assert_eq!(windows_key_scan_code(KeyboardKey::Pause), None);
+        assert_eq!(windows_key_virtual_key(KeyboardKey::NumpadEquals), None);
+        assert_eq!(windows_key_virtual_key(KeyboardKey::NumpadComma), None);
+        assert_eq!(
+            windows_key_scan_code(KeyboardKey::NumpadEquals),
+            Some((0x59, false))
+        );
+        assert_eq!(
+            windows_key_scan_code(KeyboardKey::NumpadComma),
+            Some((0x7E, false))
+        );
+        assert_eq!(
+            windows_key_scan_code(KeyboardKey::MediaPlayPause),
+            Some((0x22, true))
+        );
+    }
+
+    #[test]
+    fn macos_key_mapping_reports_unsupported_keys_without_aliasing() {
+        let unsupported = [
+            KeyboardKey::NumLock,
+            KeyboardKey::ScrollLock,
+            KeyboardKey::PrintScreen,
+            KeyboardKey::Pause,
+            KeyboardKey::F21,
+            KeyboardKey::F22,
+            KeyboardKey::F23,
+            KeyboardKey::F24,
+            KeyboardKey::MediaPrevious,
+            KeyboardKey::MediaNext,
+            KeyboardKey::MediaPlayPause,
+            KeyboardKey::MediaStop,
+        ];
+        for wire_id in 0..KeyboardKey::COUNT as u8 {
+            let key = KeyboardKey::from_u8(wire_id).unwrap();
+            assert_eq!(
+                macos_key_code(key).is_none(),
+                unsupported.contains(&key),
+                "unexpected macOS support result for {key:?}"
+            );
+        }
+        assert_ne!(
+            macos_key_code(KeyboardKey::Num1),
+            macos_key_code(KeyboardKey::Numpad1)
+        );
+        assert_ne!(
+            macos_key_code(KeyboardKey::Enter),
+            macos_key_code(KeyboardKey::NumpadEnter)
+        );
     }
 
     #[test]

@@ -117,11 +117,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 "wl_shm" => {
                     state.shm = Some(registry.bind(name, version.min(1), qh, ()));
                 }
-                "wl_output" => {
+                "wl_output" if state.output.is_none() => {
                     // Bind the first output only (multi-monitor can be added later)
-                    if state.output.is_none() {
-                        state.output = Some(registry.bind(name, version.min(4), qh, ()));
-                    }
+                    state.output = Some(registry.bind(name, version.min(4), qh, ()));
                 }
                 "zwlr_screencopy_manager_v1" => {
                     state.screencopy_manager = Some(registry.bind(name, version.min(3), qh, ()));

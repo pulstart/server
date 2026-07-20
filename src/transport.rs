@@ -7,7 +7,10 @@ use st_protocol::tunnel::{CryptoContext, CRYPTO_OVERHEAD};
 use st_protocol::{FrameSlicer, FrameTimingMeta, PacketHeader, PayloadType};
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
 #[cfg(unix)]
 use std::{mem, os::fd::AsRawFd};
 
@@ -230,10 +233,13 @@ fn configured_udp_dscp() -> Option<u8> {
 /// default depth is 2, which lets the client recover any burst of up to two
 /// consecutive lost audio packets without falling back to PLC.
 fn audio_redundancy_depth() -> usize {
+    audio_redundancy_depth_from_var(std::env::var("ST_AUDIO_REDUNDANCY").ok().as_deref())
+}
+
+fn audio_redundancy_depth_from_var(var: Option<&str>) -> usize {
     const DEFAULT_DEPTH: usize = 2;
-    let raw = match std::env::var("ST_AUDIO_REDUNDANCY") {
-        Ok(value) => value,
-        Err(_) => return DEFAULT_DEPTH,
+    let Some(raw) = var else {
+        return DEFAULT_DEPTH;
     };
     let trimmed = raw.trim();
     if let Ok(n) = trimmed.parse::<usize>() {
@@ -246,21 +252,17 @@ fn audio_redundancy_depth() -> usize {
     }
 }
 
-/// Configured (max) audio redundancy depth — the cap the adaptive controller
-/// (E5) ramps toward, and the fixed depth used when adaptation is disabled.
+/// Configured audio redundancy depth: fixed by default and the cap when
+/// explicitly using adaptive redundancy.
 pub fn configured_audio_redundancy_depth() -> usize {
     audio_redundancy_depth()
 }
 
-/// E5 (default-on): drive verbatim audio-redundancy depth from measured loss —
-/// depth 0 on a clean LAN (single losses are still covered by Opus LBRR in-band
-/// FEC, kept on under E2 RESTRICTED_LOWDELAY), ramping toward the configured cap
-/// (`ST_AUDIO_REDUNDANCY`, default 2) only when burst loss is observed, decaying
-/// back to 0 over sustained clean intervals. This pays for burst resilience only
-/// when loss appears instead of the legacy always-on fixed depth. The wire format
-/// and client reconstruction are unchanged — only the depth *value* now tracks
-/// loss — so flipping default-on adds no new untested recovery path.
-/// `ST_AUDIO_ADAPTIVE_REDUNDANCY=0` (`false`/`no`/`off`) restores the fixed depth.
+/// Opt-in adaptive redundancy. Default 5 ms CELT packets do not carry usable
+/// Opus LBRR, so the safe default is the configured fixed verbatim depth from
+/// stream start (`ST_AUDIO_REDUNDANCY`, default 2). Set
+/// `ST_AUDIO_ADAPTIVE_REDUNDANCY=1` to decay that depth on a clean path and ramp
+/// it back after loss. The wire format and client reconstruction are unchanged.
 pub fn audio_adaptive_redundancy_enabled() -> bool {
     audio_adaptive_redundancy_tristate(
         std::env::var("ST_AUDIO_ADAPTIVE_REDUNDANCY")
@@ -269,12 +271,12 @@ pub fn audio_adaptive_redundancy_enabled() -> bool {
     )
 }
 
-/// Tri-state decision for E5: unset ⇒ auto-on, `0`/`false`/`no`/`off` ⇒ off
-/// (fixed legacy depth), anything else ⇒ on.
+/// Unset/unknown values keep fixed redundancy; only explicit truthy values opt
+/// into adaptation.
 fn audio_adaptive_redundancy_tristate(var: Option<&str>) -> bool {
-    !matches!(
+    matches!(
         var.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("0") | Some("false") | Some("no") | Some("off")
+        Some("1") | Some("true") | Some("yes") | Some("on")
     )
 }
 
@@ -538,6 +540,12 @@ pub struct EncodedVideoFrame {
     pub is_recovery: bool,
 }
 
+#[derive(Debug)]
+pub struct EncodedAudioPacket {
+    pub source_seq: u64,
+    pub data: Vec<u8>,
+}
+
 pub struct EncodedUnit {
     pub data: Vec<u8>,
     pub is_recovery: bool,
@@ -643,8 +651,9 @@ pub struct UdpSender {
     max_datagram_size: usize,
     pacing: Option<PacingConfig>,
     frame_id: u32,
-    audio_seq: u16,
     audio_redundancy_depth: usize,
+    audio_redundancy_max_depth: usize,
+    last_audio_source_seq: Option<u64>,
     // Delayed-duplicate FrameStart policy + the live Auto-mode verdict pushed by
     // the utility `DupFirstController` (only sends the duplicate while it has
     // measurably reduced frame loss).
@@ -729,14 +738,16 @@ impl UdpSender {
             }
             batch
         };
+        let audio_redundancy_max_depth = audio_redundancy_depth();
         Ok(Self {
             backend: SendBackend::Direct { socket, crypto },
             slicer: FrameSlicer::with_config(max_udp, env_fec_config()),
             max_datagram_size: max_udp,
             pacing: env_pacing(client_addr),
             frame_id: 0,
-            audio_seq: 0,
-            audio_redundancy_depth: audio_redundancy_depth(),
+            audio_redundancy_depth: audio_redundancy_max_depth,
+            audio_redundancy_max_depth,
+            last_audio_source_seq: None,
             dup_mode: dup_first_mode_from_env(),
             dup_auto_active: false,
             audio_buf: Vec::with_capacity(1500),
@@ -801,14 +812,20 @@ impl UdpSender {
         if reliable {
             slicer.set_parity_enabled(false);
         }
+        let audio_redundancy_max_depth = if reliable {
+            0
+        } else {
+            audio_redundancy_depth()
+        };
         Self {
             backend: SendBackend::Tunnel(link),
             slicer,
             max_datagram_size: max_udp,
             pacing: env_pacing(peer),
             frame_id: 0,
-            audio_seq: 0,
-            audio_redundancy_depth: if reliable { 0 } else { audio_redundancy_depth() },
+            audio_redundancy_depth: audio_redundancy_max_depth,
+            audio_redundancy_max_depth,
+            last_audio_source_seq: None,
             dup_mode: if reliable {
                 DupFirstMode::Off
             } else {
@@ -843,7 +860,7 @@ impl UdpSender {
 
     /// Live-update the verbatim audio-redundancy depth (E5 adaptive redundancy).
     pub fn set_audio_redundancy_depth(&mut self, depth: usize) {
-        self.audio_redundancy_depth = depth.min(AUDIO_REDUNDANCY_MAX_DEPTH);
+        self.audio_redundancy_depth = depth.min(self.audio_redundancy_max_depth);
     }
 
     /// B5: when pacing is engaged for a frame this large, return the per-group
@@ -1114,25 +1131,39 @@ impl UdpSender {
         }
     }
 
-    /// Send a single Opus audio packet, with up to `audio_redundancy_depth`
-    /// previously-sent opus packets attached as redundancy. The client uses
-    /// the redundant copies to recover lost packets without waiting for
-    /// retransmission.
-    pub fn send_audio(&mut self, opus_data: &[u8]) -> Result<(), String> {
+    /// Send a single source-sequenced Opus packet, with up to
+    /// `audio_redundancy_depth` contiguous previous packets attached. Source
+    /// gaps clear history so stale packets are never labeled as the missing
+    /// sequence slots. A gap also restores the configured redundancy cap, which
+    /// lets pure audio pipeline loss re-enable protection without a wire change.
+    pub fn send_audio(
+        &mut self,
+        packet: &EncodedAudioPacket,
+        shared_depth: &AtomicU8,
+    ) -> Result<(), String> {
+        let source_gap = self
+            .last_audio_source_seq
+            .is_some_and(|last| packet.source_seq != last.wrapping_add(1));
+        if source_gap {
+            self.previous_audio.clear();
+            self.audio_redundancy_depth = self.audio_redundancy_max_depth;
+            shared_depth.store(self.audio_redundancy_max_depth as u8, Ordering::Relaxed);
+        }
+        self.last_audio_source_seq = Some(packet.source_seq);
+
         let backend = &self.backend;
         let encrypt_buf = &mut self.encrypt_buf;
         let header = PacketHeader {
-            seq: self.audio_seq,
+            seq: packet.source_seq as u16,
             frame_id: 0,
             payload_type: PayloadType::Audio,
         };
-        self.audio_seq = self.audio_seq.wrapping_add(1);
 
         // Pick the largest k <= depth such that the resulting datagram still fits
         // inside max_datagram_size. The newest k chunks of `previous_audio` are
         // chosen, but we attach them in oldest-first order so the client can
         // index them as `seq - k .. seq - 1`.
-        let primary_len = opus_data.len();
+        let primary_len = packet.data.len();
         let available_audio = self
             .previous_audio
             .iter()
@@ -1168,7 +1199,7 @@ impl UdpSender {
         debug_assert_eq!(written, redundancy_header_bytes);
         let primary_start = HEADER_SIZE + redundancy_header_bytes;
         let primary_end = primary_start + primary_len;
-        self.audio_buf[primary_start..primary_end].copy_from_slice(opus_data);
+        self.audio_buf[primary_start..primary_end].copy_from_slice(&packet.data);
         let mut cursor = primary_end;
         for i in chunk_start_idx..self.previous_audio.len() {
             let chunk = &self.previous_audio[i];
@@ -1182,7 +1213,7 @@ impl UdpSender {
         // Track this packet for future datagrams' redundancy, bounded by the
         // currently-configured depth. If depth is 0, drop the history entirely.
         if self.audio_redundancy_depth > 0 {
-            self.previous_audio.push_back(opus_data.to_vec());
+            self.previous_audio.push_back(packet.data.clone());
             while self.previous_audio.len() > self.audio_redundancy_depth {
                 self.previous_audio.pop_front();
             }
@@ -1428,27 +1459,164 @@ mod dup_first_tests {
 
 #[cfg(test)]
 mod audio_redundancy_tests {
-    use super::audio_adaptive_redundancy_tristate;
+    use super::{audio_adaptive_redundancy_tristate, audio_redundancy_depth_from_var};
 
     #[test]
-    fn adaptive_redundancy_auto_on_unless_disabled() {
-        // E5 default-on: unset and unknown values enable adaptive depth.
-        assert!(audio_adaptive_redundancy_tristate(None), "unset ⇒ auto-on");
+    fn adaptive_redundancy_requires_explicit_opt_in() {
+        assert!(!audio_adaptive_redundancy_tristate(None), "unset => fixed");
         assert!(audio_adaptive_redundancy_tristate(Some("1")), "explicit on");
         assert!(audio_adaptive_redundancy_tristate(Some("yes")), "truthy on");
         assert!(
-            audio_adaptive_redundancy_tristate(Some("garbage")),
-            "unknown ⇒ on"
+            !audio_adaptive_redundancy_tristate(Some("garbage")),
+            "unknown => fixed"
         );
-        // Only the explicit off sentinels restore the fixed legacy depth.
-        assert!(!audio_adaptive_redundancy_tristate(Some("0")), "0 ⇒ off");
+        assert!(!audio_adaptive_redundancy_tristate(Some("0")), "0 => fixed");
         assert!(
             !audio_adaptive_redundancy_tristate(Some("off")),
-            "off ⇒ off"
+            "off => fixed"
         );
         assert!(
             !audio_adaptive_redundancy_tristate(Some(" False ")),
             "trim + case-insensitive off"
         );
+    }
+
+    #[test]
+    fn verbatim_redundancy_defaults_to_depth_two() {
+        assert_eq!(audio_redundancy_depth_from_var(None), 2);
+        assert_eq!(audio_redundancy_depth_from_var(Some("4")), 4);
+        assert_eq!(audio_redundancy_depth_from_var(Some("off")), 0);
+    }
+}
+
+#[cfg(test)]
+mod audio_source_sequence_tests {
+    use super::{EncodedAudioPacket, UdpSender};
+    use st_protocol::packet::{parse_audio_packet, HEADER_SIZE};
+    use st_protocol::reliable_udp::PunchedMessage;
+    use st_protocol::tcp_tunnel::TunnelLink;
+    use st_protocol::PacketHeader;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingTunnel {
+        packets: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl TunnelLink for RecordingTunnel {
+        fn peer(&self) -> SocketAddr {
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9))
+        }
+
+        fn is_reliable(&self) -> bool {
+            false
+        }
+
+        fn max_media_payload(&self) -> usize {
+            1_400
+        }
+
+        fn send_media(&self, data: &[u8]) -> Result<(), String> {
+            self.packets.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+
+        fn send_control(&self, _data: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn try_recv(&self) -> Option<PunchedMessage> {
+            None
+        }
+
+        fn try_recv_all(&self) -> Vec<PunchedMessage> {
+            Vec::new()
+        }
+
+        fn recv_timeout(&self, _timeout: Duration) -> Option<PunchedMessage> {
+            None
+        }
+
+        fn tick(&self) {}
+
+        fn flush_control(&self, _timeout: Duration) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn set_read_timeout(&self, _dur: Option<Duration>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    fn packet(source_seq: u64, data: u8) -> EncodedAudioPacket {
+        EncodedAudioPacket {
+            source_seq,
+            data: vec![data],
+        }
+    }
+
+    fn parse(raw: &[u8]) -> (u16, Vec<u8>, Vec<Vec<u8>>) {
+        let header = PacketHeader::deserialize(raw).unwrap();
+        let audio = parse_audio_packet(&raw[HEADER_SIZE..]).unwrap();
+        (
+            header.seq,
+            audio.primary.to_vec(),
+            audio.redundant.iter().map(|chunk| chunk.to_vec()).collect(),
+        )
+    }
+
+    #[test]
+    fn source_gap_reaches_wire_and_clears_then_restores_history() {
+        let tunnel = Arc::new(RecordingTunnel::default());
+        let mut sender = UdpSender::from_tunnel(tunnel.clone());
+        sender.audio_redundancy_max_depth = 2;
+        sender.set_audio_redundancy_depth(2);
+        let shared_depth = AtomicU8::new(2);
+
+        sender
+            .send_audio(&packet(100, b'a'), &shared_depth)
+            .unwrap();
+        sender
+            .send_audio(&packet(101, b'b'), &shared_depth)
+            .unwrap();
+        // Simulate adaptive depth reaching zero before a pure audio source gap.
+        sender.set_audio_redundancy_depth(0);
+        shared_depth.store(0, Ordering::Relaxed);
+        sender
+            .send_audio(&packet(104, b'd'), &shared_depth)
+            .unwrap();
+        assert_eq!(shared_depth.load(Ordering::Relaxed), 2);
+        sender
+            .send_audio(&packet(105, b'e'), &shared_depth)
+            .unwrap();
+        sender
+            .send_audio(&packet(106, b'f'), &shared_depth)
+            .unwrap();
+
+        let packets = tunnel.packets.lock().unwrap();
+        let parsed = packets.iter().map(|raw| parse(raw)).collect::<Vec<_>>();
+        assert_eq!(
+            parsed.iter().map(|packet| packet.0).collect::<Vec<_>>(),
+            [100, 101, 104, 105, 106]
+        );
+        assert!(
+            parsed[2].2.is_empty(),
+            "source gap must clear stale history"
+        );
+        assert_eq!(parsed[3].2, [vec![b'd']]);
+        assert_eq!(parsed[4].2, [vec![b'd'], vec![b'e']]);
     }
 }

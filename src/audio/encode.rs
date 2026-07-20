@@ -3,9 +3,11 @@
 /// Float32 input → Opus frames.
 /// Uses FFmpeg's libopus wrapper which supports multichannel (calls opus_multistream
 /// internally for >2 channels).
-use crate::audio::capture::AudioSamples;
+use crate::audio::{capture::AudioSamples, recv_with_backlog_limit};
 use crate::encode_config::AudioConfig;
+use crate::transport::EncodedAudioPacket;
 use crossbeam_channel::{Receiver, Sender};
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -25,6 +27,8 @@ struct OpusEncoder {
     frame: *mut ffi::AVFrame,
     samples_per_frame: u32,
     channels: u32,
+    pending_source_seqs: VecDeque<u64>,
+    failed_after_submit: bool,
 }
 
 unsafe impl Send for OpusEncoder {}
@@ -38,11 +42,10 @@ fn expected_audio_packet_loss_pct() -> u32 {
 }
 
 fn opus_application_value(_expected_loss: u32) -> &'static str {
-    // Default to RESTRICTED_LOWDELAY (matches Sunshine). LBRR in-band FEC works
-    // in lowdelay too (set below via `fec`/`packet_loss`), so the old downgrade
-    // to "audio" mode whenever expected_loss>0 — which is the default path
-    // (ST_AUDIO_PACKET_LOSS_PCT=5) — needlessly cost ~2.5 ms encoder look-ahead.
-    // Explicit ST_AUDIO_OPUS_APPLICATION still overrides.
+    // Default to RESTRICTED_LOWDELAY (matches Sunshine). The FEC options below
+    // remain useful for packet sizes/modes that can emit LBRR, but default 5 ms
+    // CELT packets cannot, so transport-level verbatim redundancy is the primary
+    // loss protection. Explicit ST_AUDIO_OPUS_APPLICATION still overrides.
     match std::env::var("ST_AUDIO_OPUS_APPLICATION")
         .unwrap_or_default()
         .to_lowercase()
@@ -52,6 +55,14 @@ fn opus_application_value(_expected_loss: u32) -> &'static str {
         "audio" => "audio",
         _ => "lowdelay",
     }
+}
+
+fn invalidate_post_submit_state(
+    pending_source_seqs: &mut VecDeque<u64>,
+    failed_after_submit: &mut bool,
+) {
+    pending_source_seqs.clear();
+    *failed_after_submit = true;
 }
 
 /// -3 dB (≈0.7071) attenuation used for center/surround fold-down.
@@ -237,6 +248,8 @@ impl OpusEncoder {
             frame,
             samples_per_frame,
             channels: out_channels,
+            pending_source_seqs: VecDeque::new(),
+            failed_after_submit: false,
         })
     }
 
@@ -262,7 +275,15 @@ impl OpusEncoder {
     }
 
     /// Encode a frame of interleaved float32 samples. Returns encoded Opus packets.
-    fn encode(&mut self, samples: &[f32], pts: i64) -> Result<Vec<Vec<u8>>, String> {
+    fn encode(
+        &mut self,
+        samples: &[f32],
+        pts: i64,
+        source_seq: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        if self.failed_after_submit {
+            return Err("Opus encoder requires reset after a post-submit failure".into());
+        }
         let expected = (self.samples_per_frame * self.channels) as usize;
         if samples.len() < expected {
             return Err(format!(
@@ -289,23 +310,27 @@ impl OpusEncoder {
             (*self.frame).nb_samples = self.samples_per_frame as i32;
         }
 
+        // Allocate before submission: once FFmpeg accepts a frame, every error
+        // path must invalidate the sequence queue and replace this encoder.
+        let pkt = unsafe { ffi::av_packet_alloc() };
+        if pkt.is_null() {
+            return Err("av_packet_alloc failed".into());
+        }
+
         // Send frame to encoder
         let ret = unsafe { ffi::avcodec_send_frame(self.ctx, self.frame) };
         if ret < 0 {
+            unsafe { ffi::av_packet_free(&mut { pkt }) };
             return Err(format!(
                 "avcodec_send_frame (opus) failed: {}",
                 ffmpeg_err(ret)
             ));
         }
+        self.pending_source_seqs.push_back(source_seq);
 
         // Receive encoded packets
         let mut packets = Vec::new();
         unsafe {
-            let pkt = ffi::av_packet_alloc();
-            if pkt.is_null() {
-                return Err("av_packet_alloc failed".into());
-            }
-
             loop {
                 let ret = ffi::avcodec_receive_packet(self.ctx, pkt);
                 if ret == -ffi::EAGAIN || ret == ffi::AVERROR_EOF {
@@ -313,13 +338,26 @@ impl OpusEncoder {
                 }
                 if ret < 0 {
                     ffi::av_packet_free(&mut { pkt });
+                    invalidate_post_submit_state(
+                        &mut self.pending_source_seqs,
+                        &mut self.failed_after_submit,
+                    );
                     return Err(format!(
                         "avcodec_receive_packet (opus) failed: {}",
                         ffmpeg_err(ret)
                     ));
                 }
                 let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
-                packets.push(data.to_vec());
+                let Some(packet_source_seq) = self.pending_source_seqs.pop_front() else {
+                    ffi::av_packet_unref(pkt);
+                    ffi::av_packet_free(&mut { pkt });
+                    invalidate_post_submit_state(
+                        &mut self.pending_source_seqs,
+                        &mut self.failed_after_submit,
+                    );
+                    return Err("libopus produced a packet without a source frame".into());
+                };
+                packets.push((packet_source_seq, data.to_vec()));
                 ffi::av_packet_unref(pkt);
             }
             ffi::av_packet_free(&mut { pkt });
@@ -340,11 +378,6 @@ impl Drop for OpusEncoder {
             }
         }
     }
-}
-
-/// Encoded audio packet ready for transport.
-pub struct EncodedAudioPacket {
-    pub data: Vec<u8>,
 }
 
 /// Audio encoding thread: consumes `AudioSamples`, produces `EncodedAudioPacket`.
@@ -375,20 +408,11 @@ pub fn run_encode_thread(
         let mut backlog_logs = 0usize;
 
         while running.load(Ordering::SeqCst) {
-            let mut samples = match sample_rx.recv() {
-                Ok(s) => s,
-                Err(_) => break, // Channel closed
-            };
-            let mut dropped_frames = 0usize;
-            while sample_rx.len() > max_capture_backlog {
-                match sample_rx.try_recv() {
-                    Ok(newer) => {
-                        samples = newer;
-                        dropped_frames += 1;
-                    }
-                    Err(_) => break,
-                }
-            }
+            let (samples, dropped_frames) =
+                match recv_with_backlog_limit(&sample_rx, max_capture_backlog) {
+                    Ok(received) => received,
+                    Err(_) => break, // Channel closed
+                };
             if dropped_frames > 0 {
                 pts += dropped_frames as i64 * config.samples_per_frame() as i64;
                 if trace && backlog_logs < 12 {
@@ -418,10 +442,13 @@ pub fn run_encode_thread(
                 &samples.data
             };
 
-            match encoder.encode(frame_samples, pts) {
+            match encoder.encode(frame_samples, pts, samples.source_seq) {
                 Ok(packets) => {
-                    for pkt_data in packets {
-                        let packet = EncodedAudioPacket { data: pkt_data };
+                    for (source_seq, pkt_data) in packets {
+                        let packet = EncodedAudioPacket {
+                            source_seq,
+                            data: pkt_data,
+                        };
                         if packet_tx.send(packet).is_err() {
                             return;
                         }
@@ -429,6 +456,17 @@ pub fn run_encode_thread(
                 }
                 Err(e) => {
                     eprintln!("[audio] Opus encode error: {e}");
+                    if encoder.failed_after_submit {
+                        encoder = match OpusEncoder::new(&config) {
+                            Ok(encoder) => encoder,
+                            Err(reset_err) => {
+                                eprintln!(
+                                    "[audio] Failed to reset Opus encoder after submit error: {reset_err}"
+                                );
+                                return;
+                            }
+                        };
+                    }
                 }
             }
 
@@ -451,11 +489,47 @@ fn ffmpeg_err(code: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam_channel::unbounded;
 
     #[test]
     fn downmix_stereo_passthrough() {
         let s = [0.1, -0.2, 0.3, -0.4];
         assert_eq!(downmix_to_stereo(&s, 2), s.to_vec());
+    }
+
+    #[test]
+    fn encoder_backlog_drop_preserves_captured_source_gap() {
+        let (tx, rx) = unbounded();
+        let samples = |source_seq| AudioSamples {
+            source_seq,
+            data: vec![0.0; 2],
+            channels: 2,
+            sample_rate: 48_000,
+        };
+
+        tx.send(samples(30)).unwrap();
+        let (first, dropped) = recv_with_backlog_limit(&rx, 1).unwrap();
+        assert_eq!(first.source_seq, 30);
+        assert_eq!(dropped, 0);
+
+        for seq in 31..=34 {
+            tx.send(samples(seq)).unwrap();
+        }
+        let (next, dropped) = recv_with_backlog_limit(&rx, 1).unwrap();
+        assert_eq!(dropped, 2);
+        assert_eq!(next.source_seq, 33);
+        assert_eq!(next.source_seq - first.source_seq, 3);
+    }
+
+    #[test]
+    fn post_submit_failure_clears_pending_sequences_and_requires_reset() {
+        let mut pending = VecDeque::from([10, 11, 12]);
+        let mut failed = false;
+
+        invalidate_post_submit_state(&mut pending, &mut failed);
+
+        assert!(pending.is_empty());
+        assert!(failed);
     }
 
     // Regression guard for the E1 5 ms framing: FFmpeg's libopus must be told the
@@ -479,7 +553,7 @@ mod tests {
         let mut packets = 0usize;
         for i in 0..5i64 {
             let pkts = enc
-                .encode(&samples, i * config.samples_per_frame() as i64)
+                .encode(&samples, i * config.samples_per_frame() as i64, i as u64)
                 .expect("opus rejected the configured frame size (frame_duration not wired?)");
             packets += pkts.len();
         }
@@ -487,6 +561,35 @@ mod tests {
             packets > 0,
             "no opus packets produced at the configured frame size"
         );
+    }
+
+    #[test]
+    fn delayed_opus_output_keeps_its_source_sequence_gap() {
+        let config = AudioConfig::stereo();
+        let mut enc = match OpusEncoder::new(&config) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("libopus unavailable ({e}); skipping");
+                return;
+            }
+        };
+        let samples = vec![0.0f32; config.total_samples_per_frame()];
+        let mut output_seqs = Vec::new();
+        for (i, source_seq) in [10, 12, 13].into_iter().enumerate() {
+            output_seqs.extend(
+                enc.encode(
+                    &samples,
+                    i as i64 * config.samples_per_frame() as i64,
+                    source_seq,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|(seq, _)| seq),
+            );
+        }
+
+        assert!(output_seqs.len() >= 2, "libopus produced too little output");
+        assert_eq!(&output_seqs[..2], &[10, 12]);
     }
 
     #[test]

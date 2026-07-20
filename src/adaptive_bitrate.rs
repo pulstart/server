@@ -1,4 +1,7 @@
-use st_protocol::TransportFeedback;
+use st_protocol::{
+    packet::{audio_redundancy_header_size, AUDIO_REDUNDANCY_MAX_DEPTH, HEADER_SIZE},
+    TransportFeedback,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -108,6 +111,25 @@ pub fn fec_reserve_pct_from_env() -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(3)
         .min(90)
+}
+
+/// Sustained Opus wire rate, including verbatim copies and the per-datagram
+/// protocol/redundancy headers. This deliberately reserves the configured
+/// redundancy cap even in adaptive mode so a source-gap restoration cannot push
+/// the stream above the ABR link budget.
+pub fn audio_wire_kbps(
+    encoded_audio_bps: u32,
+    packet_duration_ms: u32,
+    redundancy_depth: usize,
+) -> u32 {
+    let depth = redundancy_depth.min(AUDIO_REDUNDANCY_MAX_DEPTH);
+    let payload_bps = encoded_audio_bps as u64 * (depth as u64 + 1);
+    let header_bytes = HEADER_SIZE + audio_redundancy_header_size(depth);
+    let header_bps = (header_bytes as u64 * 8 * 1_000).div_ceil(packet_duration_ms.max(1) as u64);
+    payload_bps
+        .saturating_add(header_bps)
+        .div_ceil(1_000)
+        .min(u32::MAX as u64) as u32
 }
 
 /// Convert an on-wire media budget into the encoder bitrate target (B3).
@@ -353,11 +375,9 @@ impl DupFirstController {
     }
 }
 
-/// Adaptive verbatim audio-redundancy controller (E5). Ramps redundancy depth
-/// up by one per lossy feedback window (capped at the configured max) and decays
-/// back toward 0 over sustained clean intervals, so a perfect LAN pays no
-/// redundancy overhead while a lossy path gets burst protection. Default-on;
-/// `ST_AUDIO_ADAPTIVE_REDUNDANCY=0` restores the fixed legacy depth.
+/// Opt-in adaptive verbatim audio-redundancy controller. Starts at the
+/// configured cap so the stream is protected immediately, then decays toward 0
+/// over sustained clean intervals and ramps back on loss.
 pub struct AudioRedundancyController {
     max_depth: u8,
     current: u8,
@@ -370,13 +390,29 @@ impl AudioRedundancyController {
     pub fn new(max_depth: u8) -> Self {
         Self {
             max_depth,
-            current: 0,
+            current: max_depth,
             last_decay: Instant::now(),
         }
     }
 
     pub fn current_depth(&self) -> u8 {
         self.current
+    }
+
+    /// Observe a sender-side source-gap restoration published through the
+    /// shared depth atomic. Raising the controller too keeps subsequent clean
+    /// feedback decaying from the restored depth instead of leaving the sender
+    /// permanently pinned above the controller's stale value.
+    pub fn synchronize_sender_depth(&mut self, depth: u8) {
+        self.synchronize_sender_depth_at(depth, Instant::now());
+    }
+
+    fn synchronize_sender_depth_at(&mut self, depth: u8, now: Instant) {
+        let depth = depth.min(self.max_depth);
+        if depth > self.current {
+            self.current = depth;
+            self.last_decay = now;
+        }
     }
 
     pub fn apply_feedback(&mut self, feedback: &TransportFeedback) -> u8 {
@@ -978,6 +1014,14 @@ mod tests {
     }
 
     #[test]
+    fn audio_wire_rate_accounts_for_fixed_copies_and_headers() {
+        // 96 kbps primary + two copies + 12 bytes/datagram at 200 packets/s.
+        assert_eq!(audio_wire_kbps(96_000, 5, 2), 308);
+        // Redundancy disabled still pays the packet and count-byte headers.
+        assert_eq!(audio_wire_kbps(96_000, 5, 0), 109);
+    }
+
+    #[test]
     fn fec_controller_raises_on_loss_and_decays_clean() {
         let start = Instant::now();
         let mut fec = FecController::new(10, 50);
@@ -1124,10 +1168,17 @@ mod tests {
     }
 
     #[test]
-    fn audio_redundancy_ramps_on_loss_and_decays() {
-        let start = Instant::now();
+    fn audio_redundancy_starts_protected_then_decays_and_ramps() {
         let mut ctl = AudioRedundancyController::new(3);
-        assert_eq!(ctl.current_depth(), 0);
+        assert_eq!(ctl.current_depth(), 3);
+
+        let clean = TransportFeedback {
+            interval_ms: 500,
+            received_packets: 100,
+            ..Default::default()
+        };
+        let mut now = ctl.last_decay + AudioRedundancyController::DECAY_COOLDOWN;
+        assert_eq!(ctl.apply_feedback_at(&clean, now), 2);
 
         let lossy = TransportFeedback {
             interval_ms: 500,
@@ -1135,24 +1186,40 @@ mod tests {
             lost_packets: 5,
             ..Default::default()
         };
-        let mut now = start;
-        // Two lossy windows ramp depth to 2 (capped at max 3).
         now += Duration::from_millis(500);
-        assert_eq!(ctl.apply_feedback_at(&lossy, now), 1);
-        now += Duration::from_millis(500);
-        assert_eq!(ctl.apply_feedback_at(&lossy, now), 2);
+        assert_eq!(ctl.apply_feedback_at(&lossy, now), 3);
 
+        // Clean but within cooldown → holds.
+        now += Duration::from_secs(1);
+        assert_eq!(ctl.apply_feedback_at(&clean, now), 3);
+        // After cooldown → decays one step.
+        now += AudioRedundancyController::DECAY_COOLDOWN;
+        assert_eq!(ctl.apply_feedback_at(&clean, now), 2);
+    }
+
+    #[test]
+    fn sender_restoration_resynchronizes_then_decays() {
+        let mut ctl = AudioRedundancyController::new(3);
         let clean = TransportFeedback {
             interval_ms: 500,
             received_packets: 100,
             ..Default::default()
         };
-        // Clean but within cooldown → holds.
-        now += Duration::from_secs(1);
+        let mut now = ctl.last_decay + AudioRedundancyController::DECAY_COOLDOWN;
         assert_eq!(ctl.apply_feedback_at(&clean, now), 2);
-        // After cooldown → decays one step.
         now += AudioRedundancyController::DECAY_COOLDOWN;
         assert_eq!(ctl.apply_feedback_at(&clean, now), 1);
+
+        ctl.synchronize_sender_depth_at(3, now);
+        assert_eq!(ctl.current_depth(), 3);
+        assert_eq!(
+            ctl.apply_feedback_at(&clean, now + Duration::from_secs(1)),
+            3
+        );
+        assert_eq!(
+            ctl.apply_feedback_at(&clean, now + AudioRedundancyController::DECAY_COOLDOWN),
+            2
+        );
     }
 
     #[test]

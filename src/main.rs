@@ -59,7 +59,7 @@ use capture::{CaptureBackend, PlatformCapture};
 use encode_config::EncoderConfig;
 use input::{CursorVersionCursor, InputRuntime};
 use server_control::ServerControl;
-use transport::{EncodedVideoFrame, UdpSender};
+use transport::{EncodedAudioPacket, EncodedVideoFrame, UdpSender};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use st_protocol::{
@@ -996,7 +996,7 @@ impl SharedCaptureState {
 struct SharedPipeline {
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    audio_bc: Arc<Broadcaster<Vec<u8>>>,
+    audio_bc: Arc<Broadcaster<EncodedAudioPacket>>,
     stream_config: StreamConfig,
     session_debug: SessionDebugInfo,
     rate_control: Arc<AdaptiveBitrateState>,
@@ -1102,7 +1102,7 @@ struct ClientSubscription {
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     aud_sub_id: u64,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    aud_rx: Receiver<Arc<Vec<u8>>>,
+    aud_rx: Receiver<Arc<EncodedAudioPacket>>,
 }
 
 /// Global server state shared across all client handlers.
@@ -1161,7 +1161,7 @@ fn run_shared_pipeline(
     control: Arc<ServerControl>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))] audio_bc: Arc<
-        Broadcaster<Vec<u8>>,
+        Broadcaster<EncodedAudioPacket>,
     >,
     capture_state: Arc<SharedCaptureState>,
     capture_cmd_rx: Receiver<CaptureCommand>,
@@ -1223,6 +1223,12 @@ fn run_shared_pipeline(
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let audio_config = encode_config::AudioConfig::from_env();
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    let audio_wire_kbps = adaptive_bitrate::audio_wire_kbps(
+        audio_config.bitrate,
+        audio_config.packet_duration_ms,
+        transport::configured_audio_redundancy_depth(),
+    );
 
     #[cfg(target_os = "linux")]
     let capture_render_hint = capture_backend
@@ -1599,7 +1605,7 @@ fn run_shared_pipeline(
                 } else {
                     adaptive_bitrate::encoder_target_kbps(
                         rate_control.current_target_kbps(),
-                        audio_config.bitrate / 1000,
+                        audio_wire_kbps,
                         adaptive_bitrate::fec_reserve_pct_from_env(),
                         current_config.min_bitrate_kbps,
                     )
@@ -1725,7 +1731,7 @@ fn run_shared_pipeline(
                 } else {
                     adaptive_bitrate::encoder_target_kbps(
                         rate_control.current_target_kbps(),
-                        audio_config.bitrate / 1000,
+                        audio_wire_kbps,
                         adaptive_bitrate::fec_reserve_pct_from_env(),
                         current_config.min_bitrate_kbps,
                     )
@@ -2074,15 +2080,16 @@ fn audio_interleave_enabled() -> bool {
 /// (so it can't build up) but only transmits when the client enabled audio.
 fn flush_pending_audio(
     sender: &mut UdpSender,
-    aud_rx: &Option<Receiver<Arc<Vec<u8>>>>,
+    aud_rx: &Option<Receiver<Arc<EncodedAudioPacket>>>,
     audio_enabled: &AtomicBool,
+    audio_depth: &AtomicU8,
     peer: impl std::fmt::Display,
 ) {
     let Some(aud) = aud_rx else { return };
     let send = audio_enabled.load(Ordering::Relaxed);
     while let Ok(opus) = aud.try_recv() {
         if send {
-            if let Err(e) = sender.send_audio(&opus) {
+            if let Err(e) = sender.send_audio(&opus, audio_depth) {
                 eprintln!("[transport] audio send error to {peer}: {e}");
             }
         }
@@ -2142,13 +2149,13 @@ fn run_transport(
     addr: SocketAddr,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    aud_rx: Option<Receiver<Arc<Vec<u8>>>>,
+    aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
     // A2: adaptive RS parity percentage, updated by the control loop from loss.
     fec_pct: Arc<AtomicU16>,
-    // E5: adaptive verbatim audio-redundancy depth.
+    // Optional adaptive verbatim audio-redundancy depth.
     audio_depth: Arc<AtomicU8>,
     // Auto-mode duplicate-FrameStart verdict from the DupFirstController.
     dup_first: Arc<AtomicBool>,
@@ -2156,8 +2163,8 @@ fn run_transport(
     // so it can react to WiFi bufferbloat that never shows up as packet loss.
     send_backlog_us: Arc<AtomicU32>,
     // B3: shared cell holding the client's current UDP media destination. The
-    // input listener updates it when the client's source address changes (wifi
-    // switch / NAT rebind); this loop repoints the send socket to match.
+    // input listener updates it when the authenticated client's source port
+    // changes; this loop repoints the send socket to match.
     media_dest: Arc<Mutex<SocketAddr>>,
 ) {
     let mut sender = match UdpSender::new(addr, crypto) {
@@ -2192,9 +2199,8 @@ fn run_transport(
     let mut backlog_seen = false;
     let hard_ceiling_us = max_queue_latency_us();
     while running.load(Ordering::SeqCst) {
-        // B3: relearn the client's UDP return path if it moved (cheap once-per-
-        // iteration check). Repoint the connected send socket so video follows
-        // the client across a wifi switch / NAT rebind without a reconnect.
+        // B3: relearn the client's UDP return port if it moved (cheap once-per-
+        // iteration check). IP changes require a new authenticated connection.
         let want_dest = *media_dest.lock().unwrap();
         if want_dest != current_dest {
             match sender.update_dest(want_dest) {
@@ -2249,7 +2255,13 @@ fn run_transport(
                 while let Some(frame) = pending.take() {
                     // B6: push queued audio ahead of this video unit.
                     if interleave_audio {
-                        flush_pending_audio(&mut sender, &aud_rx, &audio_enabled, addr);
+                        flush_pending_audio(
+                            &mut sender,
+                            &aud_rx,
+                            &audio_enabled,
+                            &audio_depth,
+                            addr,
+                        );
                     }
                     let source_gap = last_source_seq
                         .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
@@ -2362,7 +2374,7 @@ fn run_transport(
             let send_audio = audio_enabled.load(Ordering::Relaxed);
             while let Ok(opus) = aud.try_recv() {
                 if send_audio {
-                    if let Err(e) = sender.send_audio(&opus) {
+                    if let Err(e) = sender.send_audio(&opus, &audio_depth) {
                         eprintln!("[transport] audio send error to {addr}: {e}");
                     }
                 }
@@ -2583,10 +2595,9 @@ struct TunnelSessionSlot;
 
 impl TunnelSessionSlot {
     fn acquire() -> Option<Self> {
-        let prev = ACTIVE_TUNNEL_SESSIONS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_TUNNEL_SESSIONS).then_some(n + 1)
-            });
+        let prev = ACTIVE_TUNNEL_SESSIONS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < MAX_TUNNEL_SESSIONS).then_some(n + 1)
+        });
         prev.ok().map(|_| TunnelSessionSlot)
     }
 }
@@ -2643,7 +2654,10 @@ async fn handle_client(
     // control port but lead with a tunnel preamble; the whole session
     // (control + media) then runs over this one TCP connection using the
     // tunnel framing, through the same handler as hole-punched sessions.
-    if matches!(detect_tunnel_preamble(&mut stream).await, TunnelDetect::Tunnel) {
+    if matches!(
+        detect_tunnel_preamble(&mut stream).await,
+        TunnelDetect::Tunnel
+    ) {
         // Bound concurrent tunnel sessions before committing OS threads, so a
         // flood of preamble-then-silence connections can't exhaust threads/FDs.
         let Some(slot) = TunnelSessionSlot::acquire() else {
@@ -2859,13 +2873,30 @@ async fn handle_client(
         }
     }
 
+    let transport_addr = SocketAddr::new(addr.ip(), client_media_port(startup_prefs.display));
+    let input_credential = input::generate_input_credential();
+    // Register before publishing InputSession: Android sends a neutral input
+    // snapshot before ClientReadyForMedia to reveal its live UDP receive port.
+    let media_dest = Arc::new(Mutex::new(transport_addr));
+    let input_registration = state.input.register_direct_client(
+        client_id,
+        input_credential,
+        addr.ip(),
+        Arc::clone(&media_dest),
+    );
+
     // Send stream/session metadata first. The client will bind UDP, start its
     // receive path, and acknowledge readiness before we start transport.
     let mut control_buf = ControlMessage::StreamConfig(stream_config).serialize();
     control_buf
         .extend_from_slice(&ControlMessage::SessionDebugInfo(session_debug.clone()).serialize());
-    control_buf
-        .extend_from_slice(&ControlMessage::InputSession(InputSession { client_id }).serialize());
+    control_buf.extend_from_slice(
+        &ControlMessage::InputSession(InputSession {
+            client_id,
+            credential: input_credential,
+        })
+        .serialize(),
+    );
     control_buf.extend_from_slice(
         &ControlMessage::InputCapabilities(state.input.capabilities()).serialize(),
     );
@@ -2938,20 +2969,12 @@ async fn handle_client(
     // Start per-client unified transport (video + audio on single UDP socket)
     let transport_running = Arc::new(AtomicBool::new(true));
 
-    let transport_addr = SocketAddr::new(addr.ip(), client_media_port(startup_prefs.display));
-    // B3: shared media-destination cell. Seeded from the declared address; the
-    // input listener relearns the live source address (input + media share one
-    // client socket) and the transport thread repoints to follow it.
-    let media_dest = Arc::new(Mutex::new(transport_addr));
-    state
-        .input
-        .register_media_dest(client_id, Arc::clone(&media_dest));
     sub.video_bc.request_keyframe();
     let vid_rx = sub.vid_rx;
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let aud_rx = Some(sub.aud_rx);
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    let aud_rx: Option<Receiver<Arc<Vec<u8>>>> = None;
+    let aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
     let video_bc = Arc::clone(&sub.video_bc);
@@ -2968,9 +2991,8 @@ async fn handle_client(
     // read by the bitrate controller to react to WiFi bufferbloat (zero loss).
     let send_backlog_shared = Arc::new(AtomicU32::new(0));
     let send_backlog_transport = Arc::clone(&send_backlog_shared);
-    // E5 (default-on): adaptive audio-redundancy depth — starts at 0 and ramps
-    // toward the configured cap on measured loss. ST_AUDIO_ADAPTIVE_REDUNDANCY=0
-    // disables it, pinning the atomic at the fixed configured depth (legacy).
+    // Default to fixed verbatim redundancy from stream start because 5 ms CELT
+    // packets have no usable Opus LBRR. Adaptation is an explicit opt-in.
     let audio_redundancy_adaptive = transport::audio_adaptive_redundancy_enabled();
     let audio_redundancy_max = transport::configured_audio_redundancy_depth() as u8;
     let mut audio_redundancy_controller =
@@ -3144,8 +3166,11 @@ async fn handle_client(
                             // A2: raise/decay RS FEC strength on the same signal.
                             let fec_pct = fec_controller.apply_feedback(&feedback);
                             fec_pct_shared.store(fec_pct, Ordering::Relaxed);
-                            // E5: adapt audio-redundancy depth from the same loss.
+                            // Optional adaptation uses the same aggregate loss signal.
                             if audio_redundancy_adaptive {
+                                audio_redundancy_controller.synchronize_sender_depth(
+                                    audio_depth_shared.load(Ordering::Relaxed),
+                                );
                                 let depth = audio_redundancy_controller.apply_feedback(&feedback);
                                 audio_depth_shared.store(depth, Ordering::Relaxed);
                             }
@@ -3202,6 +3227,9 @@ async fn handle_client(
                         }
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
+                        }
+                        ControlMessage::TextInput(text) => {
+                            let _ = state.input.handle_text_input(client_id, &text);
                         }
                         ControlMessage::FileOffer {
                             transfer_id,
@@ -3302,7 +3330,7 @@ async fn handle_client(
     transport_running.store(false, Ordering::SeqCst);
     rate_control.unregister_client(sub.vid_sub_id);
     let _ = state.input.release_control(client_id);
-    state.input.unregister_media_dest(client_id);
+    drop(input_registration);
 
     unsubscribe_and_maybe_stop_pipeline(
         &state,
@@ -3553,18 +3581,28 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
     // failure meant no second chance until the client posted a brand-new nonce.
     const MAX_PUNCH_ATTEMPTS: u32 = 3;
     std::thread::spawn(move || {
-        let mut last_handled_punch_nonce = 0;
+        let mut last_handled_punch = None;
+        let mut attempted_punch = None;
         let mut punch_attempts: u32 = 0;
         loop {
             if state.control.shutdown_requested() {
                 break;
             }
-            let pending_punch_nonce = tunnel.pending_client_punch_nonce();
-            // `!=` not `<=`: a restarted client restarts its nonce counter at 1,
-            // which a high-water gate would ignore against this long-lived host.
-            if pending_punch_nonce == last_handled_punch_nonce || tunnel.is_punch_session_active() {
+            let Some(pending_punch) = tunnel.pending_client_punch() else {
+                attempted_punch = None;
+                punch_attempts = 0;
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
+            };
+            if last_handled_punch.as_ref() == Some(&pending_punch)
+                || tunnel.is_punch_session_active()
+            {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            if attempted_punch.as_ref() != Some(&pending_punch) {
+                attempted_punch = Some(pending_punch.clone());
+                punch_attempts = 0;
             }
             if !tunnel.is_hole_punch_ready() {
                 std::thread::sleep(Duration::from_millis(200));
@@ -3580,13 +3618,18 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                 }
             };
 
-            let candidates: Vec<SocketAddr> = tunnel.partner_candidates.lock().unwrap().clone();
+            let Some(candidates) = tunnel.partner_candidates(&pending_punch) else {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            };
             if candidates.is_empty() {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
 
-            let crypto = match tunnel.crypto_context() {
+            let crypto = match tunnel
+                .crypto_context(&pending_punch, st_protocol::tunnel::TunnelMode::Punch)
+            {
                 Some(c) => c,
                 None => {
                     std::thread::sleep(Duration::from_millis(200));
@@ -3605,7 +3648,8 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                 Duration::from_secs(10),
             ) {
                 Ok(peer) => {
-                    last_handled_punch_nonce = pending_punch_nonce;
+                    last_handled_punch = Some(pending_punch.clone());
+                    attempted_punch = None;
                     punch_attempts = 0;
                     println!("[hole-punch] Success! Peer confirmed at {peer}");
                     tunnel.set_punch_session_active(true);
@@ -3632,12 +3676,12 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                         "[hole-punch] Failed (attempt {punch_attempts}/{MAX_PUNCH_ATTEMPTS}): {e}"
                     );
                     if punch_attempts >= MAX_PUNCH_ATTEMPTS {
-                        // Give up on this nonce; the client must post a new one
-                        // (it re-attempts on its own connect retries).
-                        last_handled_punch_nonce = pending_punch_nonce;
+                        last_handled_punch = Some(pending_punch.clone());
+                        attempted_punch = None;
                         punch_attempts = 0;
                         eprintln!(
-                            "[hole-punch] Giving up on nonce {pending_punch_nonce} after {MAX_PUNCH_ATTEMPTS} attempts"
+                            "[hole-punch] Giving up on request generation {} after {MAX_PUNCH_ATTEMPTS} attempts",
+                            pending_punch.generation
                         );
                     }
                     // Brief backoff; partner candidates refresh on the API poll
@@ -3661,22 +3705,42 @@ fn spawn_relay_task(state: Arc<ServerState>, api_url: String) {
     };
     let state = Arc::clone(&state);
     std::thread::spawn(move || {
-        let mut last_handled_relay_nonce = 0u64;
+        let mut last_handled_relay = None;
+        let mut retrying_relay = None;
+        let mut retry_failures = 0u32;
+        let mut retry_at = Instant::now();
         loop {
             if state.control.shutdown_requested() {
                 break;
             }
-            let pending = tunnel.pending_client_relay_nonce();
-            // Compare for inequality, not `<=`: the client's nonce counter
-            // restarts at 1 each app launch, so a `<=` high-water gate would
-            // ignore every request from a restarted client against this
-            // long-lived host process. Any nonce we have not already acted on
-            // is a fresh request.
-            if pending == last_handled_relay_nonce || tunnel.is_relay_session_active() {
+            let Some(pending) = tunnel.pending_client_relay() else {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            };
+            if last_handled_relay.as_ref() == Some(&pending) || tunnel.is_relay_session_active() {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
-            let Some(crypto) = tunnel.crypto_context() else {
+            if retrying_relay.as_ref() != Some(&pending) {
+                retrying_relay = Some(pending.clone());
+                retry_failures = 0;
+                retry_at = Instant::now();
+            }
+            if Instant::now() < retry_at {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            let mut retry = |message: String| {
+                retry_failures = retry_failures.saturating_add(1);
+                let shift = retry_failures.saturating_sub(1).min(4);
+                let delay = Duration::from_millis(250 * (1u64 << shift));
+                retry_at = Instant::now() + delay.min(Duration::from_secs(4));
+                eprintln!("[relay] {message}; retrying in {}ms", delay.as_millis());
+            };
+            let Some(crypto) =
+                tunnel.crypto_context(&pending, st_protocol::tunnel::TunnelMode::Relay)
+            else {
+                retry("lease-bound relay crypto is not ready".into());
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             };
@@ -3687,19 +3751,31 @@ fn spawn_relay_task(state: Arc<ServerState>, api_url: String) {
             ) {
                 Some(addr) => addr,
                 None => {
-                    eprintln!("[relay] Client requested relay but no relay address is available");
-                    last_handled_relay_nonce = pending;
+                    retry("client requested relay but no relay address is available".into());
+                    continue;
+                }
+            };
+            let relay_ticket = match api_client::claim_relay_ticket(
+                &api_url,
+                &state.control.token(),
+                state.control.peer_id(),
+                tunnel.lease_id(),
+                &pending,
+            ) {
+                Ok(ticket) => ticket,
+                Err(api_client::RelayClaimError::Terminal(error)) => {
+                    eprintln!("[relay] {error}; request is no longer owned by this lease pair");
+                    last_handled_relay = Some(pending.clone());
+                    retrying_relay = None;
+                    continue;
+                }
+                Err(api_client::RelayClaimError::Transient(error)) => {
+                    retry(error);
                     continue;
                 }
             };
             println!("[relay] Client requested TCP relay; dialing {relay_addr}...");
-            last_handled_relay_nonce = pending;
-            match connect_relay(
-                &relay_addr,
-                "host",
-                &state.control.token(),
-                Duration::from_secs(45),
-            ) {
+            match connect_relay(&relay_addr, "host", &relay_ticket, Duration::from_secs(45)) {
                 Ok(stream) => {
                     match st_protocol::tcp_tunnel::TcpTunnel::new(stream, Some(crypto), Vec::new())
                     {
@@ -3707,7 +3783,7 @@ fn spawn_relay_task(state: Arc<ServerState>, api_url: String) {
                             // Bound concurrent tunnel sessions like the direct
                             // path; drop the pairing if we are already at cap.
                             let Some(slot) = TunnelSessionSlot::acquire() else {
-                                eprintln!("[relay] tunnel session cap reached; dropping relay pair");
+                                retry("tunnel session cap reached after relay pairing".into());
                                 continue;
                             };
                             println!("[relay] Paired with client via {relay_addr}");
@@ -3725,11 +3801,15 @@ fn spawn_relay_task(state: Arc<ServerState>, api_url: String) {
                                 let _guard = ActiveRelayGuard(tunnel2);
                                 handle_punched_client(Arc::new(tcp_tunnel), state2);
                             });
+                            last_handled_relay = Some(pending.clone());
+                            retrying_relay = None;
                         }
-                        Err(e) => eprintln!("[relay] Tunnel setup failed: {e}"),
+                        Err(e) => {
+                            retry(format!("tunnel setup failed after pairing: {e}"));
+                        }
                     }
                 }
-                Err(e) => eprintln!("[relay] {e}"),
+                Err(e) => retry(e),
             }
         }
     });
@@ -3909,12 +3989,21 @@ fn handle_punched_client(
     let controller_state = state.input.controller_state_for(client_id);
     // Late joiners after an output switch need the post-switch config.
     let stream_config = capture_state.updated_config().unwrap_or(stream_config);
+    let input_credential = input::generate_input_credential();
+    let input_registration = state
+        .input
+        .register_tunnel_client(client_id, input_credential);
 
     // --- Send startup control bundle ---
     let mut control_buf = ControlMessage::StreamConfig(stream_config).serialize();
     control_buf.extend_from_slice(&ControlMessage::SessionDebugInfo(session_debug).serialize());
-    control_buf
-        .extend_from_slice(&ControlMessage::InputSession(InputSession { client_id }).serialize());
+    control_buf.extend_from_slice(
+        &ControlMessage::InputSession(InputSession {
+            client_id,
+            credential: input_credential,
+        })
+        .serialize(),
+    );
     control_buf.extend_from_slice(
         &ControlMessage::InputCapabilities(state.input.capabilities()).serialize(),
     );
@@ -3968,7 +4057,7 @@ fn handle_punched_client(
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let aud_rx = Some(sub.aud_rx);
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    let aud_rx: Option<Receiver<Arc<Vec<u8>>>> = None;
+    let aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
     let punched_transport = Arc::clone(&punched);
@@ -3990,7 +4079,7 @@ fn handle_punched_client(
     // Server-side cap→send backlog (µs, EWMA) for bufferbloat-aware bitrate.
     let send_backlog_shared = Arc::new(AtomicU32::new(0));
     let send_backlog_transport = Arc::clone(&send_backlog_shared);
-    // E5 (default-on): adaptive audio-redundancy depth (ST_AUDIO_ADAPTIVE_REDUNDANCY=0 disables).
+    // Fixed configured redundancy is default; adaptation is explicit opt-in.
     let audio_redundancy_adaptive = transport::audio_adaptive_redundancy_enabled();
     let audio_redundancy_max = transport::configured_audio_redundancy_depth() as u8;
     let mut audio_redundancy_controller =
@@ -4113,8 +4202,11 @@ fn handle_punched_client(
                                 // A2: drive RS FEC strength from the same loss signal.
                                 let fec_pct = fec_controller.apply_feedback(&fb);
                                 fec_pct_shared.store(fec_pct, Ordering::Relaxed);
-                                // E5: adapt audio-redundancy depth from the same loss.
+                                // Optional adaptation uses the same aggregate loss signal.
                                 if audio_redundancy_adaptive {
+                                    audio_redundancy_controller.synchronize_sender_depth(
+                                        audio_depth_shared.load(Ordering::Relaxed),
+                                    );
                                     let depth = audio_redundancy_controller.apply_feedback(&fb);
                                     audio_depth_shared.store(depth, Ordering::Relaxed);
                                 }
@@ -4162,6 +4254,9 @@ fn handle_punched_client(
                         }
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
+                        }
+                        ControlMessage::TextInput(text) => {
+                            let _ = state.input.handle_text_input(client_id, &text);
                         }
                         ControlMessage::FileOffer {
                             transfer_id,
@@ -4238,10 +4333,12 @@ fn handle_punched_client(
                 // Demux input packets from the media channel. The punched peer
                 // address is fixed by the hole punch (no media_dest cell), so
                 // the relearn is a no-op here.
-                if let Some((header, packet)) = st_protocol::InputPacket::deserialize(&data) {
+                if let Some((header, credential, packet)) =
+                    st_protocol::InputPacket::deserialize(&data)
+                {
                     state
                         .input
-                        .handle_input_packet(header.seq, packet, punched.peer());
+                        .handle_tunnel_input_packet(header.seq, credential, packet, client_id);
                 }
             }
             None => {}
@@ -4258,9 +4355,10 @@ fn handle_punched_client(
     clipboard_sync.stop();
     ft_manager.stop();
     transport_running.store(false, Ordering::SeqCst);
+    let _ = state.input.release_control(client_id);
+    drop(input_registration);
     let _ = transport_handle.join();
     rate_control.unregister_client(sub.vid_sub_id);
-    let _ = state.input.release_control(client_id);
     unsubscribe_and_maybe_stop_pipeline(
         &state,
         sub.vid_sub_id,
@@ -4277,12 +4375,12 @@ fn run_punched_transport(
     punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink>,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    aud_rx: Option<Receiver<Arc<Vec<u8>>>>,
+    aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     // A2: adaptive RS parity percentage from the control loop.
     fec_pct: Arc<AtomicU16>,
-    // E5: adaptive verbatim audio-redundancy depth.
+    // Optional adaptive verbatim audio-redundancy depth.
     audio_depth: Arc<AtomicU8>,
     // Auto-mode duplicate-FrameStart verdict from the DupFirstController.
     dup_first: Arc<AtomicBool>,
@@ -4338,7 +4436,13 @@ fn run_punched_transport(
                 while let Some(frame) = pending.take() {
                     // B6: push queued audio ahead of this video unit.
                     if interleave_audio {
-                        flush_pending_audio(&mut sender, &aud_rx, &audio_enabled, peer);
+                        flush_pending_audio(
+                            &mut sender,
+                            &aud_rx,
+                            &audio_enabled,
+                            &audio_depth,
+                            peer,
+                        );
                     }
                     let source_gap = last_source_seq
                         .map(|last| frame.source_seq.saturating_sub(last.saturating_add(1)))
@@ -4425,7 +4529,7 @@ fn run_punched_transport(
             let send_audio = audio_enabled.load(Ordering::Relaxed);
             while let Ok(opus) = aud.try_recv() {
                 if send_audio {
-                    if let Err(e) = sender.send_audio(&opus) {
+                    if let Err(e) = sender.send_audio(&opus, &audio_depth) {
                         eprintln!("[punched-transport] audio send error: {e}");
                     }
                 }

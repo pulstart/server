@@ -110,10 +110,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "wl_shm" => {
                     state.shm = Some(registry.bind(name, version.min(1), qh, ()));
                 }
-                "wl_output" => {
-                    if state.output.is_none() {
-                        state.output = Some(registry.bind(name, version.min(4), qh, ()));
-                    }
+                "wl_output" if state.output.is_none() => {
+                    state.output = Some(registry.bind(name, version.min(4), qh, ()));
                 }
                 "ext_output_image_capture_source_manager_v1" => {
                     state.source_manager = Some(registry.bind(name, version.min(1), qh, ()));

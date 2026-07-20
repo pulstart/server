@@ -1,10 +1,28 @@
 use crate::encode_config::AudioConfig;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Captured audio samples — a single frame of interleaved float32 PCM.
 pub struct AudioSamples {
+    pub source_seq: u64,
     pub data: Vec<f32>,
     pub channels: u32,
     pub sample_rate: u32,
+}
+
+impl AudioSamples {
+    fn from_capture(
+        source_seq: &AtomicU64,
+        data: Vec<f32>,
+        channels: u32,
+        sample_rate: u32,
+    ) -> Self {
+        Self {
+            source_seq: source_seq.fetch_add(1, Ordering::Relaxed),
+            data,
+            channels,
+            sample_rate,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -12,7 +30,7 @@ mod platform {
     use super::{AudioConfig, AudioSamples};
     use crossbeam_channel::Sender;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     };
     use std::thread;
@@ -184,6 +202,7 @@ mod platform {
             config: AudioConfig,
             device: Option<String>,
             tx: Sender<AudioSamples>,
+            source_seq: Arc<AtomicU64>,
         ) -> Result<(), String> {
             if self.running.load(Ordering::SeqCst) {
                 return Err("Audio capture already running".into());
@@ -210,11 +229,12 @@ mod platform {
                 while running.load(Ordering::SeqCst) {
                     match pa.read_f32(&mut buf) {
                         Ok(()) => {
-                            let samples = AudioSamples {
-                                data: std::mem::replace(&mut buf, vec![0.0f32; samples_per_frame]),
-                                channels: channels as u32,
+                            let samples = AudioSamples::from_capture(
+                                &source_seq,
+                                std::mem::replace(&mut buf, vec![0.0f32; samples_per_frame]),
+                                channels as u32,
                                 sample_rate,
-                            };
+                            );
                             if tx.send(samples).is_err() {
                                 break;
                             }
@@ -288,8 +308,8 @@ mod platform {
     use crossbeam_channel::Sender;
     use screencapturekit::{cm::AudioBufferList, prelude::*};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     };
 
     const MAX_AUDIO_FORMAT_ERRORS: usize = 12;
@@ -308,6 +328,7 @@ mod platform {
             config: AudioConfig,
             _device: Option<String>,
             tx: Sender<AudioSamples>,
+            source_seq: Arc<AtomicU64>,
         ) -> Result<(), String> {
             if self.stream.is_some() {
                 return Err("Audio capture already running".into());
@@ -347,6 +368,7 @@ mod platform {
                     sample_rate: config.sample_rate,
                     channels: config.channels,
                     format_errors: AtomicUsize::new(0),
+                    source_seq,
                 },
                 SCStreamOutputType::Audio,
             );
@@ -382,6 +404,7 @@ mod platform {
         sample_rate: u32,
         channels: u32,
         format_errors: AtomicUsize,
+        source_seq: Arc<AtomicU64>,
     }
 
     impl SCStreamOutputTrait for AudioOutputHandler {
@@ -415,11 +438,12 @@ mod platform {
                 let frame = pending.drain(..self.frame_samples).collect::<Vec<_>>();
                 if self
                     .tx
-                    .send(AudioSamples {
-                        data: frame,
-                        channels: self.channels,
-                        sample_rate: self.sample_rate,
-                    })
+                    .send(AudioSamples::from_capture(
+                        &self.source_seq,
+                        frame,
+                        self.channels,
+                        self.sample_rate,
+                    ))
                     .is_err()
                 {
                     break;
@@ -669,7 +693,7 @@ mod platform {
     use super::{AudioConfig, AudioSamples};
     use crossbeam_channel::Sender;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     };
     use std::thread;
@@ -713,6 +737,7 @@ mod platform {
             config: AudioConfig,
             _device: Option<String>,
             tx: Sender<AudioSamples>,
+            source_seq: Arc<AtomicU64>,
         ) -> Result<(), String> {
             if self.running.load(Ordering::SeqCst) {
                 return Err("Audio capture already running".into());
@@ -736,7 +761,8 @@ mod platform {
                                 config.sample_rate,
                                 config.total_samples_per_frame()
                             );
-                            if let Err(err) = run_session_loop(&mut session, &config, &tx, &running)
+                            if let Err(err) =
+                                run_session_loop(&mut session, &config, &tx, &source_seq, &running)
                             {
                                 eprintln!("[audio] WASAPI capture error: {err}");
                             }
@@ -792,6 +818,7 @@ mod platform {
         session: &mut WasapiLoopbackSession,
         config: &AudioConfig,
         tx: &Sender<AudioSamples>,
+        source_seq: &AtomicU64,
         running: &Arc<AtomicBool>,
     ) -> Result<(), String> {
         let frame_samples = config.total_samples_per_frame();
@@ -802,11 +829,12 @@ mod platform {
             while pending.len() >= frame_samples {
                 let frame = pending.drain(..frame_samples).collect::<Vec<_>>();
                 if tx
-                    .send(AudioSamples {
-                        data: frame,
-                        channels: config.channels,
-                        sample_rate: config.sample_rate,
-                    })
+                    .send(AudioSamples::from_capture(
+                        source_seq,
+                        frame,
+                        config.channels,
+                        config.sample_rate,
+                    ))
                     .is_err()
                 {
                     return Ok(());
@@ -994,3 +1022,19 @@ mod platform {
 }
 
 pub use platform::{detect_monitor_source, AudioCapture};
+
+#[cfg(test)]
+mod tests {
+    use super::AudioSamples;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn capture_assigns_monotonic_source_sequences() {
+        let next = AtomicU64::new(41);
+        let first = AudioSamples::from_capture(&next, vec![0.0], 1, 48_000);
+        let second = AudioSamples::from_capture(&next, vec![0.0], 1, 48_000);
+
+        assert_eq!(first.source_seq, 41);
+        assert_eq!(second.source_seq, 42);
+    }
+}
