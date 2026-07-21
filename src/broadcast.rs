@@ -129,15 +129,15 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
             state
                 .subscribers
                 .retain(|sub| match sub.tx.try_send(Arc::clone(&arc)) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) => match sub.drop_rx.try_recv() {
-                    Ok(_) | Err(TryRecvError::Empty) => !matches!(
-                        sub.tx.try_send(Arc::clone(&arc)),
-                        Err(TrySendError::Disconnected(_))
-                    ),
-                    Err(TryRecvError::Disconnected) => false,
-                },
-                Err(TrySendError::Disconnected(_)) => false,
+                    Ok(()) => true,
+                    Err(TrySendError::Full(_)) => match sub.drop_rx.try_recv() {
+                        Ok(_) | Err(TryRecvError::Empty) => !matches!(
+                            sub.tx.try_send(Arc::clone(&arc)),
+                            Err(TrySendError::Disconnected(_))
+                        ),
+                        Err(TryRecvError::Disconnected) => false,
+                    },
+                    Err(TrySendError::Disconnected(_)) => false,
                 });
             before > 0 && state.subscribers.is_empty() && state.reservations == 0
         };
@@ -166,22 +166,22 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
 
 impl<T: Send + Sync + 'static> SubscriptionReservation<T> {
     pub fn commit(mut self, capacity: usize) -> (u64, Receiver<Arc<T>>) {
-        let mut state = self.broadcaster.state.lock().unwrap();
-        debug_assert!(self.active && state.reservations > 0);
-        state.reservations -= 1;
-        let became_empty = state.subscribers.is_empty() && state.reservations == 0;
-        drop(state);
-        if became_empty {
-            self.broadcaster.notify_zero();
-        }
-        self.active = false;
         let id = self.broadcaster.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = bounded(capacity);
-        state.subscribers.push(Subscriber {
-            id,
-            tx,
-            drop_rx: rx.clone(),
-        });
+        {
+            // Convert the reservation into a subscriber atomically under the
+            // lock: occupancy goes reservation -> subscriber without ever
+            // dipping to zero, so no zero-occupancy notification is due here.
+            let mut state = self.broadcaster.state.lock().unwrap();
+            debug_assert!(self.active && state.reservations > 0);
+            state.reservations -= 1;
+            state.subscribers.push(Subscriber {
+                id,
+                tx,
+                drop_rx: rx.clone(),
+            });
+        }
+        self.active = false;
         self.broadcaster
             .keyframe_requested
             .store(true, Ordering::Release);
@@ -194,16 +194,27 @@ impl<T: Send + Sync + 'static> Drop for SubscriptionReservation<T> {
         if !self.active {
             return;
         }
-        let mut state = self.broadcaster.state.lock().unwrap();
-        debug_assert!(state.reservations > 0);
-        state.reservations -= 1;
+        let became_empty = {
+            let mut state = self.broadcaster.state.lock().unwrap();
+            debug_assert!(state.reservations > 0);
+            state.reservations -= 1;
+            state.subscribers.is_empty() && state.reservations == 0
+        };
+        // Abandoning the last reservation can leave the pipeline idle; fire the
+        // zero-occupancy callback so it stops, matching unsubscribe().
+        if became_empty {
+            self.broadcaster.notify_zero();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Broadcaster, MAX_SUBSCRIBERS};
-    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn full_subscriber_queue_keeps_newest_item() {

@@ -68,8 +68,8 @@ use st_protocol::{
     control::OutputInfo, ClientDisplayInfo, ClockSyncPong, ControlMessage, InputSession,
     SessionDebugInfo, StreamConfig, VideoChromaSampling, VideoCodec, VideoCodecSupport,
 };
-use std::net::SocketAddr;
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc, Condvar, Mutex, Weak,
@@ -930,6 +930,9 @@ fn build_session_debug(
 /// Commands sent from a per-client control handler into the shared pipeline
 /// thread. Capture is a single shared resource, so these affect every client.
 enum CaptureCommand {
+    /// Switch the shared capture to a different monitor/output. Global to every
+    /// client: stops+restarts capture pinned to the new output's CRTC.
+    SelectOutput(u32),
     /// Re-select the shared encoder against every active/tentative client. The
     /// response is sent only after the compatible encoder is active, or after
     /// the old stream has been left untouched on failure.
@@ -950,7 +953,10 @@ impl ProfileRequest {
     fn is_current(&self) -> bool {
         !self.cancelled.load(Ordering::Acquire)
             && self.revision_source.load(Ordering::Acquire) == self.registry_revision
-            && self.admission.as_ref().is_none_or(AdmissionStamp::is_current)
+            && self
+                .admission
+                .as_ref()
+                .is_none_or(AdmissionStamp::is_current)
     }
 
     fn reject(self, reason: impl Into<String>) {
@@ -968,7 +974,6 @@ struct StreamSnapshot {
 
 #[derive(Clone)]
 struct DebugSnapshot {
-    generation: u64,
     info: SessionDebugInfo,
 }
 
@@ -1094,25 +1099,8 @@ impl SharedCaptureState {
         self.active_video_epoch.load(Ordering::Acquire)
     }
 
-    fn active_video_epoch_handle(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.active_video_epoch)
-    }
-
     fn initialize_debug(&self, info: SessionDebugInfo) {
-        *self.debug.lock().unwrap() = Some(DebugSnapshot {
-            generation: 1,
-            info,
-        });
-    }
-
-    fn update_debug(&self, info: SessionDebugInfo) -> DebugSnapshot {
-        let mut debug = self.debug.lock().unwrap();
-        let generation = debug
-            .as_ref()
-            .map_or(1, |current| current.generation.wrapping_add(1));
-        let snapshot = DebugSnapshot { generation, info };
-        *debug = Some(snapshot.clone());
-        snapshot
+        *self.debug.lock().unwrap() = Some(DebugSnapshot { info });
     }
 
     fn debug_snapshot(&self) -> Option<DebugSnapshot> {
@@ -1172,6 +1160,7 @@ impl SharedPipeline {
         let abc = Arc::clone(&audio_bc);
         let cs = Arc::clone(&capture_state);
         let input_owner = Arc::clone(&state.input_pipeline_owner);
+        let thread_control = Arc::clone(&control);
 
         let handle = std::thread::spawn(move || {
             run_shared_pipeline(
@@ -1181,7 +1170,7 @@ impl SharedPipeline {
                 status_tx,
                 video_capabilities,
                 input,
-                control,
+                thread_control,
                 vbc,
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 abc,
@@ -1235,7 +1224,11 @@ impl SharedPipeline {
                         state: Arc::downgrade(state),
                         pipeline_instance_id: instance_id,
                         vid_sub_id,
-                        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "windows",
+                            target_os = "macos"
+                        ))]
                         aud_sub_id,
                     },
                 },
@@ -1474,8 +1467,7 @@ struct AdmissionPermit {
 
 impl AdmissionPermit {
     fn is_current(&self) -> bool {
-        !self.cancelled.load(Ordering::Acquire)
-            && self.coordinator.is_current(self.token)
+        !self.cancelled.load(Ordering::Acquire) && self.coordinator.is_current(self.token)
     }
 }
 
@@ -2063,10 +2055,7 @@ fn run_shared_pipeline(
                             current_config.to_stream_config(&audio_config),
                         );
                         video_bc.clear_queued();
-                        input.update_stream_dimensions(
-                            current_config.width,
-                            current_config.height,
-                        );
+                        input.update_stream_dimensions(current_config.width, current_config.height);
                         println!(
                             "[pipeline] output switch complete: {}x{}",
                             current_config.width, current_config.height
@@ -2286,10 +2275,7 @@ fn run_shared_pipeline(
                         current_config = new_config;
                         capture_state
                             .commit_encoder_config(current_config.to_stream_config(&audio_config));
-                        input.update_stream_dimensions(
-                            current_config.width,
-                            current_config.height,
-                        );
+                        input.update_stream_dimensions(current_config.width, current_config.height);
                         video_bc.clear_queued();
                     }
                     Err(e) => {
@@ -3202,14 +3188,6 @@ fn client_display_fps_hint(display: Option<ClientDisplayInfo>) -> Option<u32> {
     }
 }
 
-fn wait_for_previous_pipeline_stop(state: &ServerState) {
-    if let Some(handle) = state.pending_pipeline_stop.lock().unwrap().take() {
-        println!("[pipeline] Waiting for previous pipeline to finish stopping...");
-        let _ = handle.join();
-        println!("[pipeline] Previous pipeline stopped.");
-    }
-}
-
 fn request_video_profile(
     capture_state: &SharedCaptureState,
     capabilities: AggregateVideoCapabilities,
@@ -3420,22 +3398,6 @@ fn setup_client_pipeline(
     }
 }
 
-fn admit_client_pipeline(
-    state: &Arc<ServerState>,
-    capabilities: ClientVideoCapabilities,
-    cancelled: Arc<AtomicBool>,
-) -> Result<(PipelineSetup, VideoMembership), String> {
-    let admission = state.admission.acquire(Arc::clone(&cancelled))?;
-    let membership = begin_video_membership(state, capabilities);
-    let setup = setup_client_pipeline(
-        state,
-        membership.id,
-        Arc::clone(&cancelled),
-        &admission,
-    )?;
-    Ok((setup, membership))
-}
-
 fn reconcile_video_profile(state: &Arc<ServerState>) -> Result<(), String> {
     loop {
         let (capabilities, registry_revision) = {
@@ -3475,35 +3437,53 @@ fn reconcile_video_profile(state: &Arc<ServerState>) -> Result<(), String> {
     }
 }
 
-/// Unsubscribe from broadcasters and stop the pipeline (in a background thread)
-/// if no subscribers remain.
+/// Stop the shared pipeline if it still matches `pipeline_instance_id` and no
+/// subscribers or reservations remain. Invoked from the video broadcaster's
+/// zero-occupancy callback, so it must be reached with no broadcaster lock held.
+fn stop_pipeline_if_idle(state: &Arc<ServerState>, pipeline_instance_id: u64) {
+    let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
+    let mut pipeline = state.pipeline.lock().unwrap();
+    let is_idle = pipeline
+        .as_ref()
+        .filter(|p| p.instance_id == pipeline_instance_id)
+        .is_some_and(|p| p.video_bc.occupied_count() == 0);
+    if is_idle {
+        let pipeline = pipeline.take().expect("pipeline checked above");
+        println!("[pipeline] No viewers left, stopping shared pipeline...");
+        let stop_handle = std::thread::spawn(move || {
+            pipeline.stop();
+        });
+        state.pipeline_stop.register(stop_handle);
+    }
+}
+
+/// Unsubscribe from the shared broadcasters. The video broadcaster's
+/// zero-occupancy callback (`stop_pipeline_if_idle`) stops the pipeline once the
+/// last viewer leaves, so this only detaches. It must not hold the pipeline lock
+/// while unsubscribing video, or that callback would deadlock re-acquiring it.
 fn unsubscribe_and_maybe_stop_pipeline(
     state: &Arc<ServerState>,
     pipeline_instance_id: u64,
     vid_sub_id: u64,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))] aud_sub_id: u64,
 ) {
-    let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
-    let mut pipeline = state.pipeline.lock().unwrap();
-    let should_stop = if let Some(p) = pipeline
-        .as_ref()
-        .filter(|pipeline| pipeline.instance_id == pipeline_instance_id)
-    {
-        p.video_bc.unsubscribe(vid_sub_id);
+    let video_bc = {
+        let pipeline = state.pipeline.lock().unwrap();
+        let Some(p) = pipeline
+            .as_ref()
+            .filter(|p| p.instance_id == pipeline_instance_id)
+        else {
+            return;
+        };
+        // Audio has no zero-occupancy callback, so unsubscribing it under the
+        // pipeline lock cannot re-enter; do it here while we hold the reference.
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         p.audio_bc.unsubscribe(aud_sub_id);
-        p.video_bc.occupied_count() == 0
-    } else {
-        false
+        Arc::clone(&p.video_bc)
     };
-    if should_stop {
-        let pipeline = pipeline.take().expect("pipeline checked above");
-        println!("[pipeline] No viewers left, stopping shared pipeline...");
-        let stop_handle = std::thread::spawn(move || {
-            pipeline.stop();
-        });
-        *state.pending_pipeline_stop.lock().unwrap() = Some(stop_handle);
-    }
+    // Release the pipeline lock before unsubscribing video: its zero-occupancy
+    // callback re-acquires that lock to stop the pipeline.
+    video_bc.unsubscribe(vid_sub_id);
 }
 
 fn client_media_port(display: Option<ClientDisplayInfo>) -> u16 {
@@ -3822,7 +3802,10 @@ async fn handle_client(
         // a re-blanked display also wakes it, not only the first. Disable with
         // ST_WAKE_ON_CONNECT=0.
         trigger_screen_wake(&state2.control);
-        setup_client_pipeline(&state2, membership_id, setup_worker_cancelled)
+        let admission = state2
+            .admission
+            .acquire(Arc::clone(&setup_worker_cancelled))?;
+        setup_client_pipeline(&state2, membership_id, setup_worker_cancelled, &admission)
     });
     let setup = loop {
         tokio::select! {
@@ -3979,9 +3962,11 @@ async fn handle_client(
     let transport_running = Arc::new(AtomicBool::new(true));
 
     sub.video_bc.request_keyframe();
-    let vid_rx = sub.vid_rx;
+    let vid_rx = sub
+        .vid_rx
+        .expect("committed subscription missing video receiver");
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let aud_rx = Some(sub.aud_rx);
+    let aud_rx = sub.aud_rx;
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     let aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
@@ -4911,7 +4896,18 @@ fn handle_punched_client(
     let setup_worker_cancelled = Arc::clone(&setup_cancelled);
     let membership_id = video_membership.id;
     std::thread::spawn(move || {
-        let result = setup_client_pipeline(&setup_state, membership_id, setup_worker_cancelled);
+        let result = match setup_state
+            .admission
+            .acquire(Arc::clone(&setup_worker_cancelled))
+        {
+            Ok(admission) => setup_client_pipeline(
+                &setup_state,
+                membership_id,
+                setup_worker_cancelled,
+                &admission,
+            ),
+            Err(error) => Err(error),
+        };
         let _ = setup_tx.send(result);
     });
     let setup_deadline = Instant::now() + Duration::from_secs(35);
@@ -5011,9 +5007,11 @@ fn handle_punched_client(
     let audio_enabled = Arc::new(AtomicBool::new(true));
     let transport_running = Arc::new(AtomicBool::new(true));
     sub.video_bc.request_keyframe();
-    let vid_rx = sub.vid_rx;
+    let vid_rx = sub
+        .vid_rx
+        .expect("committed subscription missing video receiver");
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let aud_rx = Some(sub.aud_rx);
+    let aud_rx = sub.aud_rx;
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     let aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
@@ -5605,10 +5603,12 @@ fn build_server_state(
     Arc::new(ServerState {
         pipeline: Mutex::new(None),
         pipeline_starting: AtomicBool::new(false),
-        pending_pipeline_stop: Mutex::new(None),
+        pipeline_stop: Arc::new(PipelineStopCoordinator::default()),
+        admission: Arc::new(AdmissionCoordinator::default()),
         pipeline_lifecycle: Mutex::new(()),
         profile_revision: Arc::new(AtomicU64::new(0)),
         profile_commit: Arc::new(Mutex::new(())),
+        input_pipeline_owner: Arc::new(AtomicU64::new(0)),
         video_capabilities: Mutex::new(VideoCapabilityRegistry::default()),
         input,
         control,
@@ -5877,6 +5877,7 @@ mod video_transition_tests {
             revision_source: Arc::clone(&revision_source),
             commit_lock: Arc::new(Mutex::new(())),
             cancelled: Arc::clone(&cancelled),
+            admission: None,
             response,
         };
         assert!(request.is_current());
