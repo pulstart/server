@@ -538,6 +538,9 @@ pub struct EncodedVideoFrame {
     pub capture_micros: u64,
     pub source_seq: u64,
     pub is_recovery: bool,
+    /// Internal-only encoder/config epoch. It is not serialized on the wire;
+    /// per-client senders use it to discard queued output from a replaced encoder.
+    pub video_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -960,6 +963,7 @@ impl UdpSender {
             FrameTimingMeta {
                 capture_ts_micros: frame.capture_micros,
                 send_ts_micros: send_micros,
+                video_epoch: frame.video_epoch,
             },
             st_protocol::packet::frame_type::from_is_recovery(frame.is_recovery),
         );

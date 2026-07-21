@@ -467,6 +467,8 @@ struct InputRuntimeInner {
     capabilities: InputCapabilities,
     controller_id: Option<u32>,
     last_input_seq_by_client: BTreeMap<u32, u16>,
+    button_mask_by_client: BTreeMap<u32, u8>,
+    keyboard_state_by_client: BTreeMap<u32, [u8; KEYBOARD_STATE_BYTES]>,
     button_mask: u8,
     keyboard_state: [u8; KEYBOARD_STATE_BYTES],
     cursor_shape: Option<CursorShape>,
@@ -480,6 +482,8 @@ struct InputRuntimeInner {
 
 enum InputBackend {
     Unavailable,
+    #[cfg(test)]
+    Test(TestInputController),
     #[cfg(target_os = "linux")]
     X11(X11InputController),
     #[cfg(target_os = "linux")]
@@ -490,6 +494,68 @@ enum InputBackend {
     Windows(WindowsInputController),
     #[cfg(target_os = "macos")]
     Macos(MacosMouseController),
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TestInputEvent {
+    Button(u32, bool),
+    Absolute(u16, u16),
+    Relative(i16, i16),
+    Wheel(i16, i16),
+    Key(KeyboardKey, bool),
+    Text(String),
+}
+
+#[cfg(test)]
+struct TestInputController {
+    events: Arc<Mutex<Vec<TestInputEvent>>>,
+}
+
+#[cfg(test)]
+impl TestInputController {
+    fn button(&mut self, button: u32, pressed: bool) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(TestInputEvent::Button(button, pressed));
+    }
+
+    fn move_absolute(&mut self, x: u16, y: u16) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(TestInputEvent::Absolute(x, y));
+    }
+
+    fn move_relative(&mut self, dx: i16, dy: i16) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(TestInputEvent::Relative(dx, dy));
+    }
+
+    fn scroll(&mut self, delta_x: i16, delta_y: i16) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(TestInputEvent::Wheel(delta_x, delta_y));
+    }
+
+    fn key(&mut self, key: KeyboardKey, pressed: bool) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(TestInputEvent::Key(key, pressed));
+    }
+
+    fn text(&mut self, text: &str) -> bool {
+        self.events
+            .lock()
+            .unwrap()
+            .push(TestInputEvent::Text(text.to_string()));
+        true
+    }
 }
 
 #[derive(Default)]
@@ -510,6 +576,8 @@ impl InputRuntime {
                 capabilities: InputCapabilities::default(),
                 controller_id: None,
                 last_input_seq_by_client: BTreeMap::new(),
+                button_mask_by_client: BTreeMap::new(),
+                keyboard_state_by_client: BTreeMap::new(),
                 button_mask: 0,
                 keyboard_state: [0u8; KEYBOARD_STATE_BYTES],
                 cursor_shape: None,
@@ -533,7 +601,8 @@ impl InputRuntime {
         source_ip: std::net::IpAddr,
         media_dest: Arc<Mutex<SocketAddr>>,
     ) -> RegisteredInputClient {
-        self.active_clients.lock().unwrap().insert(
+        let mut active_clients = self.active_clients.lock().unwrap();
+        active_clients.insert(
             client_id,
             ActiveInputClient::Direct {
                 credential,
@@ -542,6 +611,10 @@ impl InputRuntime {
                 text_rate: TextInputRateLimiter::default(),
             },
         );
+        let mut inner = self.inner.lock().unwrap();
+        inner.register_client(client_id);
+        drop(inner);
+        drop(active_clients);
         RegisteredInputClient {
             runtime: Arc::clone(self),
             client_id,
@@ -553,13 +626,18 @@ impl InputRuntime {
         client_id: u32,
         credential: InputCredential,
     ) -> RegisteredInputClient {
-        self.active_clients.lock().unwrap().insert(
+        let mut active_clients = self.active_clients.lock().unwrap();
+        active_clients.insert(
             client_id,
             ActiveInputClient::Tunnel {
                 credential,
                 text_rate: TextInputRateLimiter::default(),
             },
         );
+        let mut inner = self.inner.lock().unwrap();
+        inner.register_client(client_id);
+        drop(inner);
+        drop(active_clients);
         RegisteredInputClient {
             runtime: Arc::clone(self),
             client_id,
@@ -573,8 +651,10 @@ impl InputRuntime {
         active_clients.remove(&client_id);
         let mut inner = self.inner.lock().unwrap();
         inner.last_input_seq_by_client.remove(&client_id);
+        inner.remove_client_keyboard(client_id);
+        inner.button_mask_by_client.remove(&client_id);
         if inner.controller_id == Some(client_id) {
-            inner.release_all_inputs();
+            inner.release_buttons();
             inner.controller_id = None;
             inner.warp.reset();
         }
@@ -593,13 +673,7 @@ impl InputRuntime {
     }
 
     pub fn controller_state_for(&self, client_id: u32) -> ControllerState {
-        let inner = self.inner.lock().unwrap();
-        match (&inner.backend, inner.controller_id) {
-            (&InputBackend::Unavailable, _) => ControllerState::Unavailable,
-            (_, Some(owner)) if owner == client_id => ControllerState::OwnedByYou,
-            (_, Some(_)) => ControllerState::OwnedByOther,
-            _ => ControllerState::Available,
-        }
+        self.inner.lock().unwrap().controller_state_for(client_id)
     }
 
     pub fn capabilities(&self) -> InputCapabilities {
@@ -629,11 +703,6 @@ impl InputRuntime {
         {
             return false;
         }
-        if inner.controller_id.is_some_and(|owner| owner != client_id) {
-            return false;
-        }
-        inner.activate_controller(client_id);
-        self.set_active_controller(Some(client_id));
         inner.inject_text(text)
     }
 
@@ -646,10 +715,13 @@ impl InputRuntime {
         if matches!(&inner.backend, InputBackend::Unavailable) {
             return ControllerState::Unavailable;
         }
-        inner.release_all_inputs();
-        inner.controller_id = Some(client_id);
-        inner.button_mask = 0;
-        inner.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
+        inner.activate_mouse_owner(client_id);
+        let buttons = inner
+            .button_mask_by_client
+            .get(&client_id)
+            .copied()
+            .unwrap_or(0);
+        inner.sync_buttons(buttons);
         self.set_active_controller(Some(client_id));
         ControllerState::OwnedByYou
     }
@@ -657,23 +729,12 @@ impl InputRuntime {
     pub fn release_control(&self, client_id: u32) -> ControllerState {
         let mut inner = self.inner.lock().unwrap();
         if inner.controller_id == Some(client_id) {
-            inner.release_all_inputs();
+            inner.release_buttons();
             inner.controller_id = None;
+            inner.warp.reset();
         }
         self.set_active_controller(inner.controller_id);
-        match &inner.backend {
-            InputBackend::Unavailable => ControllerState::Unavailable,
-            #[cfg(target_os = "linux")]
-            InputBackend::X11(_) => ControllerState::Available,
-            #[cfg(target_os = "linux")]
-            InputBackend::Uinput(_) => ControllerState::Available,
-            #[cfg(target_os = "linux")]
-            InputBackend::PortalRemoteDesktop(_) => ControllerState::Available,
-            #[cfg(target_os = "windows")]
-            InputBackend::Windows(_) => ControllerState::Available,
-            #[cfg(target_os = "macos")]
-            InputBackend::Macos(_) => ControllerState::Available,
-        }
+        inner.controller_state_for(client_id)
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -686,6 +747,8 @@ impl InputRuntime {
         inner.release_all_inputs();
         inner.controller_id = None;
         inner.last_input_seq_by_client.clear();
+        inner.button_mask_by_client.clear();
+        inner.keyboard_state_by_client.clear();
         inner.button_mask = 0;
         inner.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
         inner.cursor_shape = None;
@@ -779,6 +842,18 @@ impl InputRuntime {
         }
     }
 
+    /// Update stream-space mapping without resetting cooperative ownership or
+    /// releasing any pressed input state.
+    pub fn update_stream_dimensions(&self, width: u32, height: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.stream_width = width;
+        inner.stream_height = height;
+        #[cfg(target_os = "linux")]
+        if let InputBackend::PortalRemoteDesktop(session) = &inner.backend {
+            session.set_logical_size(width, height);
+        }
+    }
+
     pub fn clear_for_stop(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.release_all_inputs();
@@ -787,6 +862,8 @@ impl InputRuntime {
         inner.capabilities = InputCapabilities::default();
         inner.controller_id = None;
         inner.last_input_seq_by_client.clear();
+        inner.button_mask_by_client.clear();
+        inner.keyboard_state_by_client.clear();
         inner.button_mask = 0;
         inner.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
         inner.cursor_shape = None;
@@ -1194,53 +1271,13 @@ impl InputRuntime {
         if matches!(inner.backend, InputBackend::Unavailable) {
             return;
         }
-        // B5: implicit control grab — first client to send input takes control —
-        // but a stray/late/duplicate packet from a *non-owner* must not steal
-        // control from the active owner. Stealing would release the owner's held
-        // buttons/keys and hijack the session, so ignore non-owner input while
-        // someone else holds control (ownership frees on disconnect/idle-timeout).
-        if let Some(owner) = inner.controller_id {
-            if owner != client_id {
-                return;
-            }
-        } else if input_packet_is_neutral(&packet) {
-            // Bootstrap snapshots establish the return path but must not claim control.
-            return;
-        }
-        inner.activate_controller(client_id);
-        self.set_active_controller(Some(client_id));
-
         match packet {
-            InputPacket::MouseAbsolute(packet) => {
-                inner.sync_buttons(packet.buttons);
-                inner.move_absolute(packet.x, packet.y);
-                // Cursor position is no longer predicted from injected input.
-                // `CursorState` is sourced solely from the capture backend's
-                // real cursor metadata (PipeWire SPA_META_Cursor / XFixes), so
-                // there is a single source of truth and no feedback loop with
-                // the client's locally-drawn cursor.
-                let (sx, sy) = (
-                    i64::from(normalized_to_stream_coord(packet.x, inner.stream_width)),
-                    i64::from(normalized_to_stream_coord(packet.y, inner.stream_height)),
-                );
-                inner.warp.observe_command_absolute(sx, sy);
-            }
-            InputPacket::MouseRelative(packet) => {
-                inner.sync_buttons(packet.buttons);
-                inner.move_relative(packet.dx, packet.dy);
-                inner
-                    .warp
-                    .observe_command_relative(i64::from(packet.dx), i64::from(packet.dy));
-            }
-            InputPacket::MouseButtons(packet) => {
-                inner.sync_buttons(packet.buttons);
-            }
-            InputPacket::MouseWheel(packet) => {
-                inner.sync_buttons(packet.buttons);
-                inner.scroll(packet.delta_x, packet.delta_y);
-            }
             InputPacket::KeyboardState(packet) => {
-                inner.sync_keyboard(packet.pressed);
+                inner.set_client_keyboard(client_id, packet.pressed);
+            }
+            mouse_packet => {
+                inner.handle_mouse_packet(client_id, mouse_packet);
+                self.set_active_controller(inner.controller_id);
             }
         }
     }
@@ -1263,6 +1300,21 @@ fn input_packet_client_id(packet: &InputPacket) -> u32 {
 }
 
 impl InputRuntimeInner {
+    fn controller_state_for(&self, client_id: u32) -> ControllerState {
+        match (&self.backend, self.controller_id) {
+            (&InputBackend::Unavailable, _) => ControllerState::Unavailable,
+            (_, Some(owner)) if owner == client_id => ControllerState::OwnedByYou,
+            (_, Some(_)) => ControllerState::OwnedByOther,
+            _ => ControllerState::Available,
+        }
+    }
+
+    fn register_client(&mut self, client_id: u32) {
+        self.button_mask_by_client.insert(client_id, 0);
+        self.keyboard_state_by_client
+            .insert(client_id, [0u8; KEYBOARD_STATE_BYTES]);
+    }
+
     fn accept_input_seq(&mut self, client_id: u32, seq: u16) -> bool {
         if let Some(last_seq) = self.last_input_seq_by_client.get(&client_id).copied() {
             if !input_seq_is_newer(seq, last_seq) {
@@ -1274,14 +1326,102 @@ impl InputRuntimeInner {
         true
     }
 
-    fn activate_controller(&mut self, client_id: u32) {
+    fn activate_mouse_owner(&mut self, client_id: u32) {
         if self.controller_id == Some(client_id) {
             return;
         }
-        self.release_all_inputs();
+        self.release_buttons();
         self.controller_id = Some(client_id);
-        self.button_mask = 0;
-        self.keyboard_state = [0u8; KEYBOARD_STATE_BYTES];
+        self.warp.reset();
+    }
+
+    fn handle_mouse_packet(&mut self, client_id: u32, packet: InputPacket) {
+        let Some((buttons, meaningful)) = self.update_client_mouse_state(client_id, &packet) else {
+            return;
+        };
+        if self.controller_id != Some(client_id) {
+            if !meaningful {
+                return;
+            }
+            self.activate_mouse_owner(client_id);
+        }
+
+        self.sync_buttons(buttons);
+        match packet {
+            InputPacket::MouseAbsolute(packet) => {
+                self.move_absolute(packet.x, packet.y);
+                // Cursor position is no longer predicted from injected input.
+                // `CursorState` is sourced solely from the capture backend's
+                // real cursor metadata (PipeWire SPA_META_Cursor / XFixes), so
+                // there is a single source of truth and no feedback loop with
+                // the client's locally-drawn cursor.
+                let (sx, sy) = (
+                    i64::from(normalized_to_stream_coord(packet.x, self.stream_width)),
+                    i64::from(normalized_to_stream_coord(packet.y, self.stream_height)),
+                );
+                self.warp.observe_command_absolute(sx, sy);
+            }
+            InputPacket::MouseRelative(packet) => {
+                self.move_relative(packet.dx, packet.dy);
+                self.warp
+                    .observe_command_relative(i64::from(packet.dx), i64::from(packet.dy));
+            }
+            InputPacket::MouseButtons(_) => {}
+            InputPacket::MouseWheel(packet) => {
+                self.scroll(packet.delta_x, packet.delta_y);
+            }
+            InputPacket::KeyboardState(_) => unreachable!("keyboard packet handled separately"),
+        }
+    }
+
+    fn update_client_mouse_state(
+        &mut self,
+        client_id: u32,
+        packet: &InputPacket,
+    ) -> Option<(u8, bool)> {
+        let buttons = match packet {
+            InputPacket::MouseAbsolute(packet) => packet.buttons,
+            InputPacket::MouseRelative(packet) => packet.buttons,
+            InputPacket::MouseButtons(packet) => packet.buttons,
+            InputPacket::MouseWheel(packet) => packet.buttons,
+            InputPacket::KeyboardState(_) => return None,
+        };
+        let previous = self
+            .button_mask_by_client
+            .insert(client_id, buttons)
+            .unwrap_or(0);
+        let newly_pressed = buttons & !previous != 0;
+        let meaningful = match packet {
+            InputPacket::MouseAbsolute(_) => true,
+            InputPacket::MouseRelative(packet) => packet.dx != 0 || packet.dy != 0 || newly_pressed,
+            InputPacket::MouseButtons(_) => newly_pressed,
+            InputPacket::MouseWheel(packet) => {
+                packet.delta_x != 0 || packet.delta_y != 0 || newly_pressed
+            }
+            InputPacket::KeyboardState(_) => false,
+        };
+        Some((buttons, meaningful))
+    }
+
+    fn set_client_keyboard(&mut self, client_id: u32, next: [u8; KEYBOARD_STATE_BYTES]) {
+        self.keyboard_state_by_client.insert(client_id, next);
+        self.sync_aggregate_keyboard();
+    }
+
+    fn remove_client_keyboard(&mut self, client_id: u32) {
+        if self.keyboard_state_by_client.remove(&client_id).is_some() {
+            self.sync_aggregate_keyboard();
+        }
+    }
+
+    fn sync_aggregate_keyboard(&mut self) {
+        let mut aggregate = [0u8; KEYBOARD_STATE_BYTES];
+        for state in self.keyboard_state_by_client.values() {
+            for (aggregate_byte, state_byte) in aggregate.iter_mut().zip(state) {
+                *aggregate_byte |= *state_byte;
+            }
+        }
+        self.sync_keyboard(aggregate);
     }
 
     fn release_all_inputs(&mut self) {
@@ -1388,6 +1528,8 @@ impl InputRuntimeInner {
                 let pressed = next & bit != 0;
                 match &mut self.backend {
                     InputBackend::Unavailable => {}
+                    #[cfg(test)]
+                    InputBackend::Test(controller) => controller.button(button, pressed),
                     #[cfg(target_os = "linux")]
                     InputBackend::X11(controller) => controller.button(button, pressed),
                     #[cfg(target_os = "linux")]
@@ -1413,6 +1555,8 @@ impl InputRuntimeInner {
     fn move_absolute(&mut self, x: u16, y: u16) {
         match &mut self.backend {
             InputBackend::Unavailable => {}
+            #[cfg(test)]
+            InputBackend::Test(controller) => controller.move_absolute(x, y),
             #[cfg(target_os = "linux")]
             InputBackend::X11(controller) => controller.move_absolute(x, y),
             #[cfg(target_os = "linux")]
@@ -1433,6 +1577,8 @@ impl InputRuntimeInner {
     fn move_relative(&mut self, dx: i16, dy: i16) {
         match &mut self.backend {
             InputBackend::Unavailable => {}
+            #[cfg(test)]
+            InputBackend::Test(controller) => controller.move_relative(dx, dy),
             #[cfg(target_os = "linux")]
             InputBackend::X11(controller) => controller.move_relative(dx, dy),
             #[cfg(target_os = "linux")]
@@ -1453,6 +1599,8 @@ impl InputRuntimeInner {
     fn scroll(&mut self, delta_x: i16, delta_y: i16) {
         match &mut self.backend {
             InputBackend::Unavailable => {}
+            #[cfg(test)]
+            InputBackend::Test(controller) => controller.scroll(delta_x, delta_y),
             #[cfg(target_os = "linux")]
             InputBackend::X11(controller) => controller.scroll(delta_x, delta_y),
             #[cfg(target_os = "linux")]
@@ -1486,6 +1634,8 @@ impl InputRuntimeInner {
             self.inject_key(*key, false);
         }
         let injected = match &mut self.backend {
+            #[cfg(test)]
+            InputBackend::Test(controller) => controller.text(_text),
             #[cfg(target_os = "windows")]
             InputBackend::Windows(controller) => controller.text(_text),
             #[cfg(target_os = "macos")]
@@ -1501,6 +1651,8 @@ impl InputRuntimeInner {
     fn inject_key(&mut self, key: KeyboardKey, pressed: bool) {
         match &mut self.backend {
             InputBackend::Unavailable => {}
+            #[cfg(test)]
+            InputBackend::Test(controller) => controller.key(key, pressed),
             #[cfg(target_os = "linux")]
             InputBackend::X11(controller) => controller.key(key, pressed),
             #[cfg(target_os = "linux")]
@@ -1535,14 +1687,6 @@ const KEYBOARD_MODIFIERS: [KeyboardKey; 8] = [
 fn keyboard_state_contains(state: &[u8; KEYBOARD_STATE_BYTES], key: KeyboardKey) -> bool {
     let (byte, bit) = key.bit();
     state[byte] & bit != 0
-}
-
-fn input_packet_is_neutral(packet: &InputPacket) -> bool {
-    match packet {
-        InputPacket::MouseButtons(packet) => packet.buttons == 0,
-        InputPacket::KeyboardState(packet) => packet.pressed.iter().all(|byte| *byte == 0),
-        _ => false,
-    }
 }
 
 fn for_each_keyboard_transition(
@@ -3896,6 +4040,8 @@ mod tests {
             },
             controller_id: Some(1),
             last_input_seq_by_client: BTreeMap::new(),
+            button_mask_by_client: BTreeMap::new(),
+            keyboard_state_by_client: BTreeMap::new(),
             button_mask: 0,
             keyboard_state: [0u8; KEYBOARD_STATE_BYTES],
             cursor_shape: Some(CursorShape {
@@ -3919,6 +4065,40 @@ mod tests {
             stream_height: 1080,
             warp: WarpDetector::new(),
         }
+    }
+
+    fn keyboard_state(keys: &[KeyboardKey]) -> [u8; KEYBOARD_STATE_BYTES] {
+        let mut state = [0u8; KEYBOARD_STATE_BYTES];
+        for key in keys {
+            let (byte, bit) = key.bit();
+            state[byte] |= bit;
+        }
+        state
+    }
+
+    fn cooperative_runtime() -> (Arc<InputRuntime>, Arc<Mutex<Vec<TestInputEvent>>>) {
+        let runtime = InputRuntime::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut inner = runtime.inner.lock().unwrap();
+            inner.backend = InputBackend::Test(TestInputController {
+                events: Arc::clone(&events),
+            });
+            inner.capabilities = InputCapabilities {
+                mouse_absolute: true,
+                mouse_relative: true,
+                keyboard: true,
+                separate_cursor: true,
+                hover_capture: true,
+                cursor_position_reliable: true,
+                text_input: true,
+            };
+        }
+        (runtime, events)
+    }
+
+    fn send_tunnel(runtime: &InputRuntime, client_id: u32, seq: u16, packet: InputPacket) {
+        runtime.handle_tunnel_input_packet(seq, CREDENTIAL, packet, client_id);
     }
 
     #[test]
@@ -4052,49 +4232,316 @@ mod tests {
     }
 
     #[test]
-    fn registration_drop_releases_owned_input_and_controller_state() {
-        let runtime = InputRuntime::new();
-        let registration = runtime.register_tunnel_client(7, CREDENTIAL);
-        {
-            let mut inner = runtime.inner.lock().unwrap();
-            inner.controller_id = Some(7);
-            inner.button_mask = MOUSE_BUTTON_PRIMARY;
-            let (byte, bit) = KeyboardKey::A.bit();
-            inner.keyboard_state[byte] = bit;
-        }
-        runtime.set_active_controller(Some(7));
+    fn two_clients_merge_same_and_disjoint_keys_until_release_or_disconnect() {
+        let (runtime, _) = cooperative_runtime();
+        let client_one = runtime.register_tunnel_client(1, CREDENTIAL);
+        let client_two = runtime.register_tunnel_client(2, CREDENTIAL);
+        let a = keyboard_state(&[KeyboardKey::A]);
+        let a_and_b = keyboard_state(&[KeyboardKey::A, KeyboardKey::B]);
 
-        drop(registration);
+        send_tunnel(
+            &runtime,
+            1,
+            1,
+            InputPacket::KeyboardState(st_protocol::KeyboardStateInput {
+                client_id: 1,
+                pressed: a,
+            }),
+        );
+        send_tunnel(
+            &runtime,
+            2,
+            1,
+            InputPacket::KeyboardState(st_protocol::KeyboardStateInput {
+                client_id: 2,
+                pressed: a_and_b,
+            }),
+        );
+        send_tunnel(
+            &runtime,
+            1,
+            2,
+            InputPacket::KeyboardState(st_protocol::KeyboardStateInput {
+                client_id: 1,
+                pressed: [0; KEYBOARD_STATE_BYTES],
+            }),
+        );
+        assert_eq!(runtime.inner.lock().unwrap().keyboard_state, a_and_b);
 
-        let inner = runtime.inner.lock().unwrap();
-        assert_eq!(inner.controller_id, None);
-        assert_eq!(inner.button_mask, 0);
-        assert_eq!(inner.keyboard_state, [0; KEYBOARD_STATE_BYTES]);
-        assert_eq!(runtime.active_controller_id.load(Ordering::Relaxed), 0);
+        drop(client_two);
+        assert_eq!(
+            runtime.inner.lock().unwrap().keyboard_state,
+            [0; KEYBOARD_STATE_BYTES]
+        );
+        drop(client_one);
     }
 
     #[test]
-    fn neutral_packet_classification_excludes_motion() {
-        assert!(input_packet_is_neutral(&InputPacket::MouseButtons(
-            st_protocol::MouseButtonsInput {
+    fn disconnect_removes_only_departing_keyboard_contribution() {
+        let (runtime, _) = cooperative_runtime();
+        let client_one = runtime.register_tunnel_client(1, CREDENTIAL);
+        let _client_two = runtime.register_tunnel_client(2, CREDENTIAL);
+        send_tunnel(
+            &runtime,
+            1,
+            1,
+            InputPacket::KeyboardState(st_protocol::KeyboardStateInput {
+                client_id: 1,
+                pressed: keyboard_state(&[KeyboardKey::A]),
+            }),
+        );
+        send_tunnel(
+            &runtime,
+            2,
+            1,
+            InputPacket::KeyboardState(st_protocol::KeyboardStateInput {
+                client_id: 2,
+                pressed: keyboard_state(&[KeyboardKey::B]),
+            }),
+        );
+
+        drop(client_one);
+
+        assert_eq!(
+            runtime.inner.lock().unwrap().keyboard_state,
+            keyboard_state(&[KeyboardKey::B])
+        );
+    }
+
+    #[test]
+    fn mouse_handoff_releases_old_buttons_without_releasing_merged_keyboard() {
+        let (runtime, events) = cooperative_runtime();
+        let _client_one = runtime.register_tunnel_client(1, CREDENTIAL);
+        let _client_two = runtime.register_tunnel_client(2, CREDENTIAL);
+        for (client_id, key) in [(1, KeyboardKey::A), (2, KeyboardKey::B)] {
+            send_tunnel(
+                &runtime,
+                client_id,
+                1,
+                InputPacket::KeyboardState(st_protocol::KeyboardStateInput {
+                    client_id,
+                    pressed: keyboard_state(&[key]),
+                }),
+            );
+        }
+        send_tunnel(
+            &runtime,
+            1,
+            2,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: MOUSE_BUTTON_PRIMARY,
+            }),
+        );
+        let before_handoff = events.lock().unwrap().len();
+        send_tunnel(
+            &runtime,
+            2,
+            2,
+            InputPacket::MouseRelative(st_protocol::MouseRelativeInput {
+                client_id: 2,
+                dx: 4,
+                dy: -3,
+                buttons: MOUSE_BUTTON_SECONDARY,
+            }),
+        );
+
+        let inner = runtime.inner.lock().unwrap();
+        assert_eq!(inner.controller_id, Some(2));
+        assert_eq!(inner.button_mask, MOUSE_BUTTON_SECONDARY);
+        assert_eq!(
+            inner.keyboard_state,
+            keyboard_state(&[KeyboardKey::A, KeyboardKey::B])
+        );
+        drop(inner);
+        assert_eq!(
+            &events.lock().unwrap()[before_handoff..],
+            &[
+                TestInputEvent::Button(1, false),
+                TestInputEvent::Button(3, true),
+                TestInputEvent::Relative(4, -3),
+            ]
+        );
+    }
+
+    #[test]
+    fn neutral_heartbeat_and_stale_release_cannot_reclaim_mouse() {
+        let (runtime, _) = cooperative_runtime();
+        let _client_one = runtime.register_tunnel_client(1, CREDENTIAL);
+        let _client_two = runtime.register_tunnel_client(2, CREDENTIAL);
+        send_tunnel(
+            &runtime,
+            1,
+            1,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: MOUSE_BUTTON_PRIMARY,
+            }),
+        );
+        send_tunnel(
+            &runtime,
+            2,
+            1,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 2,
+                buttons: MOUSE_BUTTON_SECONDARY,
+            }),
+        );
+        send_tunnel(
+            &runtime,
+            1,
+            2,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
                 client_id: 1,
                 buttons: 0,
-            },
-        )));
-        assert!(input_packet_is_neutral(&InputPacket::KeyboardState(
-            st_protocol::KeyboardStateInput {
+            }),
+        );
+        send_tunnel(
+            &runtime,
+            1,
+            3,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
                 client_id: 1,
-                pressed: [0; KEYBOARD_STATE_BYTES],
-            },
-        )));
-        assert!(!input_packet_is_neutral(&InputPacket::MouseRelative(
-            st_protocol::MouseRelativeInput {
+                buttons: 0,
+            }),
+        );
+
+        let inner = runtime.inner.lock().unwrap();
+        assert_eq!(inner.controller_id, Some(2));
+        assert_eq!(inner.button_mask, MOUSE_BUTTON_SECONDARY);
+    }
+
+    #[test]
+    fn real_mouse_activity_and_new_press_each_reclaim_mouse() {
+        let (runtime, _) = cooperative_runtime();
+        let _client_one = runtime.register_tunnel_client(1, CREDENTIAL);
+        let _client_two = runtime.register_tunnel_client(2, CREDENTIAL);
+        send_tunnel(
+            &runtime,
+            1,
+            1,
+            InputPacket::MouseAbsolute(st_protocol::MouseAbsoluteInput {
                 client_id: 1,
+                x: 10,
+                y: 20,
+                buttons: 0,
+            }),
+        );
+        assert_eq!(runtime.inner.lock().unwrap().controller_id, Some(1));
+        send_tunnel(
+            &runtime,
+            2,
+            1,
+            InputPacket::MouseRelative(st_protocol::MouseRelativeInput {
+                client_id: 2,
                 dx: 1,
                 dy: 0,
                 buttons: 0,
-            },
-        )));
+            }),
+        );
+        assert_eq!(runtime.inner.lock().unwrap().controller_id, Some(2));
+        send_tunnel(
+            &runtime,
+            1,
+            2,
+            InputPacket::MouseWheel(st_protocol::MouseWheelInput {
+                client_id: 1,
+                delta_x: 0,
+                delta_y: 1,
+                buttons: 0,
+            }),
+        );
+        assert_eq!(runtime.inner.lock().unwrap().controller_id, Some(1));
+        send_tunnel(
+            &runtime,
+            2,
+            2,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 2,
+                buttons: MOUSE_BUTTON_PRIMARY,
+            }),
+        );
+        assert_eq!(runtime.inner.lock().unwrap().controller_id, Some(2));
+    }
+
+    #[test]
+    fn non_owner_text_input_preserves_mouse_owner_and_merged_modifiers() {
+        let (runtime, events) = cooperative_runtime();
+        let _client_one = runtime.register_tunnel_client(1, CREDENTIAL);
+        let _client_two = runtime.register_tunnel_client(2, CREDENTIAL);
+        send_tunnel(
+            &runtime,
+            1,
+            1,
+            InputPacket::MouseAbsolute(st_protocol::MouseAbsoluteInput {
+                client_id: 1,
+                x: 10,
+                y: 20,
+                buttons: 0,
+            }),
+        );
+        send_tunnel(
+            &runtime,
+            2,
+            1,
+            InputPacket::KeyboardState(st_protocol::KeyboardStateInput {
+                client_id: 2,
+                pressed: keyboard_state(&[KeyboardKey::LeftShift]),
+            }),
+        );
+        events.lock().unwrap().clear();
+
+        assert!(runtime.handle_text_input(2, "hello"));
+
+        assert_eq!(runtime.inner.lock().unwrap().controller_id, Some(1));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                TestInputEvent::Key(KeyboardKey::LeftShift, false),
+                TestInputEvent::Text("hello".to_string()),
+                TestInputEvent::Key(KeyboardKey::LeftShift, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn advisory_acquire_and_release_change_only_mouse_ownership() {
+        let (runtime, _) = cooperative_runtime();
+        let _client_one = runtime.register_tunnel_client(1, CREDENTIAL);
+        let _client_two = runtime.register_tunnel_client(2, CREDENTIAL);
+        send_tunnel(
+            &runtime,
+            1,
+            1,
+            InputPacket::KeyboardState(st_protocol::KeyboardStateInput {
+                client_id: 1,
+                pressed: keyboard_state(&[KeyboardKey::A]),
+            }),
+        );
+        send_tunnel(
+            &runtime,
+            1,
+            2,
+            InputPacket::MouseButtons(st_protocol::MouseButtonsInput {
+                client_id: 1,
+                buttons: MOUSE_BUTTON_PRIMARY,
+            }),
+        );
+
+        assert_eq!(runtime.release_control(2), ControllerState::OwnedByOther);
+        assert_eq!(runtime.inner.lock().unwrap().controller_id, Some(1));
+        assert_eq!(runtime.acquire_control(2), ControllerState::OwnedByYou);
+        {
+            let inner = runtime.inner.lock().unwrap();
+            assert_eq!(inner.controller_id, Some(2));
+            assert_eq!(inner.button_mask, 0);
+            assert_eq!(inner.keyboard_state, keyboard_state(&[KeyboardKey::A]));
+        }
+        assert_eq!(runtime.release_control(2), ControllerState::Available);
+        let inner = runtime.inner.lock().unwrap();
+        assert_eq!(inner.controller_id, None);
+        assert_eq!(inner.button_mask, 0);
+        assert_eq!(inner.keyboard_state, keyboard_state(&[KeyboardKey::A]));
     }
 
     #[test]

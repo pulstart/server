@@ -42,6 +42,7 @@ mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod tray;
 mod updater;
+mod video_profile;
 
 // Real-bitstream RS-FEC loss-injection integration test (encode → slice → drop
 // → reconstruct → decode). Test-only; see recovery_loopback.rs.
@@ -54,12 +55,13 @@ mod recovery_loopback;
 mod intra_refresh_loopback;
 
 use adaptive_bitrate::{AdaptiveBitrateState, ClientRateController};
-use broadcast::Broadcaster;
+use broadcast::{Broadcaster, SubscriptionReservation};
 use capture::{CaptureBackend, PlatformCapture};
 use encode_config::EncoderConfig;
 use input::{CursorVersionCursor, InputRuntime};
 use server_control::ServerControl;
 use transport::{EncodedAudioPacket, EncodedVideoFrame, UdpSender};
+use video_profile::{AggregateVideoCapabilities, ClientVideoCapabilities, VideoCapabilityRegistry};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use st_protocol::{
@@ -67,9 +69,10 @@ use st_protocol::{
     SessionDebugInfo, StreamConfig, VideoChromaSampling, VideoCodec, VideoCodecSupport,
 };
 use std::net::SocketAddr;
+use std::collections::BTreeSet;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex, Weak,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -98,6 +101,7 @@ const CAPTURE_QUEUE_CAPACITY: usize = 4;
 const MAX_VIDEO_SEND_BURST: usize = 16;
 static TRACE_ENCODE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ENCODED_VIDEO_UNIT_SEQ: AtomicU64 = AtomicU64::new(0);
+static NEXT_PIPELINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -127,7 +131,7 @@ enum EncoderKind {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EncoderBackend {
     #[cfg(target_os = "linux")]
     Vaapi,
@@ -172,6 +176,56 @@ fn create_linux_encoder_with_hint(
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn single_codec_support(codec: VideoCodec) -> VideoCodecSupport {
+    let mut support = VideoCodecSupport::empty();
+    support.insert(codec);
+    support
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_encoder_for_aggregate(
+    base: &EncoderConfig,
+    capabilities: AggregateVideoCapabilities,
+    control: &ServerControl,
+    capture_render_node: Option<&str>,
+) -> Result<(EncoderConfig, EncoderKind), String> {
+    let codec_order = if let Some(codec) = control.forced_codec() {
+        encode_config::Codec::preferred_order(Some(codec))
+    } else {
+        EncoderConfig::preferred_codec_order_from_env()
+    };
+    let codec_order = codec_order.map(encode_config::Codec::to_stream_codec);
+    let mut codec_candidates = Vec::new();
+    if control.forced_codec().is_none() {
+        codec_candidates.extend(
+            codec_order
+                .iter()
+                .copied()
+                .filter(|codec| capabilities.hardware_codecs.supports(*codec)),
+        );
+    }
+    for codec in codec_order {
+        if capabilities.supported_codecs.supports(codec) && !codec_candidates.contains(&codec) {
+            codec_candidates.push(codec);
+        }
+    }
+    let mut failures = Vec::new();
+    for codec in codec_candidates {
+        let mut candidate_capabilities = capabilities;
+        candidate_capabilities.supported_codecs = single_codec_support(codec);
+        let config = aggregate_encoder_config(base, candidate_capabilities, control)?;
+        match create_linux_encoder_with_hint(&config, capture_render_node) {
+            Ok(encoder) => return Ok((config, encoder)),
+            Err(error) => failures.push(format!("{}: {error}", codec_name(codec))),
+        }
+    }
+    Err(format!(
+        "No mutually supported video codec could start.\n  {}",
+        failures.join("\n  ")
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -274,10 +328,14 @@ fn client_hdr_display(display: Option<ClientDisplayInfo>) -> bool {
     display.map(|info| info.hdr_display).unwrap_or(false)
 }
 
-fn stream_chroma_name(chroma: VideoChromaSampling) -> &'static str {
-    match chroma {
-        VideoChromaSampling::Yuv420 => "yuv420",
-        VideoChromaSampling::Yuv444 => "yuv444",
+fn client_video_capabilities(display: Option<ClientDisplayInfo>) -> ClientVideoCapabilities {
+    ClientVideoCapabilities {
+        supported_codecs: client_supported_video_codecs(display),
+        hardware_codecs: client_hardware_video_codecs(display),
+        supported_yuv444_codecs: client_supported_yuv444_video_codecs(display),
+        hardware_yuv444_codecs: client_hardware_yuv444_video_codecs(display),
+        hdr_display: client_hdr_display(display),
+        requested_fps: client_display_fps_hint(display),
     }
 }
 
@@ -294,6 +352,81 @@ fn supports_yuv444_codec(codec: encode_config::Codec) -> bool {
         codec,
         encode_config::Codec::H264 | encode_config::Codec::Hevc
     )
+}
+
+fn stream_codec_to_encoder(codec: VideoCodec) -> encode_config::Codec {
+    match codec {
+        VideoCodec::H264 => encode_config::Codec::H264,
+        VideoCodec::Hevc => encode_config::Codec::Hevc,
+        VideoCodec::Av1 => encode_config::Codec::Av1,
+    }
+}
+
+fn aggregate_encoder_config(
+    current: &EncoderConfig,
+    capabilities: AggregateVideoCapabilities,
+    control: &ServerControl,
+) -> Result<EncoderConfig, String> {
+    let codec_order = if let Some(codec) = control.forced_codec() {
+        encode_config::Codec::preferred_order(Some(codec))
+    } else {
+        EncoderConfig::preferred_codec_order_from_env()
+    };
+    let codec_order = codec_order.map(encode_config::Codec::to_stream_codec);
+    let codec = if control.forced_codec().is_some() {
+        capabilities.preferred_codec(codec_order)
+    } else {
+        capabilities.preferred_codec_hardware_first(codec_order)
+    }
+    .ok_or_else(|| "No video codec is supported by every connected client".to_string())?;
+    let mut config = EncoderConfig::from_env_with_framerate_and_codec(
+        current.width,
+        current.height,
+        EncoderConfig::resolve_target_fps(capabilities.requested_fps),
+        stream_codec_to_encoder(codec),
+    );
+    config.bitrate_kbps = current.bitrate_kbps;
+    config.min_bitrate_kbps = current.min_bitrate_kbps;
+    config.max_bitrate_kbps = current.max_bitrate_kbps;
+    config.quality = control.forced_quality().unwrap_or(current.quality);
+    if !capabilities.hdr_display {
+        config.dynamic_range = encode_config::DynamicRange::Sdr;
+    }
+    config.chroma = match EncoderConfig::preferred_chroma_from_env() {
+        Some(encode_config::ChromaSampling::Yuv444)
+            if capabilities.supported_yuv444_codecs.supports(codec)
+                && supports_yuv444_codec(config.codec)
+                && !config.is_hdr() =>
+        {
+            encode_config::ChromaSampling::Yuv444
+        }
+        Some(encode_config::ChromaSampling::Yuv444) => {
+            return Err(format!(
+                "Requested yuv444 profile is not supported by every client for {}",
+                codec_name(codec)
+            ));
+        }
+        Some(encode_config::ChromaSampling::Yuv420) => encode_config::ChromaSampling::Yuv420,
+        None if capabilities.hardware_codecs.supports(codec)
+            && !capabilities.hardware_yuv444_codecs.supports(codec) =>
+        {
+            encode_config::ChromaSampling::Yuv420
+        }
+        None => match capabilities.preferred_chroma(codec, config.is_hdr()) {
+            VideoChromaSampling::Yuv420 => encode_config::ChromaSampling::Yuv420,
+            VideoChromaSampling::Yuv444 => encode_config::ChromaSampling::Yuv444,
+        },
+    };
+    Ok(config)
+}
+
+fn encoder_profiles_equal(left: &EncoderConfig, right: &EncoderConfig) -> bool {
+    left.width == right.width
+        && left.height == right.height
+        && left.framerate == right.framerate
+        && left.codec == right.codec
+        && left.dynamic_range == right.dynamic_range
+        && left.chroma == right.chroma
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -341,93 +474,16 @@ fn encoder_backend_name(backend: EncoderBackend) -> &'static str {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn codec_selection_score(
-    codec: encode_config::Codec,
-    chroma: encode_config::ChromaSampling,
-    backend: EncoderBackend,
-    client_hardware_codecs: VideoCodecSupport,
-) -> (u8, u8, u8, u8) {
-    let hardware_yuv444_rank = u8::from(
-        chroma == encode_config::ChromaSampling::Yuv444
-            && matches!(backend, EncoderBackend::Vaapi | EncoderBackend::Nvenc),
-    );
-    let backend_rank = match backend {
-        EncoderBackend::Vaapi | EncoderBackend::Nvenc => 1,
-        EncoderBackend::Software => 0,
-    };
-    let client_hw_rank = u8::from(client_hardware_codecs.supports(codec.to_stream_codec()));
-    let codec_rank = match codec {
-        encode_config::Codec::H264 => 0,
-        encode_config::Codec::Hevc => 1,
-        encode_config::Codec::Av1 => 2,
-    };
-    (
-        hardware_yuv444_rank,
-        backend_rank,
-        client_hw_rank,
-        codec_rank,
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn linux_chroma_candidates(
-    codec: encode_config::Codec,
-    base_config: &EncoderConfig,
-    client_supported_yuv444_codecs: VideoCodecSupport,
-    client_hardware_yuv444_codecs: VideoCodecSupport,
-) -> Vec<encode_config::ChromaSampling> {
-    if let Some(chroma) = EncoderConfig::preferred_chroma_from_env() {
-        return vec![chroma];
-    }
-
-    if !base_config.is_hdr()
-        && supports_yuv444_codec(codec)
-        && client_supported_yuv444_codecs.supports(codec.to_stream_codec())
-        && client_hardware_yuv444_codecs.supports(codec.to_stream_codec())
-    {
-        vec![
-            encode_config::ChromaSampling::Yuv444,
-            encode_config::ChromaSampling::Yuv420,
-        ]
-    } else {
-        vec![encode_config::ChromaSampling::Yuv420]
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn log_selected_linux_encoder(
-    config: &EncoderConfig,
-    backend: EncoderBackend,
-    client_hardware_codecs: VideoCodecSupport,
-) {
-    println!(
-        "[encoder] Selected {} {} with {} backend (client hw decode: {})",
-        codec_name(config.stream_codec()),
-        encoder_chroma_name(config.chroma),
-        encoder_backend_name(backend),
-        if client_hardware_codecs.supports(config.stream_codec()) {
-            "yes"
-        } else {
-            "no"
-        }
-    );
-}
-
 /// Result of the pipeline start/subscribe handshake: the client subscription,
 /// negotiated stream config, shared bitrate state, debug info, and the shared
 /// capture handle.
 type PipelineSetup = (
     ClientSubscription,
-    StreamConfig,
+    StreamSnapshot,
     Arc<AdaptiveBitrateState>,
     SessionDebugInfo,
     Arc<SharedCaptureState>,
 );
-
-/// A candidate encoder selection: (config, opened encoder, backend, pixel-format quad).
-#[cfg(target_os = "linux")]
-type LinuxEncoderChoice = (EncoderConfig, EncoderKind, EncoderBackend, (u8, u8, u8, u8));
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
@@ -443,120 +499,30 @@ fn select_linux_encoder(
     control: &ServerControl,
     capture_render_node: Option<&str>,
 ) -> Result<(EncoderConfig, EncoderKind), String> {
-    let forced_codec = control.forced_codec();
-    let forced_quality = control.forced_quality();
-    let prefer_first_success =
-        forced_codec.is_some() || EncoderConfig::preferred_codec_from_env().is_some();
-    let mut failures = Vec::new();
-    let mut selected: Option<LinuxEncoderChoice> = None;
-
-    let codec_order = if let Some(codec) = forced_codec {
-        encode_config::Codec::preferred_order(Some(codec))
-    } else {
-        EncoderConfig::preferred_codec_order_from_env()
+    let seed = EncoderConfig::from_env_with_framerate_and_codec(
+        width,
+        height,
+        framerate,
+        encode_config::Codec::H264,
+    );
+    let capabilities = AggregateVideoCapabilities {
+        supported_codecs: client_supported_codecs,
+        hardware_codecs: client_hardware_codecs,
+        supported_yuv444_codecs: client_supported_yuv444_codecs,
+        hardware_yuv444_codecs: client_hardware_yuv444_codecs,
+        hdr_display: client_hdr_display,
+        requested_fps: Some(framerate),
     };
-    for codec in codec_order {
-        if !client_supported_codecs.supports(codec.to_stream_codec()) {
-            failures.push(format!(
-                "{} skipped: client does not support it",
-                codec_name(codec.to_stream_codec())
-            ));
-            continue;
-        }
-
-        let mut base_config =
-            EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
-        if let Some(quality) = forced_quality {
-            base_config.quality = quality;
-        }
-        // D2: HDR is AND-gated on (server ST_HDR) AND (client display is HDR).
-        // A non-HDR client streamed BT.2020+PQ sees washed-out color with no
-        // local tone-map, so fall back to SDR when the client can't present HDR.
-        if base_config.is_hdr() && !client_hdr_display {
-            eprintln!(
-                "[encoder] HDR requested but client display is SDR; encoding SDR ({})",
-                codec_name(codec.to_stream_codec())
-            );
-            base_config.dynamic_range = encode_config::DynamicRange::Sdr;
-        }
-
-        let mut best_for_codec: Option<LinuxEncoderChoice> = None;
-
-        for chroma in linux_chroma_candidates(
-            codec,
-            &base_config,
-            client_supported_yuv444_codecs,
-            client_hardware_yuv444_codecs,
-        ) {
-            if chroma == encode_config::ChromaSampling::Yuv444 {
-                if !supports_yuv444_codec(codec) {
-                    failures.push(format!(
-                        "{} yuv444 skipped: codec profile is not implemented",
-                        codec_name(codec.to_stream_codec())
-                    ));
-                    continue;
-                }
-                if !client_supported_yuv444_codecs.supports(codec.to_stream_codec()) {
-                    failures.push(format!(
-                        "{} yuv444 skipped: client does not support it",
-                        codec_name(codec.to_stream_codec())
-                    ));
-                    continue;
-                }
-            }
-
-            let config = base_config.with_chroma_sampling(chroma);
-            match create_linux_encoder_with_hint(&config, capture_render_node) {
-                Ok(encoder) => {
-                    let backend = encoder_backend(&encoder);
-                    let score = codec_selection_score(
-                        codec,
-                        config.chroma,
-                        backend,
-                        client_hardware_codecs,
-                    );
-                    let replace = best_for_codec
-                        .as_ref()
-                        .map(|(_, _, _, best_score)| score > *best_score)
-                        .unwrap_or(true);
-                    if replace {
-                        best_for_codec = Some((config, encoder, backend, score));
-                    }
-                }
-                Err(err) => failures.push(format!(
-                    "{} {} failed: {err}",
-                    codec_name(codec.to_stream_codec()),
-                    encoder_chroma_name(chroma)
-                )),
-            }
-        }
-
-        if let Some(candidate) = best_for_codec {
-            if prefer_first_success {
-                let (config, encoder, backend, _) = candidate;
-                log_selected_linux_encoder(&config, backend, client_hardware_codecs);
-                return Ok((config, encoder));
-            }
-
-            let replace = selected
-                .as_ref()
-                .map(|(_, _, _, best_score)| candidate.3 > *best_score)
-                .unwrap_or(true);
-            if replace {
-                selected = Some(candidate);
-            }
-        }
-    }
-
-    if let Some((config, encoder, backend, _)) = selected {
-        log_selected_linux_encoder(&config, backend, client_hardware_codecs);
-        Ok((config, encoder))
-    } else {
-        Err(format!(
-            "No mutually supported video codec could start.\n  {}",
-            failures.join("\n  ")
-        ))
-    }
+    let (config, encoder) =
+        open_linux_encoder_for_aggregate(&seed, capabilities, control, capture_render_node)?;
+    let backend = encoder_backend(&encoder);
+    println!(
+        "[encoder] Selected {} {} with {} backend",
+        codec_name(config.stream_codec()),
+        encoder_chroma_name(config.chroma),
+        encoder_backend_name(backend),
+    );
+    Ok((config, encoder))
 }
 
 #[cfg(target_os = "windows")]
@@ -565,6 +531,7 @@ fn select_windows_encoder(
     framerate: u32,
     client_supported_codecs: VideoCodecSupport,
     client_supported_yuv444_codecs: VideoCodecSupport,
+    client_hdr_display: bool,
     control: &ServerControl,
 ) -> Result<(EncoderConfig, EncoderKind), String> {
     let width = first_frame.width;
@@ -614,6 +581,9 @@ fn select_windows_encoder(
             EncoderConfig::from_env_with_framerate_and_codec(width, height, framerate, codec);
         if let Some(quality) = forced_quality {
             config.quality = quality;
+        }
+        if config.is_hdr() && !client_hdr_display {
+            config.dynamic_range = encode_config::DynamicRange::Sdr;
         }
         if config.is_yuv444() {
             if !supports_yuv444_codec(codec)
@@ -932,6 +902,26 @@ fn encoder_name(_encoder: &encode_vt::VTEncoder) -> &'static str {
     "videotoolbox"
 }
 
+fn build_session_debug(
+    #[cfg(any(target_os = "linux", target_os = "windows"))] encoder: &EncoderKind,
+    #[cfg(target_os = "macos")] encoder: &encode_vt::VTEncoder,
+    config: &EncoderConfig,
+    capture_backend: &str,
+    input: &InputRuntime,
+) -> SessionDebugInfo {
+    SessionDebugInfo {
+        encoder_name: format!(
+            "{}-{}",
+            encoder_name(encoder),
+            encoder_chroma_name(config.chroma)
+        ),
+        capture_backend: capture_backend.to_string(),
+        input_backend: input.backend_label(),
+        target_bitrate_kbps: config.bitrate_kbps,
+        quality_preset: config.quality.label().to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared pipeline: one capture + one encoder + one audio pipeline,
 // broadcasting encoded data to all connected clients.
@@ -940,8 +930,46 @@ fn encoder_name(_encoder: &encode_vt::VTEncoder) -> &'static str {
 /// Commands sent from a per-client control handler into the shared pipeline
 /// thread. Capture is a single shared resource, so these affect every client.
 enum CaptureCommand {
-    /// Switch the captured monitor by `OutputInfo::id`.
-    SelectOutput(u32),
+    /// Re-select the shared encoder against every active/tentative client. The
+    /// response is sent only after the compatible encoder is active, or after
+    /// the old stream has been left untouched on failure.
+    SetVideoCapabilities(ProfileRequest),
+}
+
+struct ProfileRequest {
+    capabilities: AggregateVideoCapabilities,
+    registry_revision: u64,
+    revision_source: Arc<AtomicU64>,
+    commit_lock: Arc<Mutex<()>>,
+    cancelled: Arc<AtomicBool>,
+    admission: Option<AdmissionStamp>,
+    response: Sender<Result<StreamSnapshot, String>>,
+}
+
+impl ProfileRequest {
+    fn is_current(&self) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+            && self.revision_source.load(Ordering::Acquire) == self.registry_revision
+            && self.admission.as_ref().is_none_or(AdmissionStamp::is_current)
+    }
+
+    fn reject(self, reason: impl Into<String>) {
+        let _ = self.response.send(Err(reason.into()));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamSnapshot {
+    config: StreamConfig,
+    generation: u64,
+    video_epoch: u64,
+    selection_generation: u64,
+}
+
+#[derive(Clone)]
+struct DebugSnapshot {
+    generation: u64,
+    info: SessionDebugInfo,
 }
 
 /// State shared between the pipeline thread (producer) and per-client control
@@ -952,10 +980,13 @@ struct SharedCaptureState {
     available_outputs: Mutex<Vec<OutputInfo>>,
     /// Currently captured output id (0 = unknown / primary).
     selected_output: AtomicU32,
-    /// Stream config after the most recent output switch; `None` until one
-    /// occurs. Paired with `config_generation` so each client re-syncs once.
-    updated_config: Mutex<Option<StreamConfig>>,
-    config_generation: AtomicU64,
+    requested_output: AtomicU32,
+    requested_output_generation: AtomicU64,
+    /// Canonical stream configuration. Keeping config and generation under one
+    /// lock makes startup snapshots atomic with concurrent profile changes.
+    stream: Mutex<Option<StreamSnapshot>>,
+    active_video_epoch: Arc<AtomicU64>,
+    debug: Mutex<Option<DebugSnapshot>>,
 }
 
 impl SharedCaptureState {
@@ -964,8 +995,11 @@ impl SharedCaptureState {
             cmd_tx,
             available_outputs: Mutex::new(Vec::new()),
             selected_output: AtomicU32::new(0),
-            updated_config: Mutex::new(None),
-            config_generation: AtomicU64::new(0),
+            requested_output: AtomicU32::new(0),
+            requested_output_generation: AtomicU64::new(0),
+            stream: Mutex::new(None),
+            active_video_epoch: Arc::new(AtomicU64::new(0)),
+            debug: Mutex::new(None),
         }
     }
 
@@ -977,27 +1011,120 @@ impl SharedCaptureState {
         self.selected_output.load(Ordering::SeqCst)
     }
 
-    fn generation(&self) -> u64 {
-        self.config_generation.load(Ordering::SeqCst)
+    fn request_output(&self, id: u32) {
+        self.requested_output.store(id, Ordering::Release);
+        self.requested_output_generation
+            .fetch_add(1, Ordering::AcqRel);
     }
 
-    fn updated_config(&self) -> Option<StreamConfig> {
-        *self.updated_config.lock().unwrap()
+    fn pending_output(&self, observed_generation: u64) -> Option<(u64, u32)> {
+        let generation = self.requested_output_generation.load(Ordering::Acquire);
+        (generation != observed_generation)
+            .then(|| (generation, self.requested_output.load(Ordering::Acquire)))
     }
 
-    /// Record a post-switch stream config and bump the generation so connected
-    /// clients push the new `StreamConfig` to their viewers exactly once.
-    fn publish_config(&self, config: StreamConfig) {
-        *self.updated_config.lock().unwrap() = Some(config);
-        self.config_generation.fetch_add(1, Ordering::SeqCst);
+    fn initialize_config(&self, mut config: StreamConfig) -> StreamSnapshot {
+        config.video_epoch = 1;
+        let snapshot = StreamSnapshot {
+            config,
+            generation: 1,
+            video_epoch: 1,
+            selection_generation: 1,
+        };
+        *self.stream.lock().unwrap() = Some(snapshot);
+        self.active_video_epoch
+            .store(snapshot.video_epoch, Ordering::Release);
+        snapshot
+    }
+
+    fn snapshot(&self) -> Option<StreamSnapshot> {
+        *self.stream.lock().unwrap()
+    }
+
+    /// Commit an encoder swap. Every swap gets a new internal media epoch so
+    /// queued output from the replaced encoder is rejected. The public config
+    /// generation advances only when the wire-visible configuration changed.
+    fn commit_encoder_config(&self, mut config: StreamConfig) -> StreamSnapshot {
+        let mut stream = self.stream.lock().unwrap();
+        let previous = stream.expect("stream config not initialized");
+        config.video_epoch = previous.video_epoch;
+        let config_changed = previous.config != config;
+        let video_epoch = previous.video_epoch.wrapping_add(1);
+        config.video_epoch = video_epoch;
+        let snapshot = StreamSnapshot {
+            config,
+            generation: if config_changed {
+                previous.generation.wrapping_add(1)
+            } else {
+                previous.generation
+            },
+            video_epoch,
+            selection_generation: previous.selection_generation,
+        };
+        *stream = Some(snapshot);
+        self.active_video_epoch
+            .store(snapshot.video_epoch, Ordering::Release);
+        snapshot
+    }
+
+    fn commit_output_selection(&self, mut config: StreamConfig) -> StreamSnapshot {
+        let mut stream = self.stream.lock().unwrap();
+        let previous = stream.expect("stream config not initialized");
+        config.video_epoch = previous.video_epoch;
+        let config_changed = previous.config != config;
+        let video_epoch = previous.video_epoch.wrapping_add(1);
+        config.video_epoch = video_epoch;
+        let snapshot = StreamSnapshot {
+            config,
+            generation: if config_changed {
+                previous.generation.wrapping_add(1)
+            } else {
+                previous.generation
+            },
+            video_epoch,
+            selection_generation: previous.selection_generation.wrapping_add(1),
+        };
+        *stream = Some(snapshot);
+        self.active_video_epoch
+            .store(snapshot.video_epoch, Ordering::Release);
+        snapshot
+    }
+
+    fn active_video_epoch(&self) -> u64 {
+        self.active_video_epoch.load(Ordering::Acquire)
+    }
+
+    fn active_video_epoch_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.active_video_epoch)
+    }
+
+    fn initialize_debug(&self, info: SessionDebugInfo) {
+        *self.debug.lock().unwrap() = Some(DebugSnapshot {
+            generation: 1,
+            info,
+        });
+    }
+
+    fn update_debug(&self, info: SessionDebugInfo) -> DebugSnapshot {
+        let mut debug = self.debug.lock().unwrap();
+        let generation = debug
+            .as_ref()
+            .map_or(1, |current| current.generation.wrapping_add(1));
+        let snapshot = DebugSnapshot { generation, info };
+        *debug = Some(snapshot.clone());
+        snapshot
+    }
+
+    fn debug_snapshot(&self) -> Option<DebugSnapshot> {
+        self.debug.lock().unwrap().clone()
     }
 }
 
 struct SharedPipeline {
+    instance_id: u64,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     audio_bc: Arc<Broadcaster<EncodedAudioPacket>>,
-    stream_config: StreamConfig,
     session_debug: SessionDebugInfo,
     rate_control: Arc<AdaptiveBitrateState>,
     capture_state: Arc<SharedCaptureState>,
@@ -1008,42 +1135,51 @@ struct SharedPipeline {
 impl SharedPipeline {
     #[allow(clippy::too_many_arguments)]
     fn start(
-        client_requested_fps: Option<u32>,
-        client_supported_codecs: VideoCodecSupport,
-        client_hardware_codecs: VideoCodecSupport,
-        client_supported_yuv444_codecs: VideoCodecSupport,
-        client_hardware_yuv444_codecs: VideoCodecSupport,
-        client_hdr_display: bool,
+        video_capabilities: AggregateVideoCapabilities,
         input: Arc<InputRuntime>,
         control: Arc<ServerControl>,
+        state: &Arc<ServerState>,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<(Self, ClientSubscription), String> {
+        let instance_id = NEXT_PIPELINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let video_bc = Arc::new(Broadcaster::new());
+        let zero_state = Arc::downgrade(state);
+        video_bc.set_on_zero(move || {
+            if let Some(state) = zero_state.upgrade() {
+                stop_pipeline_if_idle(&state, instance_id);
+            }
+        });
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         let audio_bc = Arc::new(Broadcaster::new());
         let (vid_sub_id, vid_rx) = video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        let (aud_sub_id, aud_rx) = audio_bc.subscribe(30)?;
+        let (aud_sub_id, aud_rx) = match audio_bc.subscribe(30) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                video_bc.unsubscribe(vid_sub_id);
+                return Err(error);
+            }
+        };
 
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (status_tx, status_rx) = bounded::<PipelineResult>(1);
         let (capture_cmd_tx, capture_cmd_rx) = bounded::<CaptureCommand>(4);
         let capture_state = Arc::new(SharedCaptureState::new(capture_cmd_tx));
+        let startup_cancelled = Arc::clone(&cancelled);
 
         let vbc = Arc::clone(&video_bc);
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         let abc = Arc::clone(&audio_bc);
         let cs = Arc::clone(&capture_state);
+        let input_owner = Arc::clone(&state.input_pipeline_owner);
 
         let handle = std::thread::spawn(move || {
             run_shared_pipeline(
+                instance_id,
                 shutdown_rx,
+                startup_cancelled,
                 status_tx,
-                client_requested_fps,
-                client_supported_codecs,
-                client_hardware_codecs,
-                client_supported_yuv444_codecs,
-                client_hardware_yuv444_codecs,
-                client_hdr_display,
+                video_capabilities,
                 input,
                 control,
                 vbc,
@@ -1051,16 +1187,35 @@ impl SharedPipeline {
                 abc,
                 cs,
                 capture_cmd_rx,
+                input_owner,
             );
         });
 
-        match status_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(PipelineResult::Started(stream_config, rate_control, session_debug)) => Ok((
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if cancelled.load(Ordering::Acquire) || control.shutdown_requested() {
+                break Err("pipeline startup was cancelled".to_string());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Err("pipeline startup timed out".to_string());
+            }
+            match status_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(status) => break Ok(status),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    break Err("pipeline startup thread exited without status".to_string())
+                }
+            }
+        };
+
+        match status {
+            Ok(PipelineResult::Started(_stream_config, rate_control, session_debug)) => Ok((
                 Self {
+                    instance_id,
                     video_bc: Arc::clone(&video_bc),
                     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                     audio_bc: Arc::clone(&audio_bc),
-                    stream_config,
                     session_debug,
                     rate_control,
                     capture_state,
@@ -1068,22 +1223,32 @@ impl SharedPipeline {
                     pipeline_handle: handle,
                 },
                 ClientSubscription {
+                    pipeline_instance_id: instance_id,
                     vid_sub_id,
-                    vid_rx,
+                    vid_rx: Some(vid_rx),
                     video_bc: Arc::clone(&video_bc),
                     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                     aud_sub_id,
                     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                    aud_rx,
+                    aud_rx: Some(aud_rx),
+                    _cleanup: SubscriptionCleanup {
+                        state: Arc::downgrade(state),
+                        pipeline_instance_id: instance_id,
+                        vid_sub_id,
+                        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                        aud_sub_id,
+                    },
                 },
             )),
             Ok(PipelineResult::Error(e)) => {
                 let _ = handle.join();
                 Err(e)
             }
-            Err(_) => {
-                let _ = handle.join();
-                Err("Pipeline thread crashed".into())
+            Err(error) => {
+                cancelled.store(true, Ordering::Release);
+                let _ = shutdown_tx.send(());
+                state.pipeline_stop.register(handle);
+                Err(error)
             }
         }
     }
@@ -1095,22 +1260,117 @@ impl SharedPipeline {
 }
 
 /// Per-client subscription handles.
-struct ClientSubscription {
+struct SubscriptionCleanup {
+    state: Weak<ServerState>,
+    pipeline_instance_id: u64,
     vid_sub_id: u64,
-    vid_rx: Receiver<Arc<EncodedVideoFrame>>,
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    aud_sub_id: u64,
+}
+
+impl Drop for SubscriptionCleanup {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            unsubscribe_and_maybe_stop_pipeline(
+                &state,
+                self.pipeline_instance_id,
+                self.vid_sub_id,
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                self.aud_sub_id,
+            );
+        }
+    }
+}
+
+struct ClientSubscription {
+    pipeline_instance_id: u64,
+    vid_sub_id: u64,
+    vid_rx: Option<Receiver<Arc<EncodedVideoFrame>>>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     aud_sub_id: u64,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    aud_rx: Receiver<Arc<EncodedAudioPacket>>,
+    aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
+    _cleanup: SubscriptionCleanup,
+}
+
+struct ClientPipelineReservation {
+    pipeline_instance_id: u64,
+    video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
+    video: SubscriptionReservation<EncodedVideoFrame>,
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    audio: SubscriptionReservation<EncodedAudioPacket>,
+    rate_control: Arc<AdaptiveBitrateState>,
+    capture_state: Arc<SharedCaptureState>,
+    state: Weak<ServerState>,
+}
+
+impl ClientPipelineReservation {
+    fn new(pipeline: &SharedPipeline, state: &Arc<ServerState>) -> Result<Self, String> {
+        let video = pipeline.video_bc.reserve()?;
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        let audio = pipeline.audio_bc.reserve()?;
+        Ok(Self {
+            pipeline_instance_id: pipeline.instance_id,
+            video_bc: Arc::clone(&pipeline.video_bc),
+            video,
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+            audio,
+            rate_control: Arc::clone(&pipeline.rate_control),
+            capture_state: Arc::clone(&pipeline.capture_state),
+            state: Arc::downgrade(state),
+        })
+    }
+
+    fn commit(self, snapshot: StreamSnapshot) -> PipelineSetup {
+        let (vid_sub_id, vid_rx) = self.video.commit(VIDEO_SUBSCRIBER_CAPACITY);
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        let (aud_sub_id, aud_rx) = self.audio.commit(30);
+        let session_debug = self
+            .capture_state
+            .debug_snapshot()
+            .expect("active pipeline has no debug snapshot")
+            .info;
+        (
+            ClientSubscription {
+                pipeline_instance_id: self.pipeline_instance_id,
+                vid_sub_id,
+                vid_rx: Some(vid_rx),
+                video_bc: self.video_bc,
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                aud_sub_id,
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                aud_rx: Some(aud_rx),
+                _cleanup: SubscriptionCleanup {
+                    state: self.state,
+                    pipeline_instance_id: self.pipeline_instance_id,
+                    vid_sub_id,
+                    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                    aud_sub_id,
+                },
+            },
+            snapshot,
+            self.rate_control,
+            session_debug,
+            self.capture_state,
+        )
+    }
 }
 
 /// Global server state shared across all client handlers.
 struct ServerState {
     pipeline: Mutex<Option<SharedPipeline>>,
-    /// When the last subscriber leaves, the pipeline stop runs in a background
-    /// thread. New pipeline starts must wait for this to complete first.
-    pending_pipeline_stop: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pipeline_starting: AtomicBool,
+    pipeline_stop: Arc<PipelineStopCoordinator>,
+    admission: Arc<AdmissionCoordinator>,
+    /// Serializes exact-instance subscribe/unsubscribe/start/stop operations.
+    pipeline_lifecycle: Mutex<()>,
+    /// Registry revision checked by asynchronous encoder workers before commit.
+    profile_revision: Arc<AtomicU64>,
+    /// Makes registry mutations and encoder-profile commits mutually exclusive.
+    profile_commit: Arc<Mutex<()>>,
+    input_pipeline_owner: Arc<AtomicU64>,
+    video_capabilities: Mutex<VideoCapabilityRegistry>,
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
     listen_port: u16,
@@ -1118,11 +1378,199 @@ struct ServerState {
     tunnel_state: Option<Arc<api_client::ApiTunnelState>>,
 }
 
+#[derive(Default)]
+struct PipelineStopCoordinator {
+    stopping: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl PipelineStopCoordinator {
+    fn register(self: &Arc<Self>, handle: std::thread::JoinHandle<()>) {
+        {
+            let mut stopping = self.stopping.lock().unwrap();
+            assert!(!*stopping, "pipeline stop already in progress");
+            *stopping = true;
+        }
+        let coordinator = Arc::clone(self);
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            *coordinator.stopping.lock().unwrap() = false;
+            coordinator.changed.notify_all();
+        });
+    }
+
+    fn wait(&self, cancelled: &AtomicBool) -> Result<(), String> {
+        let mut stopping = self.stopping.lock().unwrap();
+        while *stopping {
+            if cancelled.load(Ordering::Acquire) {
+                return Err("pipeline setup cancelled while prior capture was stopping".into());
+            }
+            stopping = self
+                .changed
+                .wait_timeout(stopping, Duration::from_millis(100))
+                .unwrap()
+                .0;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_stopping(&self) -> bool {
+        *self.stopping.lock().unwrap()
+    }
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    active: Option<u64>,
+    waiting: BTreeSet<u64>,
+}
+
+#[derive(Default)]
+struct AdmissionCoordinator {
+    next: AtomicU64,
+    state: Mutex<AdmissionState>,
+    changed: Condvar,
+}
+
+impl AdmissionCoordinator {
+    fn acquire(self: &Arc<Self>, cancelled: Arc<AtomicBool>) -> Result<AdmissionPermit, String> {
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut state = self.state.lock().unwrap();
+        state.waiting.insert(ticket);
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                state.waiting.remove(&ticket);
+                self.changed.notify_all();
+                return Err("client admission was cancelled".into());
+            }
+            if state.active.is_none() && state.waiting.first() == Some(&ticket) {
+                state.waiting.remove(&ticket);
+                state.active = Some(ticket);
+                return Ok(AdmissionPermit {
+                    token: ticket,
+                    coordinator: Arc::clone(self),
+                    cancelled,
+                });
+            }
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap()
+                .0;
+        }
+    }
+
+    fn is_current(&self, token: u64) -> bool {
+        self.state.lock().unwrap().active == Some(token)
+    }
+}
+
+struct AdmissionPermit {
+    token: u64,
+    coordinator: Arc<AdmissionCoordinator>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AdmissionPermit {
+    fn is_current(&self) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+            && self.coordinator.is_current(self.token)
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        let mut state = self.coordinator.state.lock().unwrap();
+        if state.active == Some(self.token) {
+            state.active = None;
+        }
+        self.coordinator.changed.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct AdmissionStamp {
+    token: u64,
+    coordinator: Arc<AdmissionCoordinator>,
+}
+
+impl AdmissionStamp {
+    fn is_current(&self) -> bool {
+        self.coordinator.is_current(self.token)
+    }
+}
+
+struct PipelineStartGuard<'a>(&'a AtomicBool);
+
+impl Drop for PipelineStartGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct VideoMembership {
+    id: u64,
+    cancelled: Arc<AtomicBool>,
+    state: Weak<ServerState>,
+}
+
+impl Drop for VideoMembership {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        self.cancelled.store(true, Ordering::Release);
+        let (removed, has_members) = {
+            let _commit_guard = state.profile_commit.lock().unwrap();
+            let mut registry = state.video_capabilities.lock().unwrap();
+            let removed = registry.remove(self.id);
+            state
+                .profile_revision
+                .store(registry.revision(), Ordering::Release);
+            (removed, !registry.is_empty())
+        };
+        if removed.is_some() && has_members {
+            std::thread::spawn(move || {
+                if let Err(error) = reconcile_video_profile(&state) {
+                    eprintln!("[pipeline] remaining-client profile upgrade failed: {error}");
+                }
+            });
+        }
+    }
+}
+
+fn begin_video_membership(
+    state: &Arc<ServerState>,
+    capabilities: ClientVideoCapabilities,
+) -> VideoMembership {
+    let _commit_guard = state.profile_commit.lock().unwrap();
+    let mut registry = state.video_capabilities.lock().unwrap();
+    let id = registry.insert_tentative(capabilities);
+    state
+        .profile_revision
+        .store(registry.revision(), Ordering::Release);
+    VideoMembership {
+        id,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        state: Arc::downgrade(state),
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct PendingEncoderRebuild {
+    revision: u64,
     config: EncoderConfig,
     backend: EncoderBackend,
-    rx: Receiver<Result<EncoderKind, String>>,
+    purpose: RebuildPurpose,
+    rx: Receiver<Result<(EncoderConfig, EncoderKind, EncoderBackend), String>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+enum RebuildPurpose {
+    Bitrate,
+    FrameRate,
+    Profile(ProfileRequest),
 }
 
 /// Build a new encoder for `config`/`backend` on a background thread (so the
@@ -1130,15 +1578,87 @@ struct PendingEncoderRebuild {
 /// loop polls. The rebuilt encoder is swapped in — and starts with a keyframe —
 /// once it is ready.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn spawn_encoder_rebuild(config: EncoderConfig, backend: EncoderBackend) -> PendingEncoderRebuild {
+fn spawn_encoder_rebuild(
+    config: EncoderConfig,
+    backend: EncoderBackend,
+    revision: u64,
+    purpose: RebuildPurpose,
+) -> PendingEncoderRebuild {
     let (rebuild_tx, rebuild_rx) = bounded(1);
     let rebuild_config = config.clone();
     std::thread::spawn(move || {
-        let _ = rebuild_tx.send(create_encoder_for_backend(&rebuild_config, backend));
+        let result = create_encoder_for_backend(&rebuild_config, backend)
+            .map(|encoder| (rebuild_config, encoder, backend));
+        let _ = rebuild_tx.send(result);
     });
     PendingEncoderRebuild {
+        revision,
         config,
         backend,
+        purpose,
+        rx: rebuild_rx,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn rebuild_revision_is_current(result_revision: u64, current_revision: u64) -> bool {
+    result_revision == current_revision
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_profile_encoder_rebuild(
+    current: EncoderConfig,
+    control: Arc<ServerControl>,
+    capture_render_hint: Option<String>,
+    revision: u64,
+    request: ProfileRequest,
+) -> PendingEncoderRebuild {
+    let (rebuild_tx, rebuild_rx) = bounded(1);
+    let placeholder = current.clone();
+    let capabilities = request.capabilities;
+    std::thread::spawn(move || {
+        let result = open_linux_encoder_for_aggregate(
+            &current,
+            capabilities,
+            &control,
+            capture_render_hint.as_deref(),
+        )
+        .map(|(config, encoder)| {
+            let backend = encoder_backend(&encoder);
+            (config, encoder, backend)
+        });
+        let _ = rebuild_tx.send(result);
+    });
+    PendingEncoderRebuild {
+        revision,
+        // Replaced by the selected config in the worker result.
+        config: placeholder,
+        backend: EncoderBackend::Software,
+        purpose: RebuildPurpose::Profile(request),
+        rx: rebuild_rx,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_profile_encoder_rebuild(
+    config: EncoderConfig,
+    current_backend: EncoderBackend,
+    revision: u64,
+    request: ProfileRequest,
+) -> PendingEncoderRebuild {
+    let (rebuild_tx, rebuild_rx) = bounded(1);
+    let rebuild_config = config.clone();
+    std::thread::spawn(move || {
+        let result = create_encoder_for_backend(&rebuild_config, current_backend)
+            .map(|encoder| (rebuild_config, encoder, current_backend));
+        let _ = rebuild_tx.send(result);
+    });
+    PendingEncoderRebuild {
+        revision,
+        config,
+        backend: current_backend,
+        purpose: RebuildPurpose::Profile(request),
         rx: rebuild_rx,
     }
 }
@@ -1149,14 +1669,11 @@ fn spawn_encoder_rebuild(config: EncoderConfig, backend: EncoderBackend) -> Pend
 
 #[allow(clippy::too_many_arguments)]
 fn run_shared_pipeline(
+    instance_id: u64,
     shutdown_rx: Receiver<()>,
+    startup_cancelled: Arc<AtomicBool>,
     status_tx: Sender<PipelineResult>,
-    client_requested_fps: Option<u32>,
-    client_supported_codecs: VideoCodecSupport,
-    client_hardware_codecs: VideoCodecSupport,
-    client_supported_yuv444_codecs: VideoCodecSupport,
-    client_hardware_yuv444_codecs: VideoCodecSupport,
-    client_hdr_display: bool,
+    video_capabilities: AggregateVideoCapabilities,
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
@@ -1165,48 +1682,63 @@ fn run_shared_pipeline(
     >,
     capture_state: Arc<SharedCaptureState>,
     capture_cmd_rx: Receiver<CaptureCommand>,
+    input_pipeline_owner: Arc<AtomicU64>,
 ) {
     let (frame_tx, mut frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
     // Capture-command processing (output switching) is only meaningful on the
     // KMS path (Linux); on other platforms drain-suppress the unused channel.
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = &capture_cmd_rx;
-    // D2 HDR gate is applied in select_linux_encoder; other platforms force SDR
-    // separately (VideoToolbox/D3D HDR encode unimplemented).
-    #[cfg(not(target_os = "linux"))]
-    let _ = client_hdr_display;
     let trace = trace_enabled();
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    let _ = client_hardware_codecs;
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    let _ = client_hardware_yuv444_codecs;
 
-    let negotiated_fps = EncoderConfig::resolve_target_fps(client_requested_fps);
+    let negotiated_fps = EncoderConfig::resolve_target_fps(video_capabilities.requested_fps);
     capture::set_target_fps(negotiated_fps);
     println!(
         "[pipeline] capture fps target={} (client_request={:?}fps, ST_FPS cap={:?})",
         negotiated_fps,
-        client_requested_fps,
+        video_capabilities.requested_fps,
         EncoderConfig::fps_cap_from_env()
     );
 
     let mut capture_backend = PlatformCapture::new();
+    if startup_cancelled.load(Ordering::Acquire) {
+        let _ = status_tx.send(PipelineResult::Error("Pipeline startup cancelled".into()));
+        return;
+    }
     if let Err(e) = capture_backend.start(frame_tx) {
         let msg = format!("Failed to start capture: {e}");
         eprintln!("{msg}");
         let _ = status_tx.send(PipelineResult::Error(msg));
         return;
     }
+    if startup_cancelled.load(Ordering::Acquire) {
+        capture_backend.stop();
+        let _ = status_tx.send(PipelineResult::Error("Pipeline startup cancelled".into()));
+        return;
+    }
 
     // Get first frame to determine dimensions
-    let (first_frame, first_frame_captured_micros) = match frame_rx.recv() {
-        Ok(f) => (f, unix_time_micros()),
-        Err(_) => {
-            let msg = "Capture channel closed before first frame".to_string();
-            eprintln!("{msg}");
+    let (first_frame, first_frame_captured_micros) = loop {
+        if startup_cancelled.load(Ordering::Acquire) {
             capture_backend.stop();
-            let _ = status_tx.send(PipelineResult::Error(msg));
+            let _ = status_tx.send(PipelineResult::Error("Pipeline startup cancelled".into()));
             return;
+        }
+        crossbeam_channel::select! {
+            recv(frame_rx) -> frame => match frame {
+                Ok(frame) => break (frame, unix_time_micros()),
+                Err(_) => {
+                    let msg = "Capture channel closed before first frame".to_string();
+                    eprintln!("{msg}");
+                    capture_backend.stop();
+                    let _ = status_tx.send(PipelineResult::Error(msg));
+                    return;
+                }
+            },
+            recv(shutdown_rx) -> _ => {
+                startup_cancelled.store(true, Ordering::Release);
+            },
+            default(Duration::from_millis(100)) => {}
         }
     };
     if trace {
@@ -1244,11 +1776,11 @@ fn run_shared_pipeline(
         first_frame.width,
         first_frame.height,
         negotiated_fps,
-        client_supported_codecs,
-        client_hardware_codecs,
-        client_supported_yuv444_codecs,
-        client_hardware_yuv444_codecs,
-        client_hdr_display,
+        video_capabilities.supported_codecs,
+        video_capabilities.hardware_codecs,
+        video_capabilities.supported_yuv444_codecs,
+        video_capabilities.hardware_yuv444_codecs,
+        video_capabilities.hdr_display,
         &control,
         capture_render_hint.as_deref(),
     ) {
@@ -1261,12 +1793,19 @@ fn run_shared_pipeline(
         }
     };
 
+    if startup_cancelled.load(Ordering::Acquire) {
+        capture_backend.stop();
+        let _ = status_tx.send(PipelineResult::Error("Pipeline startup cancelled".into()));
+        return;
+    }
+
     #[cfg(target_os = "windows")]
     let (config, mut encoder) = match select_windows_encoder(
         &first_frame,
         negotiated_fps,
-        client_supported_codecs,
-        client_supported_yuv444_codecs,
+        video_capabilities.supported_codecs,
+        video_capabilities.supported_yuv444_codecs,
+        video_capabilities.hdr_display,
         &control,
     ) {
         Ok(selected) => selected,
@@ -1278,13 +1817,20 @@ fn run_shared_pipeline(
         }
     };
 
+    #[cfg(target_os = "windows")]
+    if startup_cancelled.load(Ordering::Acquire) {
+        capture_backend.stop();
+        let _ = status_tx.send(PipelineResult::Error("Pipeline startup cancelled".into()));
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     let (config, mut encoder) = match select_macos_encoder(
         first_frame.width,
         first_frame.height,
         negotiated_fps,
-        client_supported_codecs,
-        client_supported_yuv444_codecs,
+        video_capabilities.supported_codecs,
+        video_capabilities.supported_yuv444_codecs,
         &control,
     ) {
         Ok(selected) => selected,
@@ -1299,6 +1845,13 @@ fn run_shared_pipeline(
             return;
         }
     };
+
+    #[cfg(target_os = "macos")]
+    if startup_cancelled.load(Ordering::Acquire) {
+        capture_backend.stop();
+        let _ = status_tx.send(PipelineResult::Error("Pipeline startup cancelled".into()));
+        return;
+    }
 
     let forced_bitrate = control.forced_bitrate_kbps();
     let rate_control = if forced_bitrate > 0 {
@@ -1338,24 +1891,18 @@ fn run_shared_pipeline(
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let stream_config = config.to_stream_config(&audio_config);
+    let initial_snapshot = capture_state.initialize_config(stream_config);
 
     let capture_backend_name = capture_backend.backend_name().to_string();
+    input_pipeline_owner.store(instance_id, Ordering::Release);
     input.refresh_backend(
         &capture_backend_name,
         stream_config.width,
         stream_config.height,
     );
-    let session_debug = SessionDebugInfo {
-        encoder_name: format!(
-            "{}-{}",
-            encoder_name(&encoder),
-            encoder_chroma_name(config.chroma)
-        ),
-        capture_backend: capture_backend_name,
-        input_backend: input.backend_label(),
-        target_bitrate_kbps: config.bitrate_kbps,
-        quality_preset: config.quality.label().to_string(),
-    };
+    let session_debug =
+        build_session_debug(&encoder, &config, &capture_backend_name, input.as_ref());
+    capture_state.initialize_debug(session_debug.clone());
 
     println!(
         "Shared pipeline started: {}x{} (video: {:?} {:?} {:?})",
@@ -1391,6 +1938,8 @@ fn run_shared_pipeline(
     let mut current_config = config.clone();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut pending_encoder_rebuild: Option<PendingEncoderRebuild> = None;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut encoder_revision = 1u64;
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let mut last_encoder_reconfigure = Instant::now();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1423,8 +1972,10 @@ fn run_shared_pipeline(
         input.as_ref(),
         &first_frame,
         first_frame_captured_micros,
+        initial_snapshot.video_epoch,
     );
 
+    let mut observed_output_generation = 0u64;
     // Main loop
     'pipeline: loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -1435,68 +1986,230 @@ fn run_shared_pipeline(
         // global to the shared stream: stop+restart capture pinned to the new
         // monitor, rebuild the encoder if the resolution changed, then publish
         // the new StreamConfig so every client re-syncs and gets a keyframe.
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        while let Ok(cmd) = capture_cmd_rx.try_recv() {
+        let mut next_command = capture_state
+            .pending_output(observed_output_generation)
+            .map(|(generation, id)| {
+                observed_output_generation = generation;
+                CaptureCommand::SelectOutput(id)
+            });
+        loop {
+            let Some(cmd) = next_command
+                .take()
+                .or_else(|| capture_cmd_rx.try_recv().ok())
+            else {
+                break;
+            };
             match cmd {
                 CaptureCommand::SelectOutput(id) => {
-                    if !capture_backend.select_output(id) {
-                        continue;
-                    }
-                    println!("[pipeline] switching capture to output id {id}");
-                    capture_backend.stop();
-                    let (new_tx, new_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
-                    if let Err(e) = capture_backend.start(new_tx) {
-                        eprintln!(
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    {
+                        if !capture_backend.select_output(id) {
+                            continue;
+                        }
+                        println!("[pipeline] switching capture to output id {id}");
+                        capture_backend.stop();
+                        let (new_tx, new_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
+                        if let Err(e) = capture_backend.start(new_tx) {
+                            eprintln!(
                             "[pipeline] capture restart after output switch failed: {e}; stopping pipeline"
                         );
-                        break 'pipeline;
-                    }
-                    frame_rx = new_rx;
-                    let switched_frame = match frame_rx
-                        .recv_timeout(std::time::Duration::from_secs(5))
-                    {
-                        Ok(f) => f,
-                        Err(_) => {
-                            eprintln!(
-                                    "[pipeline] no frame within 5s after output switch; stopping pipeline"
-                                );
                             break 'pipeline;
                         }
-                    };
-                    if switched_frame.width != current_config.width
-                        || switched_frame.height != current_config.height
-                    {
-                        let mut new_config = current_config.clone();
-                        new_config.width = switched_frame.width;
-                        new_config.height = switched_frame.height;
-                        let backend = encoder_backend(&encoder);
-                        match create_encoder_for_backend(&new_config, backend) {
-                            Ok(mut new_encoder) => {
-                                request_next_keyframe(&mut new_encoder);
-                                encoder = new_encoder;
-                                current_config = new_config;
-                            }
-                            Err(e) => {
+                        frame_rx = new_rx;
+                        let switched_frame = match frame_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                        {
+                            Ok(f) => f,
+                            Err(_) => {
                                 eprintln!(
-                                    "[pipeline] encoder rebuild for switched output failed: {e}; stopping pipeline"
+                                    "[pipeline] no frame within 5s after output switch; stopping pipeline"
                                 );
                                 break 'pipeline;
                             }
+                        };
+                        if switched_frame.width != current_config.width
+                            || switched_frame.height != current_config.height
+                        {
+                            encoder_revision = encoder_revision.wrapping_add(1);
+                            if let Some(pending) = pending_encoder_rebuild.take() {
+                                if let RebuildPurpose::Profile(request) = pending.purpose {
+                                    request.reject(
+                                        "capture changed while the video profile was opening",
+                                    );
+                                }
+                            }
+                            let mut new_config = current_config.clone();
+                            new_config.width = switched_frame.width;
+                            new_config.height = switched_frame.height;
+                            let backend = encoder_backend(&encoder);
+                            match create_encoder_for_backend(&new_config, backend) {
+                                Ok(mut new_encoder) => {
+                                    request_next_keyframe(&mut new_encoder);
+                                    encoder = new_encoder;
+                                    current_config = new_config;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                    "[pipeline] encoder rebuild for switched output failed: {e}; stopping pipeline"
+                                );
+                                    break 'pipeline;
+                                }
+                            }
+                        } else {
+                            request_next_keyframe(&mut encoder);
+                        }
+                        capture_state.selected_output.store(id, Ordering::SeqCst);
+                        capture_state.commit_output_selection(
+                            current_config.to_stream_config(&audio_config),
+                        );
+                        video_bc.clear_queued();
+                        input.update_stream_dimensions(
+                            current_config.width,
+                            current_config.height,
+                        );
+                        println!(
+                            "[pipeline] output switch complete: {}x{}",
+                            current_config.width, current_config.height
+                        );
+                        encode_and_broadcast(
+                            &mut encoder,
+                            &video_bc,
+                            input.as_ref(),
+                            &switched_frame,
+                            unix_time_micros(),
+                            capture_state.active_video_epoch(),
+                        );
+                    }
+                }
+                CaptureCommand::SetVideoCapabilities(request) => {
+                    if !request.is_current() {
+                        request.reject("video profile request was cancelled");
+                        continue;
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    {
+                        let desired = match aggregate_encoder_config(
+                            &current_config,
+                            request.capabilities,
+                            &control,
+                        ) {
+                            Ok(desired) => desired,
+                            Err(error) => {
+                                request.reject(error);
+                                continue;
+                            }
+                        };
+                        if encoder_profiles_equal(&current_config, &desired) {
+                            let _commit_guard = request.commit_lock.lock().unwrap();
+                            if !request.is_current() {
+                                drop(_commit_guard);
+                                request.reject("video profile request became stale");
+                                continue;
+                            }
+                            let snapshot = capture_state
+                                .snapshot()
+                                .expect("active pipeline has no stream config");
+                            let _ = request.response.send(Ok(snapshot));
+                            continue;
+                        }
+                        encoder_revision = encoder_revision.wrapping_add(1);
+                        if let Some(pending) = pending_encoder_rebuild.take() {
+                            if let RebuildPurpose::Profile(previous_request) = pending.purpose {
+                                previous_request.reject("video profile request was superseded");
+                            }
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            pending_encoder_rebuild = Some(spawn_profile_encoder_rebuild(
+                                current_config.clone(),
+                                Arc::clone(&control),
+                                capture_render_hint.clone(),
+                                encoder_revision,
+                                request,
+                            ));
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            let backend = encoder_backend(&encoder);
+                            if backend != EncoderBackend::Software {
+                                request.reject(format!(
+                                    "dynamic video profile changes are unavailable on the active Windows {} encoder; reconnect with a compatible profile",
+                                    encoder_backend_name(backend)
+                                ));
+                                continue;
+                            }
+                            pending_encoder_rebuild = Some(spawn_profile_encoder_rebuild(
+                                desired,
+                                backend,
+                                encoder_revision,
+                                request,
+                            ));
                         }
                     }
-                    capture_state.selected_output.store(id, Ordering::SeqCst);
-                    capture_state.publish_config(current_config.to_stream_config(&audio_config));
-                    println!(
-                        "[pipeline] output switch complete: {}x{}",
-                        current_config.width, current_config.height
-                    );
-                    encode_and_broadcast(
-                        &mut encoder,
-                        &video_bc,
-                        input.as_ref(),
-                        &switched_frame,
-                        unix_time_micros(),
-                    );
+                    #[cfg(target_os = "macos")]
+                    {
+                        let next_config = if request
+                            .capabilities
+                            .supported_codecs
+                            .supports(VideoCodec::H264)
+                        {
+                            let mut config = current_config.clone();
+                            config.codec = encode_config::Codec::H264;
+                            config.chroma = encode_config::ChromaSampling::Yuv420;
+                            config.dynamic_range = encode_config::DynamicRange::Sdr;
+                            config.framerate = EncoderConfig::resolve_target_fps(
+                                request.capabilities.requested_fps,
+                            );
+                            Ok(config)
+                        } else {
+                            Err(
+                                "VideoToolbox server has no codec in common with every client"
+                                    .into(),
+                            )
+                        };
+                        match next_config.and_then(|next_config| {
+                            if encoder_profiles_equal(&current_config, &next_config) {
+                                return Ok((next_config, None));
+                            }
+                            encode_vt::VTEncoder::new(
+                                next_config.width,
+                                next_config.height,
+                                next_config.bitrate_bps().min(u32::MAX as i64) as u32,
+                                next_config.framerate,
+                            )
+                            .map(|next_encoder| (next_config, Some(next_encoder)))
+                        }) {
+                            Ok((next_config, next_encoder)) => {
+                                let commit_guard = request.commit_lock.lock().unwrap();
+                                if !request.is_current() {
+                                    drop(commit_guard);
+                                    request.reject("video profile request became stale");
+                                    continue;
+                                }
+                                let rebuilt = next_encoder.is_some();
+                                if let Some(next_encoder) = next_encoder {
+                                    encoder = next_encoder;
+                                }
+                                current_config = next_config;
+                                capture::set_target_fps(current_config.framerate);
+                                let snapshot = if rebuilt {
+                                    let snapshot = capture_state.commit_encoder_config(
+                                        current_config.to_stream_config(&audio_config),
+                                    );
+                                    video_bc.clear_queued();
+                                    snapshot
+                                } else {
+                                    capture_state
+                                        .snapshot()
+                                        .expect("active pipeline has no stream config")
+                                };
+                                let _ = request.response.send(Ok(snapshot));
+                            }
+                            Err(error) => {
+                                request.reject(error);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1559,6 +2272,12 @@ fn run_shared_pipeline(
                 let mut new_config = current_config.clone();
                 new_config.width = frame.width;
                 new_config.height = frame.height;
+                encoder_revision = encoder_revision.wrapping_add(1);
+                if let Some(pending) = pending_encoder_rebuild.take() {
+                    if let RebuildPurpose::Profile(request) = pending.purpose {
+                        request.reject("capture resolution changed during profile setup");
+                    }
+                }
                 let backend = encoder_backend(&encoder);
                 match create_encoder_for_backend(&new_config, backend) {
                     Ok(mut new_encoder) => {
@@ -1566,7 +2285,12 @@ fn run_shared_pipeline(
                         encoder = new_encoder;
                         current_config = new_config;
                         capture_state
-                            .publish_config(current_config.to_stream_config(&audio_config));
+                            .commit_encoder_config(current_config.to_stream_config(&audio_config));
+                        input.update_stream_dimensions(
+                            current_config.width,
+                            current_config.height,
+                        );
+                        video_bc.clear_queued();
                     }
                     Err(e) => {
                         eprintln!(
@@ -1662,42 +2386,86 @@ fn run_shared_pipeline(
                     let pending = pending_encoder_rebuild
                         .take()
                         .expect("pending rebuild missing after result");
+                    if !rebuild_revision_is_current(pending.revision, encoder_revision) {
+                        if let RebuildPurpose::Profile(request) = pending.purpose {
+                            request.reject("stale encoder rebuild discarded");
+                        }
+                        continue;
+                    }
                     match result {
-                        Ok(mut next_encoder) => {
-                            let fps_changed = pending.config.framerate != current_config.framerate;
-                            if fps_changed {
+                        Ok((next_config, mut next_encoder, next_backend)) => {
+                            let profile_commit_guard = if let RebuildPurpose::Profile(request) =
+                                &pending.purpose
+                            {
+                                let guard = request.commit_lock.lock().unwrap();
+                                if !request.is_current() {
+                                    drop(guard);
+                                    if let RebuildPurpose::Profile(request) = pending.purpose {
+                                        request
+                                            .reject("cancelled encoder rebuild result discarded");
+                                    }
+                                    continue;
+                                }
+                                Some(guard)
+                            } else {
+                                None
+                            };
+                            let fps_changed = next_config.framerate != current_config.framerate;
+                            let profile_change =
+                                matches!(&pending.purpose, RebuildPurpose::Profile(_));
+                            if profile_change {
+                                println!(
+                                    "[pipeline] activating shared video profile: {} {} {}fps",
+                                    codec_name(next_config.stream_codec()),
+                                    encoder_chroma_name(next_config.chroma),
+                                    next_config.framerate,
+                                );
+                            } else if fps_changed {
                                 println!(
                                     "[adapt-fps] {} now encoding at {} fps",
-                                    encoder_backend_name(pending.backend),
-                                    pending.config.framerate
+                                    encoder_backend_name(next_backend),
+                                    next_config.framerate
                                 );
                             } else {
                                 println!(
                                     "[abr] {} bitrate {} -> {} kbps",
-                                    encoder_backend_name(pending.backend),
+                                    encoder_backend_name(next_backend),
                                     current_config.bitrate_kbps,
-                                    pending.config.bitrate_kbps
+                                    next_config.bitrate_kbps
                                 );
                             }
                             request_next_keyframe(&mut next_encoder);
                             encoder = next_encoder;
-                            current_config = pending.config;
+                            current_config = next_config;
                             last_encoder_reconfigure = Instant::now();
-                            // An fps change alters StreamConfig.framerate — push
-                            // it so every client re-fits its present pacing and
-                            // jitter buffer; force a keyframe (done above).
                             if fps_changed {
-                                capture_state
-                                    .publish_config(current_config.to_stream_config(&audio_config));
+                                capture::set_target_fps(current_config.framerate);
+                                adaptive_fps = adaptive_bitrate::AdaptiveFrameRate::from_env(
+                                    current_config.framerate,
+                                    Instant::now(),
+                                );
+                            }
+                            let snapshot = capture_state.commit_encoder_config(
+                                current_config.to_stream_config(&audio_config),
+                            );
+                            video_bc.clear_queued();
+                            drop(profile_commit_guard);
+                            if let RebuildPurpose::Profile(request) = pending.purpose {
+                                let _ = request.response.send(Ok(snapshot));
                             }
                         }
                         Err(err) => {
-                            eprintln!(
-                                "[abr] {} encoder rebuild failed at {} kbps: {err}",
-                                encoder_backend_name(pending.backend),
-                                pending.config.bitrate_kbps
-                            );
-                            rate_control.reset_all_clients(current_config.bitrate_kbps);
+                            if let RebuildPurpose::Profile(request) = pending.purpose {
+                                eprintln!("[pipeline] video profile rebuild failed: {err}");
+                                request.reject(err);
+                            } else {
+                                eprintln!(
+                                    "[abr] {} encoder rebuild failed at {} kbps: {err}",
+                                    encoder_backend_name(pending.backend),
+                                    pending.config.bitrate_kbps
+                                );
+                                rate_control.reset_all_clients(current_config.bitrate_kbps);
+                            }
                         }
                     }
                 }
@@ -1719,8 +2487,13 @@ fn run_shared_pipeline(
                             ""
                         }
                     );
-                    pending_encoder_rebuild =
-                        Some(spawn_encoder_rebuild(current_config.clone(), backend));
+                    encoder_revision = encoder_revision.wrapping_add(1);
+                    pending_encoder_rebuild = Some(spawn_encoder_rebuild(
+                        current_config.clone(),
+                        backend,
+                        encoder_revision,
+                        RebuildPurpose::Bitrate,
+                    ));
                 }
 
                 let forced_br = control.forced_bitrate_kbps();
@@ -1765,7 +2538,13 @@ fn run_shared_pipeline(
                                 next_config.bitrate_kbps
                             );
                         }
-                        pending_encoder_rebuild = Some(spawn_encoder_rebuild(next_config, backend));
+                        encoder_revision = encoder_revision.wrapping_add(1);
+                        pending_encoder_rebuild = Some(spawn_encoder_rebuild(
+                            next_config,
+                            backend,
+                            encoder_revision,
+                            RebuildPurpose::Bitrate,
+                        ));
                     } else {
                         match update_encoder_bitrate(&mut encoder, &next_config) {
                             Ok(()) => {
@@ -1790,8 +2569,13 @@ fn run_shared_pipeline(
                                         next_config.bitrate_kbps
                                     );
                                 }
-                                pending_encoder_rebuild =
-                                    Some(spawn_encoder_rebuild(next_config, backend));
+                                encoder_revision = encoder_revision.wrapping_add(1);
+                                pending_encoder_rebuild = Some(spawn_encoder_rebuild(
+                                    next_config,
+                                    backend,
+                                    encoder_revision,
+                                    RebuildPurpose::Bitrate,
+                                ));
                             }
                         }
                     }
@@ -1805,6 +2589,7 @@ fn run_shared_pipeline(
                 input.as_ref(),
                 &frame,
                 frame_captured_micros,
+                capture_state.active_video_epoch(),
             );
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
@@ -1832,8 +2617,13 @@ fn run_shared_pipeline(
                             // Slow capture immediately to stop overrunning; the
                             // encoder swaps to the new fps when the rebuild lands.
                             capture::set_target_fps(new_fps);
-                            pending_encoder_rebuild =
-                                Some(spawn_encoder_rebuild(new_config, backend));
+                            encoder_revision = encoder_revision.wrapping_add(1);
+                            pending_encoder_rebuild = Some(spawn_encoder_rebuild(
+                                new_config,
+                                backend,
+                                encoder_revision,
+                                RebuildPurpose::FrameRate,
+                            ));
                         }
                     }
                 }
@@ -1873,7 +2663,12 @@ fn run_shared_pipeline(
         ap.stop();
     }
     capture_backend.stop();
-    input.clear_for_stop();
+    if input_pipeline_owner
+        .compare_exchange(instance_id, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        input.clear_for_stop();
+    }
     println!("Shared pipeline stopped");
 }
 
@@ -1891,6 +2686,7 @@ fn encode_and_broadcast(
     input: &InputRuntime,
     frame: &capture::CapturedFrame,
     captured_micros: u64,
+    video_epoch: u64,
 ) -> usize {
     input.update_cursor(frame.cursor.as_ref());
 
@@ -1937,6 +2733,7 @@ fn encode_and_broadcast(
             capture_micros: captured_micros,
             source_seq: next_encoded_video_unit_seq(),
             is_recovery: nal.is_recovery,
+            video_epoch,
         });
     }
     encoded_bytes
@@ -1949,6 +2746,7 @@ fn encode_and_broadcast(
     input: &InputRuntime,
     frame: &capture::CapturedFrame,
     captured_micros: u64,
+    video_epoch: u64,
 ) -> usize {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     input.update_cursor(frame.cursor.as_ref());
@@ -2049,6 +2847,7 @@ fn encode_and_broadcast(
                     capture_micros: captured_micros,
                     source_seq: next_encoded_video_unit_seq(),
                     is_recovery: nal.is_recovery,
+                    video_epoch,
                 });
             }
             encoded_bytes
@@ -2403,30 +3202,302 @@ fn client_display_fps_hint(display: Option<ClientDisplayInfo>) -> Option<u32> {
     }
 }
 
+fn wait_for_previous_pipeline_stop(state: &ServerState) {
+    if let Some(handle) = state.pending_pipeline_stop.lock().unwrap().take() {
+        println!("[pipeline] Waiting for previous pipeline to finish stopping...");
+        let _ = handle.join();
+        println!("[pipeline] Previous pipeline stopped.");
+    }
+}
+
+fn request_video_profile(
+    capture_state: &SharedCaptureState,
+    capabilities: AggregateVideoCapabilities,
+    registry_revision: u64,
+    revision_source: Arc<AtomicU64>,
+    commit_lock: Arc<Mutex<()>>,
+    cancelled: Arc<AtomicBool>,
+    admission: Option<AdmissionStamp>,
+) -> Result<StreamSnapshot, String> {
+    let (response_tx, response_rx) = bounded(1);
+    capture_state
+        .cmd_tx
+        .send_timeout(
+            CaptureCommand::SetVideoCapabilities(ProfileRequest {
+                capabilities,
+                registry_revision,
+                revision_source,
+                commit_lock,
+                cancelled: Arc::clone(&cancelled),
+                admission,
+                response: response_tx,
+            }),
+            Duration::from_secs(1),
+        )
+        .map_err(|_| "shared pipeline is not accepting profile changes".to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("video profile request was cancelled".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            cancelled.store(true, Ordering::Release);
+            return Err("timed out opening the shared video profile".into());
+        }
+        match response_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(result) => return result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("shared video profile worker disconnected".into());
+            }
+        }
+    }
+}
+
+fn setup_client_pipeline(
+    state: &Arc<ServerState>,
+    membership_id: u64,
+    cancelled: Arc<AtomicBool>,
+    admission: &AdmissionPermit,
+) -> Result<PipelineSetup, String> {
+    loop {
+        if cancelled.load(Ordering::Acquire) || !admission.is_current() {
+            return Err("joining video capability membership was cancelled".into());
+        }
+        state.pipeline_stop.wait(&cancelled)?;
+        let (capabilities, registry_revision) = {
+            let registry = state.video_capabilities.lock().unwrap();
+            if !registry.is_tentative(membership_id) {
+                return Err("joining video capability membership was cancelled".into());
+            }
+            (registry.aggregate()?, registry.revision())
+        };
+
+        let mut dead_pipeline = None;
+        let reservation = {
+            let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
+            let mut pipeline = state.pipeline.lock().unwrap();
+            if pipeline
+                .as_ref()
+                .is_some_and(|pipeline| pipeline.pipeline_handle.is_finished())
+            {
+                println!("[pipeline] Pipeline thread died, will restart...");
+                dead_pipeline = pipeline.take();
+                None
+            } else {
+                pipeline
+                    .as_ref()
+                    .map(|pipeline| ClientPipelineReservation::new(pipeline, state))
+                    .transpose()?
+            }
+        };
+        if let Some(dead) = dead_pipeline {
+            dead.stop();
+            continue;
+        }
+
+        if let Some(reservation) = reservation {
+            let snapshot = match request_video_profile(
+                &reservation.capture_state,
+                capabilities,
+                registry_revision,
+                Arc::clone(&state.profile_revision),
+                Arc::clone(&state.profile_commit),
+                Arc::clone(&cancelled),
+                Some(AdmissionStamp {
+                    token: admission.token,
+                    coordinator: Arc::clone(&admission.coordinator),
+                }),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(_error)
+                    if !cancelled.load(Ordering::Acquire)
+                        && state.profile_revision.load(Ordering::Acquire) != registry_revision =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            let _commit_guard = state.profile_commit.lock().unwrap();
+            let mut registry = state.video_capabilities.lock().unwrap();
+            let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
+            let pipeline = state.pipeline.lock().unwrap();
+            let pipeline_is_current = pipeline.as_ref().is_some_and(|pipeline| {
+                pipeline.instance_id == reservation.pipeline_instance_id
+                    && !pipeline.pipeline_handle.is_finished()
+            });
+            if cancelled.load(Ordering::Acquire)
+                || !admission.is_current()
+                || registry.revision() != registry_revision
+                || !registry.is_tentative(membership_id)
+                || !pipeline_is_current
+            {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err("joining video capability membership was cancelled".into());
+                }
+                continue;
+            }
+            if !registry.activate_if_revision(membership_id, registry_revision) {
+                continue;
+            }
+            state
+                .profile_revision
+                .store(registry.revision(), Ordering::Release);
+            return Ok(reservation.commit(snapshot));
+        }
+
+        if state
+            .pipeline_starting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let _start_guard = PipelineStartGuard(&state.pipeline_starting);
+        println!("[pipeline] Starting shared pipeline...");
+        let (started, subscription) = match SharedPipeline::start(
+            capabilities,
+            Arc::clone(&state.input),
+            Arc::clone(&state.control),
+            state,
+            Arc::clone(&cancelled),
+        ) {
+            Ok(started) => started,
+            Err(_error)
+                if !cancelled.load(Ordering::Acquire)
+                    && state.profile_revision.load(Ordering::Acquire) != registry_revision =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let snapshot = started
+            .capture_state
+            .snapshot()
+            .ok_or_else(|| "pipeline started without a stream config".to_string())?;
+        let mut started = Some(started);
+        let mut subscription = Some(subscription);
+
+        let committed = {
+            let _commit_guard = state.profile_commit.lock().unwrap();
+            let mut registry = state.video_capabilities.lock().unwrap();
+            let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
+            let mut pipeline = state.pipeline.lock().unwrap();
+            if !cancelled.load(Ordering::Acquire)
+                && admission.is_current()
+                && registry.revision() == registry_revision
+                && registry.is_tentative(membership_id)
+                && pipeline.is_none()
+                && registry.activate_if_revision(membership_id, registry_revision)
+            {
+                let pipeline_to_commit = started.as_ref().expect("started pipeline missing");
+                state
+                    .profile_revision
+                    .store(registry.revision(), Ordering::Release);
+                let setup = (
+                    subscription.take().expect("started subscription missing"),
+                    snapshot,
+                    Arc::clone(&pipeline_to_commit.rate_control),
+                    pipeline_to_commit.session_debug.clone(),
+                    Arc::clone(&pipeline_to_commit.capture_state),
+                );
+                *pipeline = started.take();
+                Some(setup)
+            } else {
+                None
+            }
+        };
+        if let Some(setup) = committed {
+            return Ok(setup);
+        }
+        started.expect("uncommitted pipeline missing").stop();
+        if cancelled.load(Ordering::Acquire) {
+            return Err("joining video capability membership was cancelled".into());
+        }
+    }
+}
+
+fn admit_client_pipeline(
+    state: &Arc<ServerState>,
+    capabilities: ClientVideoCapabilities,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(PipelineSetup, VideoMembership), String> {
+    let admission = state.admission.acquire(Arc::clone(&cancelled))?;
+    let membership = begin_video_membership(state, capabilities);
+    let setup = setup_client_pipeline(
+        state,
+        membership.id,
+        Arc::clone(&cancelled),
+        &admission,
+    )?;
+    Ok((setup, membership))
+}
+
+fn reconcile_video_profile(state: &Arc<ServerState>) -> Result<(), String> {
+    loop {
+        let (capabilities, registry_revision) = {
+            let registry = state.video_capabilities.lock().unwrap();
+            if registry.is_empty() {
+                return Ok(());
+            }
+            (registry.aggregate()?, registry.revision())
+        };
+        let capture_state = {
+            let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
+            let pipeline = state.pipeline.lock().unwrap();
+            let Some(active) = pipeline.as_ref() else {
+                return Ok(());
+            };
+            Arc::clone(&active.capture_state)
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        match request_video_profile(
+            &capture_state,
+            capabilities,
+            registry_revision,
+            Arc::clone(&state.profile_revision),
+            Arc::clone(&state.profile_commit),
+            cancelled,
+            None,
+        ) {
+            Ok(_) if state.profile_revision.load(Ordering::Acquire) == registry_revision => {
+                return Ok(())
+            }
+            Ok(_) => continue,
+            Err(_error) if state.profile_revision.load(Ordering::Acquire) != registry_revision => {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Unsubscribe from broadcasters and stop the pipeline (in a background thread)
 /// if no subscribers remain.
 fn unsubscribe_and_maybe_stop_pipeline(
     state: &Arc<ServerState>,
+    pipeline_instance_id: u64,
     vid_sub_id: u64,
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))] aud_sub_id: u64,
 ) {
-    let pipeline_to_stop = {
-        let mut pipeline = state.pipeline.lock().unwrap();
-        let should_stop = if let Some(p) = pipeline.as_ref() {
-            p.video_bc.unsubscribe(vid_sub_id);
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            p.audio_bc.unsubscribe(aud_sub_id);
-            p.video_bc.subscriber_count() == 0
-        } else {
-            false
-        };
-        if should_stop {
-            pipeline.take()
-        } else {
-            None
-        }
+    let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
+    let mut pipeline = state.pipeline.lock().unwrap();
+    let should_stop = if let Some(p) = pipeline
+        .as_ref()
+        .filter(|pipeline| pipeline.instance_id == pipeline_instance_id)
+    {
+        p.video_bc.unsubscribe(vid_sub_id);
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        p.audio_bc.unsubscribe(aud_sub_id);
+        p.video_bc.occupied_count() == 0
+    } else {
+        false
     };
-    if let Some(pipeline) = pipeline_to_stop {
+    if should_stop {
+        let pipeline = pipeline.take().expect("pipeline checked above");
         println!("[pipeline] No viewers left, stopping shared pipeline...");
         let stop_handle = std::thread::spawn(move || {
             pipeline.stop();
@@ -2717,12 +3788,8 @@ async fn handle_client(
     if registered_client.disconnect_requested() {
         return;
     }
-    let client_requested_fps = client_display_fps_hint(startup_prefs.display);
-    let client_supported_codecs = client_supported_video_codecs(startup_prefs.display);
-    let client_hardware_codecs = client_hardware_video_codecs(startup_prefs.display);
-    let client_supported_yuv444_codecs =
-        client_supported_yuv444_video_codecs(startup_prefs.display);
-    let client_hardware_yuv444_codecs = client_hardware_yuv444_video_codecs(startup_prefs.display);
+    let video_capabilities = client_video_capabilities(startup_prefs.display);
+    let client_requested_fps = video_capabilities.requested_fps;
     if let Some(display) = startup_prefs.display {
         println!(
             "[client {addr}] display refresh hint: {:.3} Hz, media udp port: {}",
@@ -2738,15 +3805,15 @@ async fn handle_client(
         );
     }
 
-    // Ensure shared pipeline is running and subscribe (blocking work)
+    // Tentative membership participates in the all-client profile before this
+    // handler can subscribe to media. The RAII guard removes it on every direct
+    // cancellation/error path and triggers an upgrade after active disconnect.
+    let video_membership = begin_video_membership(&state, video_capabilities);
     let state2 = Arc::clone(&state);
-    let requested_fps_for_setup = client_requested_fps;
-    let supported_codecs_for_setup = client_supported_codecs;
-    let hardware_codecs_for_setup = client_hardware_codecs;
-    let supported_yuv444_codecs_for_setup = client_supported_yuv444_codecs;
-    let hardware_yuv444_codecs_for_setup = client_hardware_yuv444_codecs;
-    let hdr_display_for_setup = client_hdr_display(startup_prefs.display);
-    let setup = tokio::task::spawn_blocking(move || -> Result<PipelineSetup, String> {
+    let membership_id = video_membership.id;
+    let membership_cancelled = Arc::clone(&video_membership.cancelled);
+    let setup_worker_cancelled = Arc::clone(&membership_cancelled);
+    let mut setup_task = tokio::task::spawn_blocking(move || -> Result<PipelineSetup, String> {
         // Wake the display on every client connect, before any first-frame wait.
         // On Wayland (PipeWire / wlroots) and KMS the compositor/kernel stops
         // driving frames when the monitor is in DPMS off, which would otherwise
@@ -2755,88 +3822,28 @@ async fn handle_client(
         // a re-blanked display also wakes it, not only the first. Disable with
         // ST_WAKE_ON_CONNECT=0.
         trigger_screen_wake(&state2.control);
-        // Wait for any previous pipeline stop to finish before starting a new one.
-        // Without this, the new capture backend may fail because the old one still
-        // holds exclusive resources (PipeWire portal session, KMS, etc.).
-        if let Some(handle) = state2.pending_pipeline_stop.lock().unwrap().take() {
-            println!("[pipeline] Waiting for previous pipeline to finish stopping...");
-            let _ = handle.join();
-            println!("[pipeline] Previous pipeline stopped.");
-        }
-
-        let mut pipeline = state2.pipeline.lock().unwrap();
-        // Remove dead pipeline (capture died, portal closed, etc.)
-        if let Some(p) = pipeline.as_ref() {
-            if p.pipeline_handle.is_finished() {
-                println!("[pipeline] Pipeline thread died, will restart...");
-                let p = pipeline.take().unwrap();
-                p.stop();
+        setup_client_pipeline(&state2, membership_id, setup_worker_cancelled)
+    });
+    let setup = loop {
+        tokio::select! {
+            result = &mut setup_task => {
+                break result.unwrap_or_else(|error| Err(format!("pipeline setup worker failed: {error}")));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                let mut probe = [0u8; 1];
+                let peer_closed = matches!(
+                    tokio::time::timeout(Duration::from_millis(1), stream.peek(&mut probe)).await,
+                    Ok(Ok(0)) | Ok(Err(_))
+                );
+                if registered_client.disconnect_requested() || peer_closed {
+                    membership_cancelled.store(true, Ordering::Release);
+                    return;
+                }
             }
         }
-        if pipeline.is_none() {
-            println!("[pipeline] Starting shared pipeline...");
-            let (started, sub) = SharedPipeline::start(
-                requested_fps_for_setup,
-                supported_codecs_for_setup,
-                hardware_codecs_for_setup,
-                supported_yuv444_codecs_for_setup,
-                hardware_yuv444_codecs_for_setup,
-                hdr_display_for_setup,
-                Arc::clone(&state2.input),
-                Arc::clone(&state2.control),
-            )?;
-            let stream_config = started.stream_config;
-            let rate_control = Arc::clone(&started.rate_control);
-            let session_debug = started.session_debug.clone();
-            let capture_state = Arc::clone(&started.capture_state);
-            *pipeline = Some(started);
-            return Ok((
-                sub,
-                stream_config,
-                rate_control,
-                session_debug,
-                capture_state,
-            ));
-        }
-        let p = pipeline.as_ref().unwrap();
-        if !supported_codecs_for_setup.supports(p.stream_config.codec) {
-            return Err(format!(
-                "Active stream codec '{}' is not supported by this client",
-                codec_name(p.stream_config.codec)
-            ));
-        }
-        if p.stream_config.chroma == VideoChromaSampling::Yuv444
-            && !supported_yuv444_codecs_for_setup.supports(p.stream_config.codec)
-        {
-            return Err(format!(
-                "Active stream chroma '{}' is not supported by this client for codec '{}'",
-                stream_chroma_name(p.stream_config.chroma),
-                codec_name(p.stream_config.codec)
-            ));
-        }
-        let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        let (aud_id, aud_rx) = p.audio_bc.subscribe(30)?;
-        Ok((
-            ClientSubscription {
-                vid_sub_id: vid_id,
-                vid_rx,
-                video_bc: Arc::clone(&p.video_bc),
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                aud_sub_id: aud_id,
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                aud_rx,
-            },
-            p.stream_config,
-            Arc::clone(&p.rate_control),
-            p.session_debug.clone(),
-            Arc::clone(&p.capture_state),
-        ))
-    })
-    .await
-    .unwrap();
+    };
 
-    let (sub, stream_config, rate_control, session_debug, capture_state) = match setup {
+    let (sub, startup_snapshot, rate_control, session_debug, capture_state) = match setup {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Pipeline error for {addr}: {e}");
@@ -2852,6 +3859,7 @@ async fn handle_client(
         let _ = state.input.release_control(client_id);
         unsubscribe_and_maybe_stop_pipeline(
             &state,
+            sub.pipeline_instance_id,
             sub.vid_sub_id,
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             sub.aud_sub_id,
@@ -2861,9 +3869,7 @@ async fn handle_client(
     rate_control.register_client(sub.vid_sub_id);
     let mut bitrate_controller = ClientRateController::from_state(rate_control.as_ref());
     let controller_state = state.input.controller_state_for(client_id);
-    // A client joining after an output switch must get the post-switch config
-    // (the pipeline's stored config is the pre-switch one).
-    let stream_config = capture_state.updated_config().unwrap_or(stream_config);
+    let stream_config = startup_snapshot.config;
     if let Some(requested_fps) = client_requested_fps {
         if stream_config.framerate as u32 != requested_fps {
             println!(
@@ -2932,6 +3938,7 @@ async fn handle_client(
             let _ = state.input.release_control(client_id);
             unsubscribe_and_maybe_stop_pipeline(
                 &state,
+                sub.pipeline_instance_id,
                 sub.vid_sub_id,
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 sub.aud_sub_id,
@@ -2944,6 +3951,7 @@ async fn handle_client(
             let _ = state.input.release_control(client_id);
             unsubscribe_and_maybe_stop_pipeline(
                 &state,
+                sub.pipeline_instance_id,
                 sub.vid_sub_id,
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 sub.aud_sub_id,
@@ -2956,6 +3964,7 @@ async fn handle_client(
         let _ = state.input.release_control(client_id);
         unsubscribe_and_maybe_stop_pipeline(
             &state,
+            sub.pipeline_instance_id,
             sub.vid_sub_id,
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             sub.aud_sub_id,
@@ -3051,7 +4060,9 @@ async fn handle_client(
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     let mut last_controller_state = controller_state;
-    let mut last_config_generation = capture_state.generation();
+    let mut last_config_generation = startup_snapshot.generation;
+    let mut last_video_epoch = startup_snapshot.video_epoch;
+    let mut last_selection_generation = startup_snapshot.selection_generation;
     // Direct-path liveness: the OS TCP keepalive default is ~2h, so a silent
     // network drop (wifi off, NAT rebind, peer crash without RST) would leave
     // this loop spinning on the 16ms read timeout forever, holding the
@@ -3079,17 +4090,21 @@ async fn handle_client(
         // An output switch (any client) reconfigures the shared stream — push
         // the new StreamConfig so this client re-inits its decoder for the new
         // resolution. The rebuilt encoder already starts with a keyframe.
-        if capture_state.generation() != last_config_generation {
-            last_config_generation = capture_state.generation();
-            if let Some(new_config) = capture_state.updated_config() {
-                let mut buf = ControlMessage::StreamConfig(new_config).serialize();
-                buf.extend_from_slice(
-                    &ControlMessage::SelectOutput(capture_state.selected()).serialize(),
-                );
-                if stream.write_all(&buf).await.is_err() {
-                    break;
-                }
+        if let Some(snapshot) = capture_state.snapshot().filter(|snapshot| {
+            snapshot.generation != last_config_generation
+                || snapshot.video_epoch != last_video_epoch
+                || snapshot.selection_generation != last_selection_generation
+        }) {
+            last_config_generation = snapshot.generation;
+            let mut buf = ControlMessage::StreamConfig(snapshot.config).serialize();
+            buf.extend_from_slice(
+                &ControlMessage::SelectOutput(capture_state.selected()).serialize(),
+            );
+            if stream.write_all(&buf).await.is_err() {
+                break;
             }
+            last_video_epoch = snapshot.video_epoch;
+            last_selection_generation = snapshot.selection_generation;
         }
         let mut clipboard_write_failed = false;
         while let Ok(message) = clipboard_control_rx.try_recv() {
@@ -3221,9 +4236,7 @@ async fn handle_client(
                         }
                         ControlMessage::SelectOutput(id) => {
                             println!("[client {addr}] requested capture output {id}");
-                            let _ = capture_state
-                                .cmd_tx
-                                .try_send(CaptureCommand::SelectOutput(id));
+                            capture_state.request_output(id);
                         }
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
@@ -3334,6 +4347,7 @@ async fn handle_client(
 
     unsubscribe_and_maybe_stop_pipeline(
         &state,
+        sub.pipeline_instance_id,
         sub.vid_sub_id,
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         sub.aud_sub_id,
@@ -3875,7 +4889,7 @@ fn handle_punched_client(
             }
         }
     }
-    let _client_display = match client_display {
+    let client_display = match client_display {
         Some(d) => d,
         None => {
             eprintln!("[{tag}] Timeout waiting for ClientDisplayInfo from {peer}");
@@ -3886,97 +4900,41 @@ fn handle_punched_client(
     let registered_client = state.control.register_client(peer);
     let client_id = state.input.allocate_client_id();
 
-    let client_supported_codecs = _client_display.supported_video_codecs;
-    let client_hardware_codecs = _client_display.hardware_video_codecs;
-    let client_supported_yuv444_codecs = _client_display.supported_yuv444_video_codecs;
-    let client_hardware_yuv444_codecs = _client_display.hardware_yuv444_video_codecs;
-    let client_requested_fps = if _client_display.max_refresh_millihz > 0 {
-        Some(_client_display.max_refresh_millihz / 1000)
-    } else {
-        None
-    };
+    let video_capabilities = client_video_capabilities(Some(client_display));
+    let video_membership = begin_video_membership(&state, video_capabilities);
 
     // --- Start/subscribe to pipeline ---
-    let state2 = Arc::clone(&state);
-    let setup: Result<PipelineSetup, String> = (|| {
-        if let Some(handle) = state2.pending_pipeline_stop.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-        let mut pipeline = state2.pipeline.lock().unwrap();
-        if let Some(p) = pipeline.as_ref() {
-            if p.pipeline_handle.is_finished() {
-                let p = pipeline.take().unwrap();
-                p.stop();
+    trigger_screen_wake(&state.control);
+    let (setup_tx, setup_rx) = bounded(1);
+    let setup_state = Arc::clone(&state);
+    let setup_cancelled = Arc::clone(&video_membership.cancelled);
+    let setup_worker_cancelled = Arc::clone(&setup_cancelled);
+    let membership_id = video_membership.id;
+    std::thread::spawn(move || {
+        let result = setup_client_pipeline(&setup_state, membership_id, setup_worker_cancelled);
+        let _ = setup_tx.send(result);
+    });
+    let setup_deadline = Instant::now() + Duration::from_secs(35);
+    let setup = loop {
+        match setup_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => break result,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                break Err("pipeline setup worker disconnected".into())
             }
-        }
-        if pipeline.is_none() {
-            match SharedPipeline::start(
-                client_requested_fps,
-                client_supported_codecs,
-                client_hardware_codecs,
-                client_supported_yuv444_codecs,
-                client_hardware_yuv444_codecs,
-                _client_display.hdr_display,
-                Arc::clone(&state2.input),
-                Arc::clone(&state2.control),
-            ) {
-                Ok((started, sub)) => {
-                    let sc = started.stream_config;
-                    let rc = Arc::clone(&started.rate_control);
-                    let sd = started.session_debug.clone();
-                    let cs = Arc::clone(&started.capture_state);
-                    *pipeline = Some(started);
-                    Ok((sub, sc, rc, sd, cs))
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                punched.tick();
+                if registered_client.disconnect_requested()
+                    || punched.is_closed()
+                    || Instant::now() >= setup_deadline
+                {
+                    setup_cancelled.store(true, Ordering::Release);
+                    return;
                 }
-                Err(e) => Err(e),
-            }
-        } else {
-            let p = pipeline.as_ref().unwrap();
-            if !client_supported_codecs.supports(p.stream_config.codec) {
-                Err(format!(
-                    "Active stream codec '{}' not supported by punched client",
-                    codec_name(p.stream_config.codec)
-                ))
-            } else if p.stream_config.chroma == VideoChromaSampling::Yuv444
-                && !client_supported_yuv444_codecs.supports(p.stream_config.codec)
-            {
-                Err(format!(
-                    "Active stream chroma '{}' not supported by punched client for codec '{}'",
-                    stream_chroma_name(p.stream_config.chroma),
-                    codec_name(p.stream_config.codec)
-                ))
-            } else {
-                let (vid_id, vid_rx) = p.video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                let (aud_id, aud_rx) = p.audio_bc.subscribe(30)?;
-                Ok((
-                    ClientSubscription {
-                        vid_sub_id: vid_id,
-                        vid_rx,
-                        video_bc: Arc::clone(&p.video_bc),
-                        #[cfg(any(
-                            target_os = "linux",
-                            target_os = "windows",
-                            target_os = "macos"
-                        ))]
-                        aud_sub_id: aud_id,
-                        #[cfg(any(
-                            target_os = "linux",
-                            target_os = "windows",
-                            target_os = "macos"
-                        ))]
-                        aud_rx,
-                    },
-                    p.stream_config,
-                    Arc::clone(&p.rate_control),
-                    p.session_debug.clone(),
-                    Arc::clone(&p.capture_state),
-                ))
             }
         }
-    })();
+    };
 
-    let (sub, stream_config, rate_control, session_debug, capture_state) = match setup {
+    let (sub, startup_snapshot, rate_control, session_debug, capture_state) = match setup {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[{tag}] Pipeline error for {peer}: {e}");
@@ -3987,8 +4945,7 @@ fn handle_punched_client(
 
     rate_control.register_client(sub.vid_sub_id);
     let controller_state = state.input.controller_state_for(client_id);
-    // Late joiners after an output switch need the post-switch config.
-    let stream_config = capture_state.updated_config().unwrap_or(stream_config);
+    let stream_config = startup_snapshot.config;
     let input_credential = input::generate_input_credential();
     let input_registration = state
         .input
@@ -4042,6 +4999,7 @@ fn handle_punched_client(
         let _ = state.input.release_control(client_id);
         unsubscribe_and_maybe_stop_pipeline(
             &state,
+            sub.pipeline_instance_id,
             sub.vid_sub_id,
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             sub.aud_sub_id,
@@ -4130,7 +5088,9 @@ fn handle_punched_client(
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     let mut last_controller_state = controller_state;
-    let mut last_config_generation = capture_state.generation();
+    let mut last_config_generation = startup_snapshot.generation;
+    let mut last_video_epoch = startup_snapshot.video_epoch;
+    let mut last_selection_generation = startup_snapshot.selection_generation;
     let _ = punched.set_nonblocking(false);
     let _ = punched.set_read_timeout(Some(Duration::from_millis(50)));
 
@@ -4163,14 +5123,22 @@ fn handle_punched_client(
         }
         // Re-sync this client's decoder after an output switch reconfigured the
         // shared stream (see direct-path handler for rationale).
-        if capture_state.generation() != last_config_generation {
-            last_config_generation = capture_state.generation();
-            if let Some(new_config) = capture_state.updated_config() {
-                let _ = punched.send_control(&ControlMessage::StreamConfig(new_config).serialize());
-                let _ = punched.send_control(
-                    &ControlMessage::SelectOutput(capture_state.selected()).serialize(),
-                );
+        if let Some(snapshot) = capture_state.snapshot().filter(|snapshot| {
+            snapshot.generation != last_config_generation
+                || snapshot.video_epoch != last_video_epoch
+                || snapshot.selection_generation != last_selection_generation
+        }) {
+            last_config_generation = snapshot.generation;
+            if punched
+                .send_control(&ControlMessage::StreamConfig(snapshot.config).serialize())
+                .is_err()
+            {
+                break;
             }
+            let _ = punched
+                .send_control(&ControlMessage::SelectOutput(capture_state.selected()).serialize());
+            last_video_epoch = snapshot.video_epoch;
+            last_selection_generation = snapshot.selection_generation;
         }
         while let Ok(message) = clipboard_control_rx.try_recv() {
             let _ = punched.send_control(&message.serialize());
@@ -4248,9 +5216,7 @@ fn handle_punched_client(
                             sub.video_bc.request_keyframe();
                         }
                         ControlMessage::SelectOutput(id) => {
-                            let _ = capture_state
-                                .cmd_tx
-                                .try_send(CaptureCommand::SelectOutput(id));
+                            capture_state.request_output(id);
                         }
                         ControlMessage::ClipboardText(text) => {
                             clipboard_sync.set_remote_text(text);
@@ -4361,6 +5327,7 @@ fn handle_punched_client(
     rate_control.unregister_client(sub.vid_sub_id);
     unsubscribe_and_maybe_stop_pipeline(
         &state,
+        sub.pipeline_instance_id,
         sub.vid_sub_id,
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         sub.aud_sub_id,
@@ -4637,7 +5604,12 @@ fn build_server_state(
     input.spawn_listener(listen_port);
     Arc::new(ServerState {
         pipeline: Mutex::new(None),
+        pipeline_starting: AtomicBool::new(false),
         pending_pipeline_stop: Mutex::new(None),
+        pipeline_lifecycle: Mutex::new(()),
+        profile_revision: Arc::new(AtomicU64::new(0)),
+        profile_commit: Arc::new(Mutex::new(())),
+        video_capabilities: Mutex::new(VideoCapabilityRegistry::default()),
         input,
         control,
         listen_port,
@@ -4834,6 +5806,85 @@ fn main() {
     if let Err(err) = run_server_runtime(state) {
         eprintln!("{err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod video_transition_tests {
+    use super::*;
+
+    fn config(codec: VideoCodec, framerate: u16) -> StreamConfig {
+        StreamConfig {
+            video_epoch: 0,
+            codec,
+            width: 1920,
+            height: 1080,
+            framerate,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+            hdr: false,
+            chroma: VideoChromaSampling::Yuv420,
+            packet_duration_ms: 5,
+        }
+    }
+
+    #[test]
+    fn stale_rebuild_revision_cannot_replace_new_profile() {
+        assert!(!rebuild_revision_is_current(4, 5));
+        assert!(rebuild_revision_is_current(5, 5));
+    }
+
+    #[test]
+    fn startup_snapshot_observes_concurrent_config_generation() {
+        let (command_tx, _command_rx) = bounded(1);
+        let state = SharedCaptureState::new(command_tx);
+        let startup = state.initialize_config(config(VideoCodec::Hevc, 120));
+        let current = state.commit_encoder_config(config(VideoCodec::H264, 60));
+
+        assert!(current.generation > startup.generation);
+        assert_eq!(state.snapshot(), Some(current));
+        assert_ne!(startup.video_epoch, current.video_epoch);
+    }
+
+    #[test]
+    fn same_resolution_output_switch_publishes_new_selection_and_media_epoch() {
+        let (command_tx, _command_rx) = bounded(1);
+        let state = SharedCaptureState::new(command_tx);
+        let initial = state.initialize_config(config(VideoCodec::H264, 60));
+        let switched = state.commit_output_selection(config(VideoCodec::H264, 60));
+
+        assert_eq!(switched.generation, initial.generation);
+        assert!(switched.selection_generation > initial.selection_generation);
+        assert!(switched.video_epoch > initial.video_epoch);
+        assert_eq!(switched.config.video_epoch, switched.video_epoch);
+    }
+
+    #[test]
+    fn cancelled_or_stale_profile_request_cannot_commit() {
+        let revision_source = Arc::new(AtomicU64::new(7));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (response, _response_rx) = bounded(1);
+        let request = ProfileRequest {
+            capabilities: AggregateVideoCapabilities {
+                supported_codecs: VideoCodecSupport::h264_only(),
+                hardware_codecs: VideoCodecSupport::h264_only(),
+                supported_yuv444_codecs: VideoCodecSupport::empty(),
+                hardware_yuv444_codecs: VideoCodecSupport::empty(),
+                hdr_display: false,
+                requested_fps: Some(60),
+            },
+            registry_revision: 7,
+            revision_source: Arc::clone(&revision_source),
+            commit_lock: Arc::new(Mutex::new(())),
+            cancelled: Arc::clone(&cancelled),
+            response,
+        };
+        assert!(request.is_current());
+        revision_source.store(8, Ordering::Release);
+        assert!(!request.is_current());
+        revision_source.store(7, Ordering::Release);
+        cancelled.store(true, Ordering::Release);
+        assert!(!request.is_current());
     }
 }
 

@@ -313,13 +313,6 @@ impl EncoderConfig {
         next
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn with_chroma_sampling(&self, chroma: ChromaSampling) -> Self {
-        let mut next = self.clone();
-        next.chroma = chroma;
-        next
-    }
-
     pub fn is_hdr(&self) -> bool {
         self.dynamic_range == DynamicRange::Hdr
     }
@@ -485,6 +478,8 @@ impl EncoderConfig {
 
     pub fn to_stream_config(&self, audio: &AudioConfig) -> StreamConfig {
         StreamConfig {
+            // Assigned atomically when the pipeline publishes this profile.
+            video_epoch: 0,
             codec: self.stream_codec(),
             width: self.width,
             height: self.height,
