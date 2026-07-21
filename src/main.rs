@@ -1373,43 +1373,43 @@ struct ServerState {
 
 #[derive(Default)]
 struct PipelineStopCoordinator {
-    stopping: Mutex<bool>,
+    /// Number of background pipeline-stop joins still in flight.
+    active: Mutex<usize>,
     changed: Condvar,
 }
 
 impl PipelineStopCoordinator {
+    /// Track a background pipeline-stop join. More than one stop can be in
+    /// flight at once — a fresh pipeline may start (after `wait` observed no
+    /// outstanding stops) while a prior instance is still joining, then itself
+    /// go idle before that join finishes — so this counts stops rather than
+    /// asserting a single one.
     fn register(self: &Arc<Self>, handle: std::thread::JoinHandle<()>) {
-        {
-            let mut stopping = self.stopping.lock().unwrap();
-            assert!(!*stopping, "pipeline stop already in progress");
-            *stopping = true;
-        }
+        *self.active.lock().unwrap() += 1;
         let coordinator = Arc::clone(self);
         std::thread::spawn(move || {
             let _ = handle.join();
-            *coordinator.stopping.lock().unwrap() = false;
+            let mut active = coordinator.active.lock().unwrap();
+            *active = active.saturating_sub(1);
             coordinator.changed.notify_all();
         });
     }
 
+    /// Block until every outstanding pipeline stop has finished joining, so a
+    /// fresh pipeline never starts while a prior instance still holds capture.
     fn wait(&self, cancelled: &AtomicBool) -> Result<(), String> {
-        let mut stopping = self.stopping.lock().unwrap();
-        while *stopping {
+        let mut active = self.active.lock().unwrap();
+        while *active > 0 {
             if cancelled.load(Ordering::Acquire) {
                 return Err("pipeline setup cancelled while prior capture was stopping".into());
             }
-            stopping = self
+            active = self
                 .changed
-                .wait_timeout(stopping, Duration::from_millis(100))
+                .wait_timeout(active, Duration::from_millis(100))
                 .unwrap()
                 .0;
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn is_stopping(&self) -> bool {
-        *self.stopping.lock().unwrap()
     }
 }
 
