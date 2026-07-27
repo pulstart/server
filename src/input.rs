@@ -1636,6 +1636,10 @@ impl InputRuntimeInner {
         let injected = match &mut self.backend {
             #[cfg(test)]
             InputBackend::Test(controller) => controller.text(_text),
+            #[cfg(target_os = "linux")]
+            InputBackend::X11(controller) => controller.text(_text),
+            #[cfg(target_os = "linux")]
+            InputBackend::PortalRemoteDesktop(controller) => inject_portal_text(controller, _text),
             #[cfg(target_os = "windows")]
             InputBackend::Windows(controller) => controller.text(_text),
             #[cfg(target_os = "macos")]
@@ -2181,7 +2185,7 @@ fn select_linux_backend(
                     separate_cursor: true,
                     hover_capture: true,
                     cursor_position_reliable: true,
-                    text_input: false,
+                    text_input: true,
                 },
                 "x11/xtest",
             )),
@@ -2213,7 +2217,7 @@ fn select_linux_backend(
                     separate_cursor: false,
                     hover_capture: true,
                     cursor_position_reliable: false,
-                    text_input: false,
+                    text_input: true,
                 },
                 "x11/xtest",
             )),
@@ -2261,7 +2265,7 @@ fn select_linux_backend(
                         separate_cursor: true,
                         hover_capture: true,
                         cursor_position_reliable: true,
-                        text_input: false,
+                        text_input: true,
                     },
                     "portal/remote-desktop",
                 ))
@@ -3573,6 +3577,25 @@ mod x11_ffi {
         pub fn XKeysymToKeycode(display: *mut Display, keysym: KeySym) -> c_uchar;
         pub fn XStringToKeysym(string: *const c_char) -> KeySym;
         pub fn XSync(display: *mut Display, discard: Bool) -> c_int;
+        pub fn XFree(data: *mut c_void) -> c_int;
+        pub fn XDisplayKeycodes(
+            display: *mut Display,
+            min_keycodes_return: *mut c_int,
+            max_keycodes_return: *mut c_int,
+        ) -> c_int;
+        pub fn XGetKeyboardMapping(
+            display: *mut Display,
+            first_keycode: c_uchar,
+            keycode_count: c_int,
+            keysyms_per_keycode_return: *mut c_int,
+        ) -> *mut KeySym;
+        pub fn XChangeKeyboardMapping(
+            display: *mut Display,
+            first_keycode: c_int,
+            keysyms_per_keycode: c_int,
+            keysyms: *const KeySym,
+            num_codes: c_int,
+        ) -> c_int;
         pub fn XQueryPointer(
             display: *mut Display,
             w: Window,
@@ -3772,6 +3795,178 @@ impl X11InputController {
             self.button(button, true);
             self.button(button, false);
         }
+    }
+
+    /// Type committed Unicode text (IME output, a pasted string, a Cyrillic
+    /// keyboard) that no physical key on the remote layout can produce.
+    ///
+    /// XTest can only fake *keycodes*, and a keycode means whatever the active
+    /// layout maps it to — so there is no keycode for "б" on a US layout. The
+    /// standard way around that (what `xdotool type` does) is to borrow a
+    /// keycode the layout doesn't use, point it at the character's Unicode
+    /// keysym, press it, and put it back. Restoring the mapping matters: leaving
+    /// a hijacked keycode behind would corrupt the user's own keyboard.
+    fn text(&mut self, text: &str) -> bool {
+        let Some(scratch) = self.find_scratch_keycodes(X11_TEXT_BATCH_KEYCODES) else {
+            eprintln!("[input] x11 text injection: no unused keycode available");
+            return false;
+        };
+        let characters: Vec<char> = text.chars().collect();
+        let mut injected = false;
+        // Remap a whole batch of borrowed keycodes, settle once, then fire the
+        // batch. The settle is per batch rather than per character: toolkits
+        // refresh their keymap from MappingNotify asynchronously, so a keypress
+        // sent immediately after its remap can be read with the stale mapping —
+        // but that cost only has to be paid once per remap round, and paying it
+        // per character would make pasting a paragraph take tens of seconds
+        // while holding the input lock.
+        for batch in characters.chunks(scratch.keycodes.len()) {
+            let mut mapped = Vec::with_capacity(batch.len());
+            for (keycode, character) in scratch.keycodes.iter().zip(batch) {
+                let keysym = unicode_keysym(*character) as x11_ffi::KeySym;
+                if self.remap_keycode(*keycode, scratch.per_keycode, keysym) {
+                    mapped.push(*keycode);
+                }
+            }
+            if mapped.is_empty() {
+                continue;
+            }
+            unsafe {
+                x11_ffi::XSync(self.display, 0);
+            }
+            std::thread::sleep(X11_TEXT_REMAP_SETTLE);
+            for keycode in mapped {
+                unsafe {
+                    x11_ffi::XTestFakeKeyEvent(self.display, keycode as u32, 1, 0);
+                    x11_ffi::XTestFakeKeyEvent(self.display, keycode as u32, 0, 0);
+                }
+                injected = true;
+            }
+            unsafe {
+                x11_ffi::XSync(self.display, 0);
+            }
+        }
+        // Always hand the keycodes back, even if nothing was injected.
+        for keycode in &scratch.keycodes {
+            self.remap_keycode(*keycode, scratch.per_keycode, 0);
+        }
+        unsafe {
+            x11_ffi::XSync(self.display, 0);
+        }
+        injected
+    }
+
+    /// Collect keycodes the current layout leaves entirely unmapped, so
+    /// borrowing them cannot shadow a key the user actually has.
+    fn find_scratch_keycodes(&self, wanted: usize) -> Option<ScratchKeycodes> {
+        let mut min_keycode = 0;
+        let mut max_keycode = 0;
+        unsafe {
+            x11_ffi::XDisplayKeycodes(self.display, &mut min_keycode, &mut max_keycode);
+        }
+        if min_keycode <= 0 || max_keycode < min_keycode {
+            return None;
+        }
+        let count = max_keycode - min_keycode + 1;
+        let mut per_keycode = 0;
+        let mapping = unsafe {
+            x11_ffi::XGetKeyboardMapping(
+                self.display,
+                min_keycode as std::os::raw::c_uchar,
+                count,
+                &mut per_keycode,
+            )
+        };
+        if mapping.is_null() || per_keycode <= 0 {
+            return None;
+        }
+        let symbols =
+            unsafe { std::slice::from_raw_parts(mapping, (count * per_keycode) as usize) };
+        let keycodes: Vec<i32> = (0..count as usize)
+            .filter(|index| {
+                symbols[index * per_keycode as usize..(index + 1) * per_keycode as usize]
+                    .iter()
+                    .all(|keysym| *keysym == 0)
+            })
+            .take(wanted.max(1))
+            .map(|index| min_keycode + index as i32)
+            .collect();
+        unsafe {
+            x11_ffi::XFree(mapping as *mut std::ffi::c_void);
+        }
+        (!keycodes.is_empty()).then_some(ScratchKeycodes {
+            keycodes,
+            per_keycode,
+        })
+    }
+
+    /// Point every shift level of a borrowed keycode at one keysym (or clear it
+    /// with `0`). Using every level means the result doesn't depend on whatever
+    /// modifiers happen to be held. Does not sync — callers batch that.
+    fn remap_keycode(&self, keycode: i32, per_keycode: i32, keysym: x11_ffi::KeySym) -> bool {
+        let symbols = vec![keysym; per_keycode as usize];
+        let status = unsafe {
+            x11_ffi::XChangeKeyboardMapping(self.display, keycode, per_keycode, symbols.as_ptr(), 1)
+        };
+        status == 0
+    }
+}
+
+/// Type committed Unicode text through the RemoteDesktop portal.
+///
+/// `NotifyKeyboardKeysym` takes an absolute keysym rather than a layout-relative
+/// keycode, so unlike the keycode path this needs no scratch-key trickery — it
+/// expresses any character directly.
+#[cfg(target_os = "linux")]
+fn inject_portal_text(session: &Arc<RemoteDesktopPortalSession>, text: &str) -> bool {
+    let mut injected = false;
+    for character in text.chars() {
+        let keysym = unicode_keysym(character) as i32;
+        if let Err(e) = session.notify_keyboard_keysym(keysym, true) {
+            log_portal_error("notify_keyboard_keysym", e);
+            continue;
+        }
+        if let Err(e) = session.notify_keyboard_keysym(keysym, false) {
+            log_portal_error("notify_keyboard_keysym", e);
+            continue;
+        }
+        injected = true;
+    }
+    injected
+}
+
+/// Unused X11 keycodes borrowed for Unicode injection.
+#[cfg(target_os = "linux")]
+struct ScratchKeycodes {
+    keycodes: Vec<i32>,
+    per_keycode: i32,
+}
+
+/// How many keycodes to borrow at once. A typical layout leaves well over a
+/// hundred of the 8..=255 range unmapped, so batching amortises the settle
+/// delay across that many characters.
+#[cfg(target_os = "linux")]
+const X11_TEXT_BATCH_KEYCODES: usize = 32;
+
+/// Time to let X clients process the `MappingNotify` for remapped keycodes
+/// before faking the key events that depend on them.
+#[cfg(target_os = "linux")]
+const X11_TEXT_REMAP_SETTLE: Duration = Duration::from_millis(12);
+
+/// Map a character to an X11 keysym.
+///
+/// Latin-1 is keysym-identical to its code points; everything else uses the
+/// Unicode keysym range (`0x01000000 | code point`), which both X11 and the
+/// XDG RemoteDesktop portal accept. That range is what makes Cyrillic (and any
+/// other non-ASCII text) expressible at all — evdev keycodes are relative to the
+/// remote layout, so they can only ever produce what that layout already has.
+#[cfg(any(target_os = "linux", test))]
+fn unicode_keysym(character: char) -> u32 {
+    let code_point = character as u32;
+    if code_point < 0x100 {
+        code_point
+    } else {
+        0x0100_0000 | code_point
     }
 }
 
@@ -4606,6 +4801,27 @@ mod tests {
             assert!(byte_limited.allow(MAX_TEXT_INPUT_BYTES, start));
         }
         assert!(!byte_limited.allow(1, start));
+    }
+
+    #[test]
+    fn unicode_keysyms_cover_cyrillic_and_stay_latin1_compatible() {
+        // Latin-1 (and ASCII) keysyms are their own code points.
+        assert_eq!(unicode_keysym('a'), 0x61);
+        assert_eq!(unicode_keysym(' '), 0x20);
+        assert_eq!(unicode_keysym('ÿ'), 0xff);
+
+        // Everything above Latin-1 uses the Unicode keysym range. This is the
+        // whole point of the text-input path: a Cyrillic character has no
+        // keycode on a US layout, so it can only be injected by keysym.
+        assert_eq!(unicode_keysym('Ā'), 0x0100_0100);
+        assert_eq!(unicode_keysym('б'), 0x0100_0431);
+        assert_eq!(unicode_keysym('Я'), 0x0100_042f);
+        assert_eq!(unicode_keysym('є'), 0x0100_0454);
+        assert_eq!(unicode_keysym('漢'), 0x0100_6f22);
+        // Astral-plane characters (emoji) stay inside i32, which is what the
+        // portal's NotifyKeyboardKeysym argument is.
+        assert_eq!(unicode_keysym('🙂'), 0x0101_f642);
+        assert!(unicode_keysym(char::MAX) <= i32::MAX as u32);
     }
 
     #[test]

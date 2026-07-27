@@ -1152,6 +1152,41 @@ impl RemoteDesktopPortalSession {
             })
         })
     }
+
+    /// Press/release a key by *keysym* rather than by evdev keycode.
+    ///
+    /// Keycodes are layout-relative — sending KEY_A produces whatever the
+    /// remote layout has on that physical key, so a Cyrillic (or any non-ASCII)
+    /// character simply cannot be expressed that way. Keysyms are absolute, and
+    /// X11's Unicode keysym range (`0x01000000 | code point`) covers every
+    /// character, which is what makes committed IME text injectable.
+    pub(crate) fn notify_keyboard_keysym(&self, keysym: i32, pressed: bool) -> Result<(), String> {
+        self.with_remote_desktop_proxy(|runtime, connection, session_path| {
+            runtime.block_on(async {
+                let proxy = zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+                    .destination("org.freedesktop.portal.Desktop")
+                    .map_err(|e| format!("portal dest: {e}"))?
+                    .path("/org/freedesktop/portal/desktop")
+                    .map_err(|e| format!("portal path: {e}"))?
+                    .interface("org.freedesktop.portal.RemoteDesktop")
+                    .map_err(|e| format!("portal iface: {e}"))?
+                    .build()
+                    .await
+                    .map_err(|e| format!("portal proxy: {e}"))?;
+                let opts = std::collections::HashMap::<&str, zvariant::Value<'_>>::new();
+                let session = zvariant::ObjectPath::try_from(session_path)
+                    .map_err(|e| format!("session path: {e}"))?;
+                let _: () = proxy
+                    .call(
+                        "NotifyKeyboardKeysym",
+                        &(&session, opts, keysym, if pressed { 1u32 } else { 0u32 }),
+                    )
+                    .await
+                    .map_err(|e| format!("NotifyKeyboardKeysym: {e}"))?;
+                Ok(())
+            })
+        })
+    }
 }
 
 fn close_portal_session(

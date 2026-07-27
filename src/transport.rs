@@ -969,6 +969,17 @@ impl UdpSender {
         );
         self.frame_id = self.frame_id.wrapping_add(1);
 
+        if packets.is_empty() {
+            // The slicer refuses units that exceed the receiver's per-unit packet
+            // cap (see MAX_UNIT_PACKETS). Sending them anyway would freeze the
+            // stream with no diagnostic, so fail loudly instead.
+            return Err(format!(
+                "encoded unit of {} bytes exceeds the {} packet per-unit cap; dropped",
+                frame.data.len(),
+                st_protocol::packet::MAX_UNIT_PACKETS
+            ));
+        }
+
         let resend_first_packet = packets.len() > 1 && dup_first_allowed;
 
         // Build a flat list of plaintext packets to send: the sliced packets,

@@ -2926,6 +2926,21 @@ fn observe_send_backlog(
     hard_ceiling_us.is_some_and(|c| dwell >= c)
 }
 
+/// Longest a transport may withhold video while waiting for a decodable
+/// recovery unit.
+///
+/// After a loss/backlog event the transport drops non-recovery units until the
+/// encoder answers with an IDR, so the client isn't fed inter-frames it can't
+/// decode. That hold assumed the IDR always arrives — but the pipeline only
+/// consumes the keyframe request when a *new captured frame* shows up, so a
+/// static screen (or any stalled capture path) leaves the hold latched with no
+/// way out. Media keepalives keep flowing the whole time, so the client's
+/// stall watchdog sees a healthy path and never reconnects: the stream is
+/// frozen for good. Past this deadline, resume sending. Feeding the decoder
+/// inter-frames it may reject is strictly better than sending it nothing: the
+/// client runs its own recovery latch and will ask again.
+const RECOVERY_HOLD_MAX: Duration = Duration::from_millis(1500);
+
 // Per-client transport setup: one Arc per independent adaptive-control signal
 // (FEC, audio redundancy, dup-FrameStart, send backlog) plus the transport
 // plumbing. Grouping them into a struct would only move the argument list.
@@ -2970,7 +2985,11 @@ fn run_transport(
     let mut sent_video_units = 0usize;
     let mut last_video_activity = std::time::Instant::now();
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
-    let mut waiting_for_recovery_frame = false;
+    // `Some(t)` = holding non-recovery units since `t`, waiting for an IDR. The
+    // instant doubles as the hold deadline's origin (see RECOVERY_HOLD_MAX);
+    // keeping it in the same value as the flag makes a hold that can never
+    // expire unrepresentable.
+    let mut recovery_hold: Option<Instant> = None;
     let mut last_source_seq = None::<u64>;
 
     // Preserve the very first queued frame so a new subscriber starts from the
@@ -3065,9 +3084,9 @@ fn run_transport(
                         &send_backlog_us,
                         hard_ceiling_us,
                     ) && !frame.is_recovery
-                        && !waiting_for_recovery_frame
+                        && recovery_hold.is_none()
                     {
-                        waiting_for_recovery_frame = true;
+                        recovery_hold = Some(Instant::now());
                         if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
                             video_bc.request_keyframe();
                             last_backlog_keyframe_request = Instant::now();
@@ -3081,7 +3100,7 @@ fn run_transport(
                     }
 
                     if source_gap > 0 {
-                        waiting_for_recovery_frame = true;
+                        recovery_hold.get_or_insert_with(Instant::now);
                         if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
                             video_bc.request_keyframe();
                             last_backlog_keyframe_request = Instant::now();
@@ -3093,7 +3112,10 @@ fn run_transport(
                         }
                     }
 
-                    if waiting_for_recovery_frame && !frame.is_recovery {
+                    let holding = recovery_hold
+                        .is_some_and(|since| since.elapsed() < RECOVERY_HOLD_MAX)
+                        && !frame.is_recovery;
+                    if holding {
                         // Discard P-frames until a fresh IDR arrives; keep nudging
                         // the encoder for one (throttled).
                         if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
@@ -3107,12 +3129,22 @@ fn run_transport(
                             );
                         }
                     } else {
-                        if waiting_for_recovery_frame && frame.is_recovery {
-                            waiting_for_recovery_frame = false;
-                            if trace {
+                        if let Some(since) = recovery_hold.take() {
+                            if frame.is_recovery {
+                                if trace {
+                                    eprintln!(
+                                        "[trace][server] resumed video for {addr} on recovery unit source_seq={}",
+                                        frame.source_seq
+                                    );
+                                }
+                            } else {
+                                // Deadline hit: the encoder never answered the
+                                // keyframe request (typically a stalled capture
+                                // path on a static screen). Resume rather than
+                                // stay dark — see RECOVERY_HOLD_MAX.
                                 eprintln!(
-                                    "[trace][server] resumed video for {addr} on recovery unit source_seq={}",
-                                    frame.source_seq
+                                    "[transport] no recovery unit for {:?} for {addr}; resuming video without one",
+                                    since.elapsed()
                                 );
                             }
                         }
@@ -5357,7 +5389,11 @@ fn run_punched_transport(
     let trace = trace_enabled();
     let interleave_audio = audio_interleave_enabled();
     let mut last_backlog_keyframe_request = Instant::now() - Duration::from_secs(1);
-    let mut waiting_for_recovery_frame = false;
+    // `Some(t)` = holding non-recovery units since `t`, waiting for an IDR. The
+    // instant doubles as the hold deadline's origin (see RECOVERY_HOLD_MAX);
+    // keeping it in the same value as the flag makes a hold that can never
+    // expire unrepresentable.
+    let mut recovery_hold: Option<Instant> = None;
     let mut last_source_seq = None::<u64>;
     let mut last_fec_pct = u16::MAX;
     let mut last_audio_depth = u8::MAX;
@@ -5424,9 +5460,9 @@ fn run_punched_transport(
                         &send_backlog_us,
                         hard_ceiling_us,
                     ) && !frame.is_recovery
-                        && !waiting_for_recovery_frame
+                        && recovery_hold.is_none()
                     {
-                        waiting_for_recovery_frame = true;
+                        recovery_hold = Some(Instant::now());
                         if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
                             video_bc.request_keyframe();
                             last_backlog_keyframe_request = Instant::now();
@@ -5440,7 +5476,7 @@ fn run_punched_transport(
                     }
 
                     if source_gap > 0 {
-                        waiting_for_recovery_frame = true;
+                        recovery_hold.get_or_insert_with(Instant::now);
                         if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
                             video_bc.request_keyframe();
                             last_backlog_keyframe_request = Instant::now();
@@ -5452,7 +5488,10 @@ fn run_punched_transport(
                         }
                     }
 
-                    if waiting_for_recovery_frame && !frame.is_recovery {
+                    let holding = recovery_hold
+                        .is_some_and(|since| since.elapsed() < RECOVERY_HOLD_MAX)
+                        && !frame.is_recovery;
+                    if holding {
                         if last_backlog_keyframe_request.elapsed() >= Duration::from_millis(250) {
                             video_bc.request_keyframe();
                             last_backlog_keyframe_request = Instant::now();
@@ -5464,12 +5503,19 @@ fn run_punched_transport(
                             );
                         }
                     } else {
-                        if waiting_for_recovery_frame && frame.is_recovery {
-                            waiting_for_recovery_frame = false;
-                            if trace {
+                        if let Some(since) = recovery_hold.take() {
+                            if frame.is_recovery {
+                                if trace {
+                                    eprintln!(
+                                        "[trace][server] resumed punched video on recovery unit source_seq={}",
+                                        frame.source_seq
+                                    );
+                                }
+                            } else {
+                                // Deadline hit — see RECOVERY_HOLD_MAX.
                                 eprintln!(
-                                    "[trace][server] resumed punched video on recovery unit source_seq={}",
-                                    frame.source_seq
+                                    "[punched-transport] no recovery unit for {:?}; resuming video without one",
+                                    since.elapsed()
                                 );
                             }
                         }
