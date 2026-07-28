@@ -5,6 +5,7 @@ use crossbeam_channel::{Sender, TrySendError};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
@@ -46,7 +47,14 @@ impl Card {
 
         for i in 0..8 {
             let path = format!("/dev/dri/card{i}");
-            let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            let file = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                // We spawn helper processes (zenity/kdialog/loginctl) while capture
+                // is live; without O_CLOEXEC every card fd we probe leaks into them.
+                .custom_flags(libc::O_CLOEXEC)
+                .open(&path)
+            {
                 Ok(f) => f,
                 Err(_) => continue,
             };
@@ -55,6 +63,7 @@ impl Card {
             if card.get_driver().is_err() {
                 continue;
             }
+            card.drop_implicit_master(&path, verbose);
 
             let render_node = Self::render_node_for(&card);
             let driver_name = card
@@ -102,6 +111,36 @@ impl Card {
         }
 
         Err("No usable DRM card found (/dev/dri/card0..7)".into())
+    }
+
+    /// Release DRM master if opening the card node implicitly granted it.
+    ///
+    /// The kernel hands DRM master to whoever opens a primary node while no one
+    /// else holds it. In system mode we run as root from the login screen, so we
+    /// can win that race against the compositor/greeter — which then cannot
+    /// become master and never puts an image on screen. Holding master also
+    /// blocks the compositor from re-acquiring it across VT switches.
+    ///
+    /// Capture does not need master: `GETFB2` is gated on `CAP_SYS_ADMIN` (the
+    /// file capability the installer grants) and `PRIME_HANDLE_TO_FD` is
+    /// render-allowed, so both keep working after the drop.
+    ///
+    /// `DRM_IOCTL_DROP_MASTER` is a no-op returning `EINVAL` unless *this* fd is
+    /// the current master, so calling it unconditionally cannot steal master
+    /// from the compositor. `Ok` therefore means "we had implicit master and
+    /// gave it back"; an error means we never held it.
+    fn drop_implicit_master(&self, path: &str, verbose: bool) {
+        match self.release_master_lock() {
+            Ok(()) => {
+                if verbose {
+                    println!("[kms] Dropped implicit DRM master for {path}");
+                }
+            }
+            Err(err) if verbose => {
+                println!("[kms] {path} not DRM master ({err}); nothing to drop");
+            }
+            Err(_) => {}
+        }
     }
 
     /// Get the render node path for this card (e.g. /dev/dri/renderD128).
@@ -1235,6 +1274,28 @@ mod tests {
     fn resolve_output_none_uses_primary() {
         let ids = [10u32, 20, 30];
         assert_eq!(resolve_output_index(&ids, 2, None), 2);
+    }
+
+    /// Regression guard for the implicit-DRM-master bug class: opening a
+    /// primary node grants master when nobody else holds it, and keeping it
+    /// stops the compositor/greeter from ever becoming master (black screen,
+    /// failed VT switches). `Card::open` must therefore always give it back.
+    ///
+    /// `release_master_lock` only succeeds when *this* fd is the current master,
+    /// so a second call succeeding means the first one never happened — exactly
+    /// the state this test exists to catch. Skips where there is no DRM device
+    /// or no permission to open one (CI, containers).
+    #[test]
+    fn card_open_does_not_retain_drm_master() {
+        let Ok((card, _)) = Card::open(false) else {
+            eprintln!("skipping: no openable DRM card");
+            return;
+        };
+        assert!(
+            card.release_master_lock().is_err(),
+            "Card::open left the process holding DRM master; the compositor \
+             cannot acquire it and the screen stays black"
+        );
     }
 
     #[test]
