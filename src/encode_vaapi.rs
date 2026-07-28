@@ -304,6 +304,10 @@ impl VaapiEncoder {
                     };
                     (*ctx).gop_size = config.gop_size as i32;
                     (*ctx).max_b_frames = config.max_b_frames as i32;
+                    // Caps num_ref_frames in the emitted SPS so the client's
+                    // hardware decoder sizes its DPB to 1 and returns each frame
+                    // immediately.
+                    (*ctx).refs = config.ref_frames as i32;
                     (*ctx).bit_rate = config.bitrate_bps();
                     (*ctx).rc_buffer_size = config.vbv_buffer_size(false);
                     (*ctx).profile = *profile_id;
@@ -355,6 +359,21 @@ impl VaapiEncoder {
                     // Multi-slice encoding (C2), clamped by the driver to
                     // VAConfigAttribEncMaxSlices if it advertises a lower max.
                     (*ctx).slices = config.slices_per_frame() as i32;
+
+                    // VAAPI quality level. 0 leaves the driver default; a
+                    // non-zero value out of the driver's range is clamped down
+                    // to its maximum by libavcodec.
+                    let vaapi_quality = config.vaapi_quality();
+                    if vaapi_quality > 0 {
+                        (*ctx).compression_level = vaapi_quality;
+                    }
+
+                    // Block-level rate control. Absent on some drivers and
+                    // libavcodec builds; av_opt_set then fails harmlessly.
+                    if config.vaapi_blbrc() {
+                        let blbrc_key = std::ffi::CString::new("blbrc").unwrap();
+                        ffi::av_opt_set((*ctx).priv_data, blbrc_key.as_ptr(), one.as_ptr(), 0);
+                    }
 
                     // H.264 entropy coder (F1). CABAC default; ST_H264_CODER=cavlc.
                     if let Some(coder) = config.h264_coder() {

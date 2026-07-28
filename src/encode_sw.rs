@@ -97,6 +97,9 @@ impl SoftwareEncoder {
                 config.gop_size as i32
             };
             (*ctx).max_b_frames = config.max_b_frames as i32;
+            // Caps num_ref_frames in the emitted SPS so the client's hardware
+            // decoder sizes its DPB to 1 and returns each frame immediately.
+            (*ctx).refs = config.ref_frames as i32;
             (*ctx).bit_rate = config.bitrate_bps();
             (*ctx).rc_buffer_size = config.vbv_buffer_size(true);
 

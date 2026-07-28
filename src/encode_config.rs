@@ -145,6 +145,8 @@ pub struct EncoderConfig {
     pub chroma: ChromaSampling,
     pub gop_size: u32,
     pub max_b_frames: u32,
+    /// Reference-frame limit written into the emitted SPS/sequence header.
+    pub ref_frames: u32,
     pub low_delay: bool,
     pub quality: QualityPreset,
 }
@@ -164,6 +166,16 @@ impl EncoderConfig {
     /// controller to either crush IDR quality or burst past the pacing budget
     /// once per second — the visible "periodic refresh"/pulsing artifact.
     pub const INFINITE_GOP: u32 = i32::MAX as u32;
+
+    /// Reference-frame limit. This is a decode-latency knob, not a quality one:
+    /// it lands in the emitted SPS as `num_ref_frames`, from which hardware
+    /// decoders size their DPB. A DPB larger than 1 lets the decoder hold frames
+    /// back before returning them, adding whole frame times of latency for a
+    /// stream that has no B-frames and no reordering to justify it. Moonlight
+    /// has to rewrite the host's SPS client-side to force this to 1 precisely
+    /// because encoders leave it high; we control both ends, so we emit it
+    /// correctly instead.
+    const DEFAULT_REF_FRAMES: u32 = 1;
 
     fn default_gop_size(_framerate: u32) -> u32 {
         // Infinite GOP is the documented design ("infinite GOP, IDR on demand").
@@ -232,6 +244,15 @@ impl EncoderConfig {
             .map(|v| if v == 0 { Self::INFINITE_GOP } else { v })
             .unwrap_or_else(|| Self::default_gop_size(framerate));
 
+        // ST_REF_FRAMES overrides the reference-frame limit. See `ref_frames`
+        // below for why 1 is the default; raise it only to trade latency for
+        // compression efficiency on a path that is bandwidth- not latency-bound.
+        let ref_frames = std::env::var("ST_REF_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(Self::DEFAULT_REF_FRAMES);
+
         Self {
             width,
             height,
@@ -244,6 +265,7 @@ impl EncoderConfig {
             chroma,
             gop_size,
             max_b_frames: 0,
+            ref_frames,
             low_delay: true,
             // Latency-first default: this is a low-latency streaming server, so an
             // unforced session encodes with the LowLatency preset (NVENC p1/ull,
@@ -376,6 +398,45 @@ impl EncoderConfig {
             "cavlc" | "vlc" => Some("cavlc"),
             _ => Some("cabac"),
         }
+    }
+
+    /// VAAPI quality level, written to `AVCodecContext::compression_level`.
+    ///
+    /// Lower is slower/higher quality, higher is faster/lower quality, and the
+    /// valid range is driver-defined (Intel iHD is typically 1-7, AMD is much
+    /// narrower). `0` means "leave the driver default", which is the default
+    /// here and preserves the previous behaviour exactly.
+    ///
+    /// **Opt-in, not auto-enabled**, because picking a good non-zero value needs
+    /// the driver's `VAConfigAttribEncQualityRange` — and reading that means
+    /// linking libva directly, since `ffmpeg-sys-next` does not expose
+    /// `AVVAAPIDeviceContext`. Without the range we cannot map "fastest" or
+    /// "middle" onto a number; libavcodec clamps an out-of-range value down to
+    /// the driver maximum, but only after logging a warning. Set the level
+    /// explicitly via `ST_VAAPI_QUALITY` if you know your driver's range.
+    pub fn vaapi_quality(&self) -> i32 {
+        std::env::var("ST_VAAPI_QUALITY")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(0)
+    }
+
+    /// VAAPI block-level rate control (`blbrc`), opt-in via `ST_VAAPI_BLBRC=1`.
+    ///
+    /// Improves quality at a fixed bitrate by varying rate within a frame, at
+    /// the cost of encode time — so it stays off by default on a latency-first
+    /// server. Not every driver or libavcodec build exposes the option; when it
+    /// is absent `av_opt_set` fails harmlessly and the encoder opens unchanged.
+    pub fn vaapi_blbrc(&self) -> bool {
+        matches!(
+            std::env::var("ST_VAAPI_BLBRC")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     }
 
     /// Intra-refresh recovery (A3, opt-in). Spreads intra coding across a wave of
@@ -691,6 +752,7 @@ mod tests {
             chroma: ChromaSampling::Yuv420,
             gop_size: EncoderConfig::default_gop_size(framerate),
             max_b_frames: 0,
+            ref_frames: EncoderConfig::DEFAULT_REF_FRAMES,
             low_delay: true,
             quality: QualityPreset::Balanced,
         }
