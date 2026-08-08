@@ -221,10 +221,15 @@ impl ApiTunnelState {
             Some(t) => t.elapsed() < STUN_REFRESH_TTL,
             None => false,
         };
-        // Reuse cached candidates if they're fresh OR if a live punched
-        // session owns the socket (a STUN recv would steal its packets).
+        // Reuse cached candidates if they're fresh, if a live punched session
+        // owns the socket, or if a client punch request is pending (the punch
+        // task is about to probe, or already probing, on this socket) — a
+        // STUN sweep would consume inbound STPUNCH datagrams for up to 1.5s
+        // and, on a symmetric NAT, shift our external port after the client
+        // already fetched the candidate list.
         let session_active = self.is_punch_session_active();
-        if has_socket && !cached.is_empty() && (stun_fresh || session_active) {
+        let punch_imminent = self.pending_client_punch.lock().unwrap().is_some();
+        if has_socket && !cached.is_empty() && (stun_fresh || session_active || punch_imminent) {
             return Ok(self.augment_with_portmap(cached));
         }
 

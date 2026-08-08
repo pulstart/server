@@ -3764,7 +3764,11 @@ async fn handle_client(
         std::thread::spawn(move || {
             let _slot = slot; // released when the session ends
             match st_protocol::tcp_tunnel::TcpTunnel::new(std_stream, None, Vec::new()) {
-                Ok(tunnel) => handle_punched_client(Arc::new(tunnel), state2),
+                Ok(tunnel) => handle_punched_client(
+                    Arc::new(tunnel),
+                    state2,
+                    Arc::new(AtomicBool::new(false)),
+                ),
                 Err(e) => eprintln!("[tcp-tunnel] setup failed for {addr}: {e}"),
             }
         });
@@ -4615,6 +4619,13 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
         let mut last_handled_punch = None;
         let mut attempted_punch = None;
         let mut punch_attempts: u32 = 0;
+        // Cancel handle for the punched session spawned by the last successful
+        // punch. A newer punch request while that session is still up means
+        // the client gave up on it (cancelled, crashed, or its handshake
+        // window expired) and is retrying — without preemption the stale
+        // handler's auth/display deadlines hold `punch_session_active` for up
+        // to ~15s, blacking out exactly the retry the user just started.
+        let mut active_session_cancel: Option<Arc<AtomicBool>> = None;
         loop {
             if state.control.shutdown_requested() {
                 break;
@@ -4625,9 +4636,22 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             };
-            if last_handled_punch.as_ref() == Some(&pending_punch)
-                || tunnel.is_punch_session_active()
-            {
+            if tunnel.is_punch_session_active() {
+                if last_handled_punch.as_ref() != Some(&pending_punch) {
+                    if let Some(cancel) = &active_session_cancel {
+                        if !cancel.swap(true, Ordering::AcqRel) {
+                            println!(
+                                "[hole-punch] Newer punch request (generation {}) — \
+                                 cancelling stale punched session",
+                                pending_punch.generation
+                            );
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            if last_handled_punch.as_ref() == Some(&pending_punch) {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -4672,11 +4696,18 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                 "[hole-punch] Attempting to punch through to {} candidate(s)...",
                 candidates.len()
             );
-            match st_protocol::tunnel::hole_punch(
+            // Abort mid-punch as soon as the client posts a fresh nonce (its
+            // 10s window has moved on — probing for the old one is wasted
+            // time that delays the retry) or the server shuts down.
+            match st_protocol::tunnel::hole_punch_cancellable(
                 &socket,
                 &candidates,
                 &crypto,
                 Duration::from_secs(10),
+                || {
+                    state.control.shutdown_requested()
+                        || tunnel.pending_client_punch().as_ref() != Some(&pending_punch)
+                },
             ) {
                 Ok(peer) => {
                     last_handled_punch = Some(pending_punch.clone());
@@ -4687,6 +4718,8 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                     let punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink> = Arc::new(
                         st_protocol::reliable_udp::PunchedSocket::new(socket, peer, crypto),
                     );
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    active_session_cancel = Some(Arc::clone(&cancel));
                     let state2 = Arc::clone(&state);
                     let tunnel2 = Arc::clone(&tunnel);
                     // Run the punched-client handler in a blocking thread.
@@ -4698,7 +4731,7 @@ fn spawn_hole_punch_task(state: Arc<ServerState>) {
                             }
                         }
                         let _guard = ActivePunchGuard(Arc::clone(&tunnel2));
-                        handle_punched_client(punched, state2);
+                        handle_punched_client(punched, state2, cancel);
                     });
                 }
                 Err(e) => {
@@ -4830,7 +4863,11 @@ fn spawn_relay_task(state: Arc<ServerState>, api_url: String) {
                                     }
                                 }
                                 let _guard = ActiveRelayGuard(tunnel2);
-                                handle_punched_client(Arc::new(tcp_tunnel), state2);
+                                handle_punched_client(
+                                    Arc::new(tcp_tunnel),
+                                    state2,
+                                    Arc::new(AtomicBool::new(false)),
+                                );
                             });
                             last_handled_relay = Some(pending.clone());
                             retrying_relay = None;
@@ -4849,9 +4886,15 @@ fn spawn_relay_task(state: Arc<ServerState>, api_url: String) {
 /// Handle a client connection over a tunnel link: a hole-punched UDP socket
 /// or a TCP fallback tunnel (direct upgrade or API-server relay). All control
 /// and media traffic flows through the single link.
+///
+/// `cancel` preempts the session (and, more importantly, its handshake
+/// deadlines) when the punch task sees a newer punch request from the client
+/// — a stale handler must not hold `punch_session_active` through the
+/// client's retry window. TCP callers pass a never-set flag.
 fn handle_punched_client(
     punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink>,
     state: Arc<ServerState>,
+    cancel: Arc<AtomicBool>,
 ) {
     use st_protocol::reliable_udp::PunchedMessage;
     let peer = punched.peer();
@@ -4866,7 +4909,7 @@ fn handle_punched_client(
     let token = state.control.token();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut authenticated = false;
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
         punched.tick();
         if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
             if let Some((ControlMessage::Authenticate(client_token), _)) =
@@ -4895,7 +4938,7 @@ fn handle_punched_client(
     // --- Read ClientDisplayInfo ---
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut client_display: Option<ClientDisplayInfo> = None;
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
         punched.tick();
         if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
             if let Some((ControlMessage::ClientDisplayInfo(info), _)) =
@@ -4953,6 +4996,7 @@ fn handle_punched_client(
                 punched.tick();
                 if registered_client.disconnect_requested()
                     || punched.is_closed()
+                    || cancel.load(Ordering::Relaxed)
                     || Instant::now() >= setup_deadline
                 {
                     setup_cancelled.store(true, Ordering::Release);
@@ -5005,7 +5049,7 @@ fn handle_punched_client(
     // Wait for ClientReadyForMedia.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut ready = false;
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
         punched.tick();
         if let Some(PunchedMessage::Control(data)) = punched.try_recv() {
             let mut offset = 0;
@@ -5134,7 +5178,10 @@ fn handle_punched_client(
     let mut last_peer_activity = Instant::now();
 
     loop {
-        if registered_client.disconnect_requested() || state.control.shutdown_requested() {
+        if registered_client.disconnect_requested()
+            || state.control.shutdown_requested()
+            || cancel.load(Ordering::Relaxed)
+        {
             break;
         }
         if last_peer_activity.elapsed() > PUNCHED_INACTIVITY_TIMEOUT {
