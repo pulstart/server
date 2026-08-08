@@ -101,6 +101,14 @@ impl SoftwareEncoder {
             // decoder sizes its DPB to 1 and returns each frame immediately.
             (*ctx).refs = config.ref_frames as i32;
             (*ctx).bit_rate = config.bitrate_bps();
+            // Capped VBR: bound the burst with maxrate + VBV, let static
+            // content undershoot the average instead of burning the full
+            // budget on identical frames. ST_RC_MODE=cbr pins minrate too
+            // (see EncoderConfig::cbr_forced).
+            if config.cbr_forced() {
+                (*ctx).rc_min_rate = config.bitrate_bps();
+            }
+            (*ctx).rc_max_rate = config.bitrate_bps();
             (*ctx).rc_buffer_size = config.vbv_buffer_size(true);
 
             if config.low_delay {
@@ -581,14 +589,15 @@ impl SoftwareEncoder {
 
         let bitrate_bps = config.bitrate_bps();
         let buffer_size = config.vbv_buffer_size(true) as i64;
+        let min_rate = if config.cbr_forced() { bitrate_bps } else { 0 };
         unsafe {
             (*self.codec_ctx).bit_rate = bitrate_bps;
-            (*self.codec_ctx).rc_min_rate = bitrate_bps;
+            (*self.codec_ctx).rc_min_rate = min_rate;
             (*self.codec_ctx).rc_max_rate = bitrate_bps;
             (*self.codec_ctx).rc_buffer_size = config.vbv_buffer_size(true);
 
             set_int_opt(self.codec_ctx.cast(), "b", bitrate_bps)?;
-            set_int_opt(self.codec_ctx.cast(), "minrate", bitrate_bps)?;
+            set_int_opt(self.codec_ctx.cast(), "minrate", min_rate)?;
             set_int_opt(self.codec_ctx.cast(), "maxrate", bitrate_bps)?;
             set_int_opt(self.codec_ctx.cast(), "bufsize", buffer_size)?;
         }

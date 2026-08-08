@@ -701,6 +701,27 @@ fn kms_copy_enabled() -> bool {
     )
 }
 
+/// Damage skip: the compositor page-flips to a different framebuffer whenever
+/// it repaints, so an unchanged primary-plane framebuffer handle between
+/// pacer ticks means the scanout content is byte-identical to the previous
+/// capture. Skipping those ticks (PRIME export + stabilize + encode + send)
+/// turns a static desktop from full-fps traffic into a low keepalive cadence.
+/// Cursor-plane state (fb handle + position) is part of the change signature
+/// so cursor motion still flows to clients at full rate — its position rides
+/// `CapturedFrame`. `ST_KMS_DAMAGE=0` (also `false`/`no`/`off`) is the escape
+/// hatch for a compositor that re-renders into the bound framebuffer in place
+/// (none of KWin/Mutter/wlroots do).
+fn kms_damage_skip_enabled() -> bool {
+    !matches!(
+        std::env::var("ST_KMS_DAMAGE").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    )
+}
+
+/// Re-send an unchanged frame at this cadence so late joiners, keyframe
+/// requests, and loss recovery never wait on the next real content change.
+const DAMAGE_KEEPALIVE: Duration = Duration::from_millis(250);
+
 /// How long `start()` retries plane acquisition + the test capture before giving
 /// up. The display can be DPMS-off when a client connects: `trigger_screen_wake`
 /// fires just before the pipeline starts, but powering the monitor back on and
@@ -979,6 +1000,16 @@ impl CaptureBackend for KmsCapture {
                 eprintln!("[kms] timerfd unavailable; falling back to sleep-based pacer");
             }
 
+            // Damage-skip state (see kms_damage_skip_enabled).
+            let damage_skip = kms_damage_skip_enabled();
+            if !damage_skip {
+                println!("[kms] ST_KMS_DAMAGE=0: damage skip disabled (full-fps capture)");
+            }
+            let mut last_scanout_fb: Option<control::framebuffer::Handle> = None;
+            let mut last_cursor_sig: Option<(Option<control::framebuffer::Handle>, i32, i32)> =
+                None;
+            let mut last_forwarded = Instant::now();
+
             // C4: cache the resolved plane handle. Plane handles are stable; only
             // the framebuffer bound to a plane flips. So we reuse the validated
             // handle and only re-walk all planes (the N+N×M `type`-property reads)
@@ -991,6 +1022,55 @@ impl CaptureBackend for KmsCapture {
 
             while running.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
+
+                // Damage-skip probe (see kms_damage_skip_enabled): two cheap
+                // get_plane ioctls decide whether anything changed since the
+                // last forwarded frame. Probe failures and capture-error
+                // streaks always take the full capture path below — it owns
+                // error handling and plane re-acquisition.
+                let skip_unchanged = damage_skip
+                    && capture_err_streak == 0
+                    && match card
+                        .get_plane(current_plane)
+                        .ok()
+                        .and_then(|p| p.framebuffer())
+                    {
+                        Some(fb) => {
+                            let cursor_sig = cursor_handle.map(|h| {
+                                let cursor_fb =
+                                    card.get_plane(h).ok().and_then(|p| p.framebuffer());
+                                let (x, y) = read_cursor_position(
+                                    &card,
+                                    h,
+                                    &mut cursor_cache.crtc_pos_props,
+                                );
+                                (cursor_fb, x, y)
+                            });
+                            let unchanged =
+                                last_scanout_fb == Some(fb) && last_cursor_sig == cursor_sig;
+                            last_scanout_fb = Some(fb);
+                            last_cursor_sig = cursor_sig;
+                            unchanged && last_forwarded.elapsed() < DAMAGE_KEEPALIVE
+                        }
+                        None => {
+                            last_scanout_fb = None;
+                            false
+                        }
+                    };
+                if skip_unchanged {
+                    match pacer.as_mut() {
+                        Some(p) => {
+                            let _ = p.wait();
+                        }
+                        None => {
+                            let elapsed = frame_start.elapsed();
+                            if elapsed < target_interval {
+                                thread::sleep(target_interval - elapsed);
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 match capture_frame(&card, current_plane, cursor_handle, Some(&mut cursor_cache)) {
                     Ok(mut frame) => {
@@ -1077,6 +1157,7 @@ impl CaptureBackend for KmsCapture {
                         };
 
                         if let Some(frame) = to_send {
+                            last_forwarded = Instant::now();
                             match tx.try_send(frame) {
                                 Ok(()) => {}
                                 Err(TrySendError::Full(_)) => {

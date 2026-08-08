@@ -471,6 +471,17 @@ impl EncoderConfig {
         )
     }
 
+    /// Rate control is capped VBR by default: `maxrate` (and the VBV buffer)
+    /// still bound the worst-case per-frame burst exactly like the old hard
+    /// CBR did, but the encoder is free to *undershoot* on easy content. Hard
+    /// CBR (`minrate == maxrate`) made a static desktop cost the full
+    /// configured bitrate — gigabytes per 10 minutes for a picture that
+    /// wasn't changing. `ST_RC_MODE=cbr` forces the old pinned-CBR behavior
+    /// as a debugging escape hatch (e.g. a driver whose VBR pacing misbehaves).
+    pub fn cbr_forced(&self) -> bool {
+        matches!(std::env::var("ST_RC_MODE").as_deref(), Ok("cbr"))
+    }
+
     /// Compute VBV buffer size in bits (bitrate / fps for HW, larger for SW).
     ///
     /// `libsvtav1` derives a VBV duration from `rc_buffer_size` and rejects values below 20 ms.

@@ -226,7 +226,12 @@ impl WindowsHwEncoder {
             // decoder sizes its DPB to 1 and returns each frame immediately.
             (*ctx).refs = config.ref_frames as i32;
             (*ctx).bit_rate = config.bitrate_bps();
-            (*ctx).rc_min_rate = config.bitrate_bps();
+            // Capped VBR unless ST_RC_MODE=cbr (see EncoderConfig::cbr_forced).
+            (*ctx).rc_min_rate = if config.cbr_forced() {
+                config.bitrate_bps()
+            } else {
+                0
+            };
             (*ctx).rc_max_rate = config.bitrate_bps();
             (*ctx).rc_buffer_size = config.vbv_buffer_size(false);
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(device_ctx.ptr);
@@ -520,14 +525,15 @@ impl WindowsHwEncoder {
 
         let bitrate_bps = config.bitrate_bps();
         let buffer_size = config.vbv_buffer_size(false) as i64;
+        let min_rate = if config.cbr_forced() { bitrate_bps } else { 0 };
         unsafe {
             (*self.codec_ctx).bit_rate = bitrate_bps;
-            (*self.codec_ctx).rc_min_rate = bitrate_bps;
+            (*self.codec_ctx).rc_min_rate = min_rate;
             (*self.codec_ctx).rc_max_rate = bitrate_bps;
             (*self.codec_ctx).rc_buffer_size = config.vbv_buffer_size(false);
 
             set_int_opt(self.codec_ctx.cast(), "b", bitrate_bps)?;
-            set_int_opt(self.codec_ctx.cast(), "minrate", bitrate_bps)?;
+            set_int_opt(self.codec_ctx.cast(), "minrate", min_rate)?;
             set_int_opt(self.codec_ctx.cast(), "maxrate", bitrate_bps)?;
             set_int_opt(self.codec_ctx.cast(), "bufsize", buffer_size)?;
         }
@@ -883,7 +889,12 @@ impl WindowsHwEncoder {
             // decoder sizes its DPB to 1 and returns each frame immediately.
             (*ctx).refs = config.ref_frames as i32;
             (*ctx).bit_rate = config.bitrate_bps();
-            (*ctx).rc_min_rate = config.bitrate_bps();
+            // Capped VBR unless ST_RC_MODE=cbr (see EncoderConfig::cbr_forced).
+            (*ctx).rc_min_rate = if config.cbr_forced() {
+                config.bitrate_bps()
+            } else {
+                0
+            };
             (*ctx).rc_max_rate = config.bitrate_bps();
             (*ctx).rc_buffer_size = config.vbv_buffer_size(false);
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(device_ctx.ptr);
@@ -1155,11 +1166,15 @@ unsafe fn apply_backend_options(
     backend: WindowsEncoderBackend,
     config: &EncoderConfig,
 ) -> Result<(), String> {
+    // Capped VBR by default (ST_RC_MODE=cbr escape hatch): maxrate + the
+    // 1-frame VBV still bound the burst, but static content undershoots
+    // instead of burning the full budget (see EncoderConfig::cbr_forced).
+    let cbr = config.cbr_forced();
     match backend {
         WindowsEncoderBackend::Nvenc => {
             set_str_opt((*ctx).priv_data, "preset", config.quality.nvenc_preset())?;
             set_str_opt((*ctx).priv_data, "tune", config.quality.nvenc_tune())?;
-            set_str_opt((*ctx).priv_data, "rc", "cbr")?;
+            set_str_opt((*ctx).priv_data, "rc", if cbr { "cbr" } else { "vbr" })?;
             set_int_opt((*ctx).priv_data, "delay", 0)?;
             set_int_opt((*ctx).priv_data, "forced-idr", 1)?;
             set_int_opt((*ctx).priv_data, "zerolatency", 1)?;
@@ -1174,7 +1189,12 @@ unsafe fn apply_backend_options(
             set_int_opt((*ctx).priv_data, "filler_data", 0)?;
             set_int_opt((*ctx).priv_data, "forced_idr", 1)?;
             set_int_opt((*ctx).priv_data, "async_depth", 1)?;
-            set_str_opt((*ctx).priv_data, "rc", "cbr")?;
+            // AMF's low-latency VBR mode; plain "vbr_peak" adds pacing delay.
+            set_str_opt(
+                (*ctx).priv_data,
+                "rc",
+                if cbr { "cbr" } else { "vbr_latency" },
+            )?;
             set_int_opt((*ctx).priv_data, "skip_frame", 0)?;
             set_int_opt((*ctx).priv_data, "frame_skipping", 0)?;
             if config.codec == Codec::Hevc {
@@ -1183,7 +1203,13 @@ unsafe fn apply_backend_options(
         }
         WindowsEncoderBackend::MediaFoundation => {
             set_int_opt((*ctx).priv_data, "hw_encoding", 1)?;
-            set_str_opt((*ctx).priv_data, "rate_control", "cbr")?;
+            // MediaFoundation's low-delay VBR keeps the peak bound while
+            // letting static content undershoot.
+            set_str_opt(
+                (*ctx).priv_data,
+                "rate_control",
+                if cbr { "cbr" } else { "ld_vbr" },
+            )?;
             set_str_opt((*ctx).priv_data, "scenario", "display_remoting")?;
         }
     }

@@ -220,7 +220,15 @@ impl NvencEncoder {
             // decoder sizes its DPB to 1 and returns each frame immediately.
             (*ctx).refs = config.ref_frames as i32;
             (*ctx).bit_rate = config.bitrate_bps();
-            (*ctx).rc_min_rate = config.bitrate_bps();
+            // Capped VBR by default: maxrate + the 1-frame VBV bound the
+            // per-frame burst exactly like the old pinned CBR, but static
+            // content may undershoot instead of burning the full budget on
+            // identical frames (see EncoderConfig::cbr_forced).
+            (*ctx).rc_min_rate = if config.cbr_forced() {
+                config.bitrate_bps()
+            } else {
+                0
+            };
             (*ctx).rc_max_rate = config.bitrate_bps();
             (*ctx).rc_buffer_size = config.vbv_buffer_size(false);
 
@@ -275,10 +283,11 @@ impl NvencEncoder {
             let tune_val = std::ffi::CString::new(config.quality.nvenc_tune()).unwrap();
             ffi::av_opt_set((*ctx).priv_data, tune.as_ptr(), tune_val.as_ptr(), 0);
 
-            // Rate control: CBR
+            // Rate control: capped VBR (CBR via ST_RC_MODE=cbr escape hatch)
             let rc = std::ffi::CString::new("rc").unwrap();
-            let cbr = std::ffi::CString::new("cbr").unwrap();
-            ffi::av_opt_set((*ctx).priv_data, rc.as_ptr(), cbr.as_ptr(), 0);
+            let rc_mode =
+                std::ffi::CString::new(if config.cbr_forced() { "cbr" } else { "vbr" }).unwrap();
+            ffi::av_opt_set((*ctx).priv_data, rc.as_ptr(), rc_mode.as_ptr(), 0);
 
             // Zero-delay output
             let delay = std::ffi::CString::new("delay").unwrap();
@@ -622,14 +631,15 @@ impl NvencEncoder {
 
         let bitrate_bps = config.bitrate_bps();
         let buffer_size = config.vbv_buffer_size(false) as i64;
+        let min_rate = if config.cbr_forced() { bitrate_bps } else { 0 };
         unsafe {
             (*self.codec_ctx).bit_rate = bitrate_bps;
-            (*self.codec_ctx).rc_min_rate = bitrate_bps;
+            (*self.codec_ctx).rc_min_rate = min_rate;
             (*self.codec_ctx).rc_max_rate = bitrate_bps;
             (*self.codec_ctx).rc_buffer_size = config.vbv_buffer_size(false);
 
             set_int_opt(self.codec_ctx.cast(), "b", bitrate_bps)?;
-            set_int_opt(self.codec_ctx.cast(), "minrate", bitrate_bps)?;
+            set_int_opt(self.codec_ctx.cast(), "minrate", min_rate)?;
             set_int_opt(self.codec_ctx.cast(), "maxrate", bitrate_bps)?;
             set_int_opt(self.codec_ctx.cast(), "bufsize", buffer_size)?;
         }

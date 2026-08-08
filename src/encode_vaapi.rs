@@ -321,18 +321,16 @@ impl VaapiEncoder {
 
                     colorspace.apply_to_codec_ctx(ctx);
 
-                    // Rate control per vendor
-                    match gpu_vendor {
-                        GpuVendor::Intel => {
-                            // Intel: VBR — only cap the max rate, single-frame VBV
-                            (*ctx).rc_max_rate = config.bitrate_bps();
-                        }
-                        _ => {
-                            // AMD/Other: CBR — pin min and max to bitrate
-                            (*ctx).rc_min_rate = config.bitrate_bps();
-                            (*ctx).rc_max_rate = config.bitrate_bps();
-                        }
+                    // Capped VBR on every vendor: maxrate + the 1-frame VBV
+                    // bound the per-frame burst exactly like pinned CBR, but
+                    // static content may undershoot instead of burning the
+                    // full budget on identical frames. ST_RC_MODE=cbr
+                    // restores the old AMD min==max pinning (see
+                    // EncoderConfig::cbr_forced); Intel was VBR-only already.
+                    if config.cbr_forced() && !matches!(gpu_vendor, GpuVendor::Intel) {
+                        (*ctx).rc_min_rate = config.bitrate_bps();
                     }
+                    (*ctx).rc_max_rate = config.bitrate_bps();
 
                     // Minimal encoder pipeline depth — only 1 frame in-flight
                     let async_key = std::ffi::CString::new("async_depth").unwrap();
@@ -789,26 +787,20 @@ impl VaapiEncoder {
 
         let bitrate_bps = config.bitrate_bps();
         let buffer_size = config.vbv_buffer_size(false) as i64;
+        // Capped VBR everywhere; ST_RC_MODE=cbr restores the old AMD/other
+        // min==max pinning (see EncoderConfig::cbr_forced).
+        let pin_min = config.cbr_forced() && !matches!(self.gpu_vendor, GpuVendor::Intel);
+        let min_rate = if pin_min { bitrate_bps } else { 0 };
         unsafe {
             (*self.codec_ctx).bit_rate = bitrate_bps;
             (*self.codec_ctx).rc_buffer_size = config.vbv_buffer_size(false);
-            match self.gpu_vendor {
-                GpuVendor::Intel => {
-                    (*self.codec_ctx).rc_min_rate = 0;
-                    (*self.codec_ctx).rc_max_rate = bitrate_bps;
-                }
-                _ => {
-                    (*self.codec_ctx).rc_min_rate = bitrate_bps;
-                    (*self.codec_ctx).rc_max_rate = bitrate_bps;
-                }
-            }
+            (*self.codec_ctx).rc_min_rate = min_rate;
+            (*self.codec_ctx).rc_max_rate = bitrate_bps;
 
             set_int_opt(self.codec_ctx.cast(), "b", bitrate_bps)?;
             set_int_opt(self.codec_ctx.cast(), "maxrate", bitrate_bps)?;
             set_int_opt(self.codec_ctx.cast(), "bufsize", buffer_size)?;
-            if !matches!(self.gpu_vendor, GpuVendor::Intel) {
-                set_int_opt(self.codec_ctx.cast(), "minrate", bitrate_bps)?;
-            }
+            set_int_opt(self.codec_ctx.cast(), "minrate", min_rate)?;
         }
 
         Ok(())
