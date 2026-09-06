@@ -326,6 +326,11 @@ pub struct IpcClient {
 impl IpcClient {
     pub fn connect(path: &Path) -> io::Result<Self> {
         let stream = UnixStream::connect(path)?;
+        // A live socket can stop replying during a server stall/update. Bound
+        // IPC waits so tray polling and menu callbacks can reconnect.
+        let timeout = Some(std::time::Duration::from_secs(2));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
         let reader = BufReader::new(stream.try_clone()?);
         Ok(Self {
             reader,
@@ -419,6 +424,20 @@ fn unexpected(resp: &Resp) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_server_does_not_block_tray_snapshot_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stalled.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut client = IpcClient::connect(&path).unwrap();
+        let (_stalled_server, _) = listener.accept().unwrap();
+        let error = client.snapshot().unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+    }
 
     #[test]
     fn snapshot_and_setters_round_trip() {

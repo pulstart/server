@@ -956,7 +956,18 @@ impl InputRuntime {
             return;
         };
 
-        if !cursor.visible || cursor.width == 0 || cursor.height == 0 || cursor.pixels.is_empty() {
+        // Some games hide the pointer by installing a transparent bitmap
+        // instead of disabling the cursor plane. Treat a complete, blank shape
+        // as hidden too; an absent/partial shape alone is not visibility data.
+        let shape_bytes = (cursor.width as usize)
+            .checked_mul(cursor.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        let transparent = shape_bytes
+            .filter(|&len| len > 0)
+            .and_then(|len| cursor.pixels.get(..len))
+            .is_some_and(|pixels| pixels.chunks_exact(4).all(|pixel| pixel[3] == 0));
+        let visible = cursor.visible && !transparent;
+        if !visible || cursor.width == 0 || cursor.height == 0 || cursor.pixels.is_empty() {
             let serial = if cursor.shape_serial != 0 {
                 cursor.shape_serial
             } else {
@@ -974,7 +985,7 @@ impl InputRuntime {
                 serial,
                 x: cursor.x,
                 y: cursor.y,
-                visible: cursor.visible,
+                visible,
                 app_grab: false,
             };
             if inner.cursor_state != next_state {
@@ -4290,6 +4301,52 @@ mod tests {
             };
         }
         (runtime, events)
+    }
+
+    #[test]
+    fn transparent_game_cursor_hides_and_menu_cursor_restores() {
+        let (runtime, _) = cooperative_runtime();
+        let mut cursor = CapturedCursor {
+            pixels: vec![255, 255, 255, 0].into(),
+            x: 500,
+            y: 300,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width: 1,
+            height: 1,
+            shape_serial: 42,
+            visible: true,
+        };
+        runtime.update_cursor(Some(&cursor));
+        {
+            let inner = runtime.inner.lock().unwrap();
+            assert!(!inner.cursor_state.visible);
+            assert!(inner.cursor_state_version > 0);
+        }
+        // Reusing the same shape ID must still restore a visible menu cursor.
+        cursor.pixels = vec![255, 255, 255, 255].into();
+        runtime.update_cursor(Some(&cursor));
+        let inner = runtime.inner.lock().unwrap();
+        assert!(inner.cursor_state.visible);
+        assert!(inner.cursor_shape.is_some());
+    }
+
+    #[test]
+    fn missing_cursor_bitmap_does_not_override_explicit_visibility() {
+        let (runtime, _) = cooperative_runtime();
+        let cursor = CapturedCursor {
+            pixels: Vec::new().into(),
+            x: 500,
+            y: 300,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width: 0,
+            height: 0,
+            shape_serial: 42,
+            visible: true,
+        };
+        runtime.update_cursor(Some(&cursor));
+        assert!(runtime.inner.lock().unwrap().cursor_state.visible);
     }
 
     fn send_tunnel(runtime: &InputRuntime, client_id: u32, seq: u16, packet: InputPacket) {

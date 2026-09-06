@@ -3148,7 +3148,7 @@ dependencies = [
 
 [[package]]
 name = "st-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
@@ -3161,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "st-server"
-version = "0.1.0"
+version = "0.9.9"
 dependencies = [
  "arboard",
  "bitflags 2.11.0",

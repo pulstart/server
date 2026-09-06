@@ -109,8 +109,8 @@ fn is_game(state: &FocusState, excluded: &[String], games: &[String]) -> bool {
 }
 
 /// Running detector. Holds its worker thread alive for the process lifetime; the
-/// `stop` flag lets poll loops exit promptly. The KWin script is left loaded (a
-/// reload by the same plugin name replaces it; it harmlessly idles otherwise).
+/// `stop` flag lets poll loops exit promptly. The KWin script is replaced on
+/// the next start so the new receiver gets an initial focused-window report.
 pub struct GameModeWatcher {
     stop: Arc<AtomicBool>,
 }
@@ -198,57 +198,52 @@ fn run_cli(cmd: &str, args: &[&str]) -> Option<String> {
     String::from_utf8(out.stdout).ok()
 }
 
-/// `hyprctl -j activewindow` → JSON with `"fullscreen"` (0/1/int) and `"class"`.
-/// Parsed with a tiny string scan to avoid pulling in a JSON dep here.
+/// `hyprctl -j activewindow` reports the focused window directly.
 fn query_hyprland() -> Option<FocusState> {
     let json = run_cli("hyprctl", &["-j", "activewindow"])?;
-    let fullscreen = json_number_field(&json, "fullscreen").map(|n| n > 0.0);
-    let class = json_string_field(&json, "class").unwrap_or_default();
+    let window: serde_json::Value = serde_json::from_str(&json).ok()?;
     Some(FocusState {
-        fullscreen: fullscreen.unwrap_or(false),
-        class,
+        fullscreen: window["fullscreen"].as_u64().unwrap_or(0) > 0,
+        class: window["class"].as_str().unwrap_or_default().to_string(),
     })
 }
 
-/// Sway: find the focused node, read its `fullscreen_mode` (>0) and `app_id`
-/// (Wayland) / `window_properties.class` (XWayland).
+/// Sway returns a tree, including both tiled and floating containers. Read
+/// only the focused node's identity, inheriting fullscreen from its ancestors.
 fn query_sway() -> Option<FocusState> {
     let json = run_cli("swaymsg", &["-t", "get_tree"])?;
-    // Locate the `"focused": true` node and read fields near it. get_tree is a
-    // big nested object; a focused leaf has `"focused": true` plus its own
-    // `fullscreen_mode` and `app_id`. Scan around the focused marker.
-    let idx = json.find("\"focused\": true")?;
-    // Search a window before/after the marker for the nearest fields.
-    let window = &json[idx.saturating_sub(4000)..(idx + 4000).min(json.len())];
-    let fullscreen = json_number_field(window, "fullscreen_mode")
-        .map(|n| n > 0.0)
-        .unwrap_or(false);
-    let class = json_string_field(window, "app_id")
-        .filter(|s| !s.is_empty())
-        .or_else(|| json_string_field(window, "class"))
-        .unwrap_or_default();
-    Some(FocusState { fullscreen, class })
+    parse_sway_focus(&json)
 }
 
-/// Read `"key": <number>` from a JSON fragment (first occurrence).
-fn json_number_field(json: &str, key: &str) -> Option<f64> {
-    let needle = format!("\"{key}\"");
-    let start = json.find(&needle)? + needle.len();
-    let rest = json[start..].trim_start().strip_prefix(':')?.trim_start();
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
-        .unwrap_or(rest.len());
-    rest[..end].parse::<f64>().ok()
-}
+fn parse_sway_focus(json: &str) -> Option<FocusState> {
+    fn focused(node: &serde_json::Value, parent_fullscreen: bool) -> Option<FocusState> {
+        let fullscreen = parent_fullscreen || node["fullscreen_mode"].as_u64().unwrap_or(0) > 0;
+        if node["focused"].as_bool() == Some(true) {
+            let class = node["app_id"]
+                .as_str()
+                .filter(|class| !class.is_empty())
+                .or_else(|| node["window_properties"]["class"].as_str())
+                .unwrap_or_default();
+            // An empty focused workspace is not a fullscreen application.
+            return Some(FocusState {
+                fullscreen: fullscreen && !class.is_empty(),
+                class: class.to_string(),
+            });
+        }
+        for field in ["nodes", "floating_nodes"] {
+            if let Some(children) = node[field].as_array() {
+                for child in children {
+                    if let Some(state) = focused(child, fullscreen) {
+                        return Some(state);
+                    }
+                }
+            }
+        }
+        None
+    }
 
-/// Read `"key": "value"` from a JSON fragment (first occurrence).
-fn json_string_field(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let start = json.find(&needle)? + needle.len();
-    let rest = json[start..].trim_start().strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    let tree: serde_json::Value = serde_json::from_str(json).ok()?;
+    Some(focused(&tree, false).unwrap_or_default())
 }
 
 // ---- KWin: load a script that calls back over D-Bus --------------------------
@@ -366,16 +361,28 @@ async fn load_kwin_script() -> Result<(), String> {
     )
     .await
     .map_err(|e| format!("scripting proxy: {e}"))?;
-    // loadScript(path, pluginName) -> id. Same plugin name replaces a prior load.
-    let _id: i32 = proxy
-        .call("loadScript", &(path.as_str(), "st-gamemode"))
-        .await
-        .map_err(|e| format!("loadScript: {e}"))?;
+    // KWin returns -1 for an already-loaded plugin; it does not replace it.
+    // Unload first so restarting the tray refreshes both the code and its
+    // initial focus report. Deletion is deferred in KWin's event loop.
     proxy
-        .call::<_, _, ()>("start", &())
+        .call::<_, _, bool>("unloadScript", &("st-gamemode",))
         .await
-        .map_err(|e| format!("start: {e}"))?;
-    Ok(())
+        .map_err(|e| format!("unloadScript: {e}"))?;
+    for _ in 0..20 {
+        let id: i32 = proxy
+            .call("loadScript", &(path.as_str(), "st-gamemode"))
+            .await
+            .map_err(|e| format!("loadScript: {e}"))?;
+        if id >= 0 {
+            proxy
+                .call::<_, _, ()>("start", &())
+                .await
+                .map_err(|e| format!("start: {e}"))?;
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Err("KWin did not unload the previous game-mode script".into())
 }
 
 #[cfg(test)]
@@ -428,5 +435,42 @@ mod tests {
         // game-class match short-circuits before the fullscreen + exclude rule.
         let (ex, ga) = lists();
         assert!(is_game(&st(false, "steam_app_42"), &ex, &ga));
+    }
+
+    #[test]
+    fn sway_reads_focused_floating_game_instead_of_nearby_browser() {
+        let tree = serde_json::json!({
+            "nodes": [{"app_id": "firefox", "focused": false, "fullscreen_mode": 0}],
+            "floating_nodes": [{
+                "fullscreen_mode": 1,
+                "nodes": [{"focused": true, "app_id": null,
+                    "window_properties": {"class": "game-\"世界\""}}]
+            }]
+        });
+        let focus = parse_sway_focus(&tree.to_string()).unwrap();
+        assert_eq!(focus.class, "game-\"世界\"");
+        assert!(focus.fullscreen);
+        let (ex, ga) = lists();
+        assert!(is_game(&focus, &ex, &ga));
+    }
+
+    #[test]
+    fn sway_does_not_inherit_unfocused_games_identity() {
+        let tree = serde_json::json!({"nodes": [
+            {"app_id": "steam_app_730", "fullscreen_mode": 1, "focused": false},
+            {"app_id": "firefox", "fullscreen_mode": 1, "focused": true}
+        ]});
+        let focus = parse_sway_focus(&tree.to_string()).unwrap();
+        let (ex, ga) = lists();
+        assert!(!is_game(&focus, &ex, &ga));
+    }
+
+    #[test]
+    fn sway_clears_game_mode_on_empty_focus() {
+        let (ex, ga) = lists();
+        for tree in [r#"{"focused":true,"type":"workspace"}"#, r#"{"nodes":[]}"#] {
+            assert!(!is_game(&parse_sway_focus(tree).unwrap(), &ex, &ga));
+        }
+        assert!(parse_sway_focus("invalid JSON").is_none());
     }
 }

@@ -193,15 +193,30 @@ fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
     }));
 
     let quit = Arc::new(AtomicBool::new(false));
-    let handle = LinuxTray {
-        control: control.clone(),
-        quit: Arc::clone(&quit),
-    }
-    .assume_sni_available(true)
-    .spawn()
-    .map_err(|err| format!("Failed to create Linux tray: {err}"))?;
-
-    while !quit.load(Ordering::SeqCst) && !control.shutdown_requested() && !handle.is_closed() {
+    let mut handle: Option<ksni::blocking::Handle<LinuxTray>> = None;
+    while !quit.load(Ordering::SeqCst) && !control.shutdown_requested() {
+        if handle.as_ref().is_some_and(|handle| handle.is_closed()) {
+            eprintln!("[tray] StatusNotifier service closed; recreating tray in 2s");
+            handle = None;
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        if handle.is_none() {
+            match (LinuxTray {
+                control: control.clone(),
+                quit: Arc::clone(&quit),
+            })
+            .assume_sni_available(true)
+            .spawn()
+            {
+                Ok(new_handle) => handle = Some(new_handle),
+                Err(err) => {
+                    eprintln!("[tray] Failed to create Linux tray ({err}); retrying in 2s");
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            }
+        }
         // Remote handles pull a fresh snapshot here; Local is a no-op.
         control.refresh();
         if wake_via_agent {
@@ -225,12 +240,16 @@ fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
         if version != last_version || api_connected != last_api_connected {
             last_version = version;
             last_api_connected = api_connected;
-            let _ = handle.update(|_| {});
+            if let Some(handle) = &handle {
+                let _ = handle.update(|_| {});
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    handle.shutdown().wait();
+    if let Some(handle) = handle {
+        handle.shutdown().wait();
+    }
     Ok(())
 }
 
@@ -282,7 +301,10 @@ impl ControlHandle {
     fn shutdown_requested(&self) -> bool {
         match self {
             ControlHandle::Local { control, .. } => control.shutdown_requested(),
-            ControlHandle::Remote(r) => r.cache().shutdown_requested,
+            // A system server restart/update is not a request to quit this
+            // user's tray. Keep polling and reconnect to the replacement
+            // service; only the local Quit Tray action ends the agent.
+            ControlHandle::Remote(_) => false,
         }
     }
 
@@ -366,7 +388,10 @@ impl ControlHandle {
     fn set_game_mode(&self, on: bool) {
         match self {
             ControlHandle::Local { control, .. } => control.set_session_game_mode(on),
-            ControlHandle::Remote(r) => r.with_client(|c| c.set_game_mode(on)),
+            ControlHandle::Remote(r) => {
+                *r.game_mode.lock().unwrap() = Some(on);
+                r.with_client(|c| c.set_game_mode(on));
+            }
         }
     }
 
@@ -440,6 +465,8 @@ struct RemoteControl {
     client: Mutex<Option<IpcClient>>,
     cache: Mutex<StateSnapshot>,
     socket_path: std::path::PathBuf,
+    /// Restore focus after reconnect even if the compositor emits no new event.
+    game_mode: Mutex<Option<bool>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -451,6 +478,7 @@ impl RemoteControl {
             client: Mutex::new(Some(client)),
             cache: Mutex::new(snapshot),
             socket_path: path.to_path_buf(),
+            game_mode: Mutex::new(None),
         }))
     }
 
@@ -477,23 +505,30 @@ impl RemoteControl {
     /// on success. Best-effort: failure leaves the cache stale until the next
     /// tick retries.
     fn reconnect(&self) {
-        *self.client.lock().unwrap() = None;
+        let mut client = self.client.lock().unwrap();
+        *client = None;
         if let Ok(mut fresh) = IpcClient::connect(&self.socket_path) {
             if let Ok(snapshot) = fresh.snapshot() {
+                if let Some(on) = *self.game_mode.lock().unwrap() {
+                    if fresh.set_game_mode(on).is_err() {
+                        return; // retry synchronization on the next poll
+                    }
+                }
                 *self.cache.lock().unwrap() = snapshot;
+                *client = Some(fresh);
             }
-            *self.client.lock().unwrap() = Some(fresh);
         }
     }
 
     fn with_client(&self, f: impl FnOnce(&mut IpcClient) -> std::io::Result<()>) {
+        // Use the same reconnect path for menu actions and polling so a menu
+        // click during a restart also restores the current game-mode hint.
+        let disconnected = self.client.lock().unwrap().is_none();
+        if disconnected {
+            self.reconnect();
+        }
         {
             let mut guard = self.client.lock().unwrap();
-            if guard.is_none() {
-                if let Ok(c) = IpcClient::connect(&self.socket_path) {
-                    *guard = Some(c);
-                }
-            }
             match guard.as_mut() {
                 Some(client) => {
                     if let Err(err) = f(client) {
@@ -760,7 +795,10 @@ impl ksni::Tray for LinuxTray {
 
     fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
         eprintln!("[tray] Linux StatusNotifier watcher offline: {reason:?}");
-        true
+        // ksni re-registers when a missing watcher returns. A registration or
+        // D-Bus error needs a fresh service instead: waiting for another name
+        // change can otherwise leave the icon absent indefinitely.
+        matches!(reason, ksni::OfflineReason::No)
     }
 }
 
@@ -2104,4 +2142,94 @@ fn desktop_tray_icon(connected: bool) -> Result<DesktopTrayIcon, String> {
     let (rgba, width, height) = server_icon_rgba(connected);
     DesktopTrayIcon::from_rgba(rgba, width, height)
         .map_err(|err| format!("Failed to build tray icon: {err}"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn remote_control(shutdown_requested: bool) -> ControlHandle {
+        ControlHandle::Remote(Arc::new(RemoteControl {
+            client: Mutex::new(None),
+            socket_path: std::path::PathBuf::from("/unused-test-socket"),
+            game_mode: Mutex::new(None),
+            cache: Mutex::new(StateSnapshot {
+                version: 1,
+                shutdown_requested,
+                token: String::new(),
+                peer_id: "host".into(),
+                allow_new_connections: true,
+                forced_codec: 0,
+                forced_bitrate_kbps: 0,
+                forced_quality: 0,
+                api_connected: None,
+                update_state: UpdateStateWire::ClosingForUpdate {
+                    version: "next".into(),
+                },
+                clients: Vec::new(),
+                wake_generation: 0,
+            }),
+        }))
+    }
+
+    #[test]
+    fn system_server_shutdown_does_not_quit_its_tray_agent() {
+        assert!(!remote_control(true).shutdown_requested());
+        assert!(!remote_control(false).shutdown_requested());
+    }
+
+    #[test]
+    fn watcher_restart_waits_but_registration_error_recreates_service() {
+        let tray = LinuxTray {
+            control: remote_control(false),
+            quit: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(ksni::Tray::watcher_offline(&tray, ksni::OfflineReason::No));
+        assert!(!ksni::Tray::watcher_offline(
+            &tray,
+            ksni::OfflineReason::Error(ksni::Error::WontShow),
+        ));
+        assert!(!tray.quit.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reconnect_restores_game_hint_without_another_focus_event() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let ControlHandle::Remote(mut remote) = remote_control(true) else {
+            unreachable!();
+        };
+        let inner = Arc::get_mut(&mut remote).unwrap();
+        inner.socket_path = path;
+        *inner.game_mode.lock().unwrap() = Some(true);
+        let mut snapshot = inner.cache();
+        snapshot.shutdown_requested = false;
+        let response = serde_json::json!({"Snapshot": snapshot}).to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "\"Snapshot\"");
+            writeln!(stream, "{response}").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                serde_json::json!({"SetGameMode": true})
+            );
+            writeln!(stream, "\"Ack\"").unwrap();
+        });
+        remote.refresh();
+        assert!(!remote.cache().shutdown_requested);
+        assert!(remote.client.lock().unwrap().is_some());
+        server.join().unwrap();
+    }
 }
