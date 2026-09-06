@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Must match the ABI the Rust crates are compiled against (ffmpeg-next in
-  # Cargo.toml). BtbN only ships n7.1 and n8.1 — n8.0 does not exist.
+  # Windows FFmpeg SDK. macOS uses ffmpeg@7, available on hosted runners.
+  # The pinned ffmpeg-next 8 bindings support both native library versions.
   FFMPEG_VERSION: "8.1"
   FFMPEG_BUILD_TAG: "latest"
 
@@ -107,8 +107,8 @@ jobs:
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         run: |
-          brew install ffmpeg@8 opus pkg-config
-          FFMPEG_PREFIX="$(brew --prefix ffmpeg@8)"
+          brew install ffmpeg@7 opus pkg-config
+          FFMPEG_PREFIX="$(brew --prefix ffmpeg@7)"
           OPUS_PREFIX="$(brew --prefix opus)"
           echo "PKG_CONFIG_PATH=${FFMPEG_PREFIX}/lib/pkgconfig:${OPUS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
           echo "FFMPEG_DIR=${FFMPEG_PREFIX}" >> "$GITHUB_ENV"
