@@ -692,7 +692,17 @@ fn request_systemd_restart(scope: &SystemdScope) -> Result<(), String> {
 }
 
 fn cleanup_staging_root(staging_root: &Path) {
-    let _ = self_replace::self_delete_outside_path(staging_root);
+    // self_delete_outside_path deletes the running executable; "outside" only
+    // controls Windows temporary-file placement. A relaunch helper can
+    // run from the installed app, which must never be deleted during cleanup.
+    let helper_is_staged = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .ok()
+        .zip(staging_root.canonicalize().ok())
+        .is_some_and(|(exe, staging)| exe.starts_with(staging));
+    if helper_is_staged {
+        let _ = self_replace::self_delete_outside_path(staging_root);
+    }
     let _ = fs::remove_dir_all(staging_root);
 }
 
@@ -824,5 +834,43 @@ mod tests {
     fn strips_v_prefix() {
         assert_eq!(normalize_version("v1.2.3").unwrap(), "1.2.3");
         assert_eq!(normalize_version("1.2.3").unwrap(), "1.2.3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_an_installed_relaunch_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = root.path().join("installed-helper");
+        let staging = root.path().join("download");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("archive.zip"), b"download").unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &installed).unwrap();
+        let result = std::process::Command::new(&installed)
+            .args([
+                "--exact",
+                "updater::tests::cleanup_helper_process",
+                "--nocapture",
+            ])
+            .env("ST_TEST_UPDATE_STAGING", &staging)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            installed.is_file(),
+            "cleanup deleted the installed executable"
+        );
+        assert!(!staging.exists(), "download staging was not removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_helper_process() {
+        if let Some(staging) = std::env::var_os("ST_TEST_UPDATE_STAGING") {
+            super::cleanup_staging_root(std::path::Path::new(&staging));
+        }
     }
 }

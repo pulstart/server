@@ -229,20 +229,19 @@ prepare_codesign_keychain() {
 }
 
 sign_app_bundle() {
-    codesign \
-        --force \
-        --sign "$MACOS_CODESIGN_IDENTITY" \
-        --timestamp \
-        --options runtime \
-        "$app_executable"
-
-    codesign \
-        --force \
-        --sign "$MACOS_CODESIGN_IDENTITY" \
-        --timestamp \
-        --options runtime \
-        "$app_root"
-
+    local identity="$1"
+    local library
+    local options=(--force --sign "$identity")
+    if [[ "$identity" != "-" ]]; then
+        options+=(--timestamp --options runtime)
+    fi
+    # Sign nested code first, after rewriting every dependency load command.
+    for library in "$app_root"/Contents/Frameworks/*.dylib; do
+        [[ -f "$library" ]] || continue
+        codesign "${options[@]}" "$library"
+    done
+    codesign "${options[@]}" "$app_executable"
+    codesign "${options[@]}" "$app_root"
     codesign --verify --deep --strict --verbose=2 "$app_root"
 }
 
@@ -276,13 +275,24 @@ create_final_archive() {
 }
 
 copy_app_bundle
+python3 "${server_root}/scripts/bundle-macos-libs.py" "$binary_path" "$app_executable"
 
 if has_codesign_credentials; then
     assert_notarization_credentials
     trap cleanup_signing_material EXIT
     prepare_codesign_keychain
-    sign_app_bundle
+    sign_app_bundle "$MACOS_CODESIGN_IDENTITY"
     notarize_app_bundle
+else
+    # Mach-O edits invalidate the linker's signature, including on Apple Silicon.
+    sign_app_bundle "-"
+fi
+
+# Catch dyld/code-signing failures before publishing an otherwise valid ZIP.
+reported_version="$(env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH "$app_executable" --version)"
+if [[ "$reported_version" != "st-server $version" ]]; then
+    echo "Packaged app failed its startup/version check: $reported_version" >&2
+    exit 1
 fi
 
 create_final_archive

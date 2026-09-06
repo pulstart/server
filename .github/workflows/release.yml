@@ -141,6 +141,12 @@ jobs:
           echo "FFMPEG_DIR=$($extractedDir.FullName)" >> $env:GITHUB_ENV
           Write-Host "FFmpeg extracted to $($extractedDir.FullName)"
 
+      - name: Verify macOS update and bundle behavior
+        if: runner.os == 'macOS'
+        run: |
+          python3 scripts/test_macos_bundle.py
+          cargo test --release --locked updater::tests
+
       - name: Build Unix release
         if: matrix.build_kind == 'unix'
         run: cargo build --release --locked
