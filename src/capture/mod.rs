@@ -9,6 +9,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 static TARGET_FPS: AtomicU32 = AtomicU32::new(60);
+#[cfg(target_os = "linux")]
+static UNCHANGED_CAPTURE_TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// Intentional damage skips are successful capture opportunities, not overload.
+#[cfg(target_os = "linux")]
+pub fn record_unchanged_capture_tick() {
+    UNCHANGED_CAPTURE_TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "linux")]
+pub fn take_unchanged_capture_ticks() -> u32 {
+    UNCHANGED_CAPTURE_TICKS.swap(0, Ordering::Relaxed)
+}
 
 /// A single plane of a DMA-BUF (GPU-accessible buffer exported via DRM).
 #[cfg(target_os = "linux")]

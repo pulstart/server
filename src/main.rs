@@ -1945,6 +1945,8 @@ fn run_shared_pipeline(
         adaptive_bitrate::AdaptiveFrameRate::from_env(current_config.framerate, Instant::now());
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut frame_rate_tracker = adaptive_bitrate::EncodeRateTracker::new(Instant::now());
+    #[cfg(target_os = "linux")]
+    let _ = capture::take_unchanged_capture_ticks();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if adaptive_fps.enabled() {
         println!(
@@ -2426,10 +2428,17 @@ fn run_shared_pipeline(
                             last_encoder_reconfigure = Instant::now();
                             if fps_changed {
                                 capture::set_target_fps(current_config.framerate);
-                                adaptive_fps = adaptive_bitrate::AdaptiveFrameRate::from_env(
+                            }
+                            if fps_changed || profile_change {
+                                adaptive_fps.encoder_reconfigured(
                                     current_config.framerate,
+                                    profile_change,
                                     Instant::now(),
                                 );
+                                frame_rate_tracker =
+                                    adaptive_bitrate::EncodeRateTracker::new(Instant::now());
+                                #[cfg(target_os = "linux")]
+                                let _ = capture::take_unchanged_capture_ticks();
                             }
                             let snapshot = capture_state.commit_encoder_config(
                                 current_config.to_stream_config(&audio_config),
@@ -2441,6 +2450,14 @@ fn run_shared_pipeline(
                             }
                         }
                         Err(err) => {
+                            if matches!(&pending.purpose, RebuildPurpose::FrameRate) {
+                                capture::set_target_fps(current_config.framerate);
+                                adaptive_fps.encoder_reconfigured(
+                                    current_config.framerate,
+                                    false,
+                                    Instant::now(),
+                                );
+                            }
                             if let RebuildPurpose::Profile(request) = pending.purpose {
                                 eprintln!("[pipeline] video profile rebuild failed: {err}");
                                 request.reject(err);
@@ -2584,6 +2601,9 @@ fn run_shared_pipeline(
                 let encode_us = now.duration_since(encode_start).as_micros() as u64;
                 let budget_us = (1_000_000u64 / current_config.framerate.max(1) as u64).max(1);
                 frame_rate_tracker.record(encode_us, budget_us);
+                #[cfg(target_os = "linux")]
+                frame_rate_tracker
+                    .record_unchanged_capture_ticks(capture::take_unchanged_capture_ticks());
                 // Don't stack an fps rebuild on a pending bitrate/resolution one.
                 if pending_encoder_rebuild.is_none() {
                     if let Some(sample) = frame_rate_tracker.take_sample(now) {
@@ -2616,6 +2636,12 @@ fn run_shared_pipeline(
             }
         } else {
             // Release frame resources without encoding
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                frame_rate_tracker = adaptive_bitrate::EncodeRateTracker::new(Instant::now());
+            }
+            #[cfg(target_os = "linux")]
+            let _ = capture::take_unchanged_capture_ticks();
             #[cfg(target_os = "macos")]
             unsafe {
                 CVPixelBufferRelease(frame.pixel_buffer_ptr);

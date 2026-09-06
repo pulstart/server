@@ -439,7 +439,8 @@ impl AudioRedundancyController {
 /// produced this window (capture + copy + encode), not just the encoder call.
 #[derive(Clone, Copy, Debug)]
 pub struct EncodeLoadSample {
-    /// Frames actually encoded per second over the window. The *primary*
+    /// Capture opportunities serviced per second, including intentional damage
+    /// skips. Missing unchanged frames must not look like overload. The *primary*
     /// can't-sustain signal: if the box can't hold the target cadence the
     /// delivered rate sags below it regardless of where the bottleneck is
     /// (KMS GPU-copy, capture, or encode).
@@ -456,6 +457,7 @@ pub struct EncodeLoadSample {
 pub struct EncodeRateTracker {
     window_start: Instant,
     frames: u32,
+    unchanged_capture_ticks: u32,
     encode_us_sum: u64,
     overrun_frames: u32,
 }
@@ -468,6 +470,7 @@ impl EncodeRateTracker {
         Self {
             window_start: now,
             frames: 0,
+            unchanged_capture_ticks: 0,
             encode_us_sum: 0,
             overrun_frames: 0,
         }
@@ -482,6 +485,11 @@ impl EncodeRateTracker {
         if budget_us > 0 && encode_us > budget_us {
             self.overrun_frames = self.overrun_frames.saturating_add(1);
         }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn record_unchanged_capture_ticks(&mut self, ticks: u32) {
+        self.unchanged_capture_ticks = self.unchanged_capture_ticks.saturating_add(ticks);
     }
 
     /// Emit a sample and reset once the window has elapsed with enough frames.
@@ -499,7 +507,8 @@ impl EncodeRateTracker {
         }
         let frames = self.frames.max(1) as f32;
         let sample = EncodeLoadSample {
-            delivered_fps: self.frames as f32 / elapsed,
+            delivered_fps: self.frames.saturating_add(self.unchanged_capture_ticks) as f32
+                / elapsed,
             avg_encode_ms: (self.encode_us_sum as f32 / frames) / 1000.0,
             overrun_ratio: self.overrun_frames as f32 / frames,
         };
@@ -597,6 +606,16 @@ impl AdaptiveFrameRate {
 
     pub fn current_fps(&self) -> u32 {
         self.current_fps
+    }
+
+    /// Internal FPS rebuilds must retain the negotiated ceiling and probe
+    /// history. Only a newly negotiated profile establishes a new ceiling.
+    pub fn encoder_reconfigured(&mut self, fps: u32, profile_change: bool, now: Instant) {
+        if profile_change {
+            *self = Self::with_enabled(self.enabled, fps, now);
+        } else {
+            self.current_fps = fps.clamp(self.floor_fps, self.ceiling_fps);
+        }
     }
 
     fn step_down(&self) -> Option<u32> {
@@ -1727,5 +1746,61 @@ mod tests {
         }
         let s = tr.take_sample(start + Duration::from_millis(1100)).unwrap();
         assert_eq!(s.overrun_ratio, 1.0);
+    }
+
+    #[test]
+    fn unchanged_desktop_does_not_degrade_fps_over_a_minute() {
+        let start = Instant::now();
+        let mut tracker = EncodeRateTracker::new(start);
+        let mut controller = AdaptiveFrameRate::with_enabled(true, 120, start);
+        // KMS samples at 120 Hz but forwards just four keepalives per second.
+        // Real encodes take 4.2 ms, as in the reported LAN degradation trace.
+        for tick in 1..=240 {
+            tracker.record(4_200, 1_000_000 / 120);
+            tracker.record_unchanged_capture_ticks(29);
+            let now = start + Duration::from_millis(tick * 250);
+            if let Some(sample) = tracker.take_sample(now) {
+                assert!((sample.delivered_fps - 120.0).abs() < 0.1);
+                assert!((sample.avg_encode_ms - 4.2).abs() < 0.1);
+                assert_eq!(controller.apply_at(&sample, now), None);
+            }
+        }
+        assert_eq!(controller.current_fps(), 120);
+    }
+
+    #[test]
+    fn real_capture_shortfall_still_reduces_fps() {
+        let start = Instant::now();
+        let mut tracker = EncodeRateTracker::new(start);
+        let mut controller = AdaptiveFrameRate::with_enabled(true, 120, start);
+        for _ in 0..120 {
+            tracker.record(4_200, 1_000_000 / 120);
+        }
+        let now = start + Duration::from_secs(2);
+        let sample = tracker.take_sample(now).unwrap();
+        assert_eq!(sample.delivered_fps, 60.0);
+        assert_eq!(controller.apply_at(&sample, now), Some(90));
+    }
+
+    #[test]
+    fn encoder_fps_rebuilds_preserve_ceiling_and_allow_recovery() {
+        let start = Instant::now();
+        let mut controller = AdaptiveFrameRate::with_enabled(true, 120, start);
+        let mut now = start + Duration::from_secs(2);
+        let reduced = controller.apply_at(&load(60.0, 4.2, 0.0), now).unwrap();
+        controller.encoder_reconfigured(reduced, false, now);
+        assert_eq!(controller.ceiling_fps, 120);
+        for _ in 0..40 {
+            now += Duration::from_secs(1);
+            let sample = load(controller.current_fps() as f32, 4.2, 0.0);
+            if let Some(fps) = controller.apply_at(&sample, now) {
+                controller.encoder_reconfigured(fps, false, now);
+            }
+        }
+        assert_eq!(controller.current_fps(), 120);
+        // A user-requested profile really does establish a lower ceiling.
+        controller.encoder_reconfigured(60, true, now);
+        assert_eq!(controller.ceiling_fps, 60);
+        assert_eq!(controller.current_fps(), 60);
     }
 }

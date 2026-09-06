@@ -1058,6 +1058,7 @@ impl CaptureBackend for KmsCapture {
                         }
                     };
                 if skip_unchanged {
+                    super::super::record_unchanged_capture_tick();
                     match pacer.as_mut() {
                         Some(p) => {
                             let _ = p.wait();
