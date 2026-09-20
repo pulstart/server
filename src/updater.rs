@@ -215,6 +215,20 @@ pub fn prepare_and_spawn_update(release: &ReleaseInfo) -> Result<(), String> {
         // that intact.
         #[cfg(target_os = "linux")]
         if let Some(scope) = systemd_service_scope() {
+            if matches!(scope, SystemdScope::System) {
+                // The tray is a different process in each user's manager. It
+                // owns compositor integration, so reconnecting its old binary
+                // to the updated service leaves game detection outdated.
+                // Queue these jobs before restarting our own unit, which may
+                // terminate this process as soon as systemctl returns.
+                if let Err(err) =
+                    restart_system_tray_agents(Path::new("/run/user"), Path::new("systemctl"))
+                {
+                    eprintln!(
+                        "[updater] {err}. Affected users must run: systemctl --user restart st-server-tray.service"
+                    );
+                }
+            }
             match request_systemd_restart(&scope) {
                 Ok(()) => {
                     // Files are already in place; staging is no longer needed.
@@ -665,6 +679,68 @@ fn systemd_service_scope() -> Option<SystemdScope> {
     None
 }
 
+/// Refresh active session agents after the shared installation is replaced.
+/// The root service has no user bus of its own: address each logged-in user's
+/// manager explicitly. `try-restart` preserves intentionally stopped trays.
+#[cfg(target_os = "linux")]
+fn restart_system_tray_agents(runtime_root: &Path, systemctl: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let users = match fs::read_dir(runtime_root) {
+        Ok(users) => users,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("Cannot enumerate tray sessions: {err}")),
+    };
+    let mut failures = Vec::new();
+    for user in users {
+        let user = match user {
+            Ok(user) => user,
+            Err(err) => {
+                failures.push(format!("Cannot read tray session: {err}"));
+                continue;
+            }
+        };
+        let Some(uid) = user
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !fs::metadata(user.path().join("systemd/private"))
+            .is_ok_and(|metadata| metadata.file_type().is_socket())
+        {
+            continue;
+        }
+        let result = Command::new(systemctl)
+            .args([
+                "--user",
+                &format!("--machine={uid}@.host"),
+                "--no-ask-password",
+                "--no-block",
+                "try-restart",
+                "st-server-tray.service",
+            ])
+            .output();
+        match result {
+            Ok(output) if output.status.success() => {
+                eprintln!("[updater] requested tray refresh for uid={uid}");
+            }
+            Ok(output) => failures.push(format!(
+                "Tray refresh failed for uid={uid}: {} ({})",
+                String::from_utf8_lossy(&output.stderr).trim(),
+                output.status
+            )),
+            Err(err) => failures.push(format!("Tray refresh failed for uid={uid}: {err}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 /// Ask systemd to restart the st-server unit. Used instead of self-relaunch when
 /// running under systemd: a self-spawned child would be reaped with the unit's
 /// cgroup and would lose the run-mode flags, capabilities, and launcher.
@@ -834,6 +910,65 @@ mod tests {
     fn strips_v_prefix() {
         assert_eq!(normalize_version("v1.2.3").unwrap(), "1.2.3");
         assert_eq!(normalize_version("1.2.3").unwrap(), "1.2.3");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_update_refreshes_session_trays_and_continues_after_failure() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("users");
+        let mut sockets = Vec::new();
+        for user in ["1000", "1001", "not-a-uid"] {
+            let manager = runtime.join(user).join("systemd");
+            std::fs::create_dir_all(&manager).unwrap();
+            sockets.push(UnixListener::bind(manager.join("private")).unwrap());
+        }
+        // A user without a running manager must not receive a restart request.
+        std::fs::create_dir_all(runtime.join("1002")).unwrap();
+        let systemctl = root.path().join("systemctl");
+        std::fs::write(
+            &systemctl,
+            r##"#!/bin/sh
+printf '%s\n' "$@" >> "$0.calls"
+printf '%s\n' END >> "$0.calls"
+case "$2" in
+    --machine=1001@.host) printf '%s\n' 'manager unavailable' >&2; exit 1 ;;
+esac
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = super::restart_system_tray_agents(&runtime, &systemctl).unwrap_err();
+        assert!(error.contains("uid=1001"));
+        assert!(error.contains("manager unavailable"));
+        let calls = std::fs::read_to_string(systemctl.with_extension("calls")).unwrap();
+        let mut calls: Vec<_> = calls.split("END\n").filter(|call| !call.is_empty()).collect();
+        calls.sort_unstable();
+        assert_eq!(calls.len(), 2);
+        for (call, uid) in calls.iter().zip([1000, 1001]) {
+            assert_eq!(
+                *call,
+                format!(
+                    "--user\n--machine={uid}@.host\n--no-ask-password\n--no-block\ntry-restart\nst-server-tray.service\n"
+                )
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_update_without_logged_in_users_needs_no_tray_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_systemctl = root.path().join("missing-systemctl");
+        assert!(super::restart_system_tray_agents(
+            &root.path().join("missing-users"),
+            &missing_systemctl,
+        )
+        .is_ok());
+        assert!(super::restart_system_tray_agents(root.path(), &missing_systemctl).is_ok());
     }
 
     #[cfg(unix)]

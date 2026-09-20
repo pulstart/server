@@ -184,8 +184,8 @@ fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
     let wake_in_progress = Arc::new(AtomicBool::new(false));
 
     // Session game-mode detector: this agent lives in the user's graphical
-    // session, so it can ask the compositor whether a fullscreen game is focused
-    // and push that to the service (→ CursorState.app_grab → relative capture).
+    // session, so it can identify the focused game and push that to the service.
+    // The service then interprets a missing KMS cursor as relative capture.
     // Held for the tray's lifetime; dropping it stops the worker.
     let _game_mode = crate::game_mode::start(Arc::new({
         let control = control.clone();
