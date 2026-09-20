@@ -3,14 +3,14 @@
 //! The root service can't see the user's compositor, so the per-user tray agent
 //! asks the compositor which window is focused and whether it's fullscreen, and
 //! pushes a "game mode" hint to the service over the control socket (mirrors the
-//! screen-wake-via-tray pattern). The service ORs it into `CursorState.app_grab`
-//! so the client enters relative (mouselook) capture — which is what makes
-//! fullscreen games work even where the warp detector can't (e.g. NVIDIA, no
-//! cursor-position readback).
+//! screen-wake-via-tray pattern). This lets the service interpret an absent KMS
+//! cursor as hidden while a game is focused. The client then enters relative
+//! capture; a visible menu cursor still restores absolute input.
 //!
 //! Signal: the focused window is a game when EITHER
 //!   - its app-class matches a known game class (`steam_app_…`, `gamescope`, …),
 //!     regardless of fullscreen — catches **windowed / borderless** games; OR
+//!   - its identity is a known standalone game (`z3d`); OR
 //!   - it is **fullscreen** AND its app-class is **not** a known browser / video
 //!     player (those go fullscreen for content you still want to click).
 //!
@@ -22,6 +22,8 @@
 //! excluded classes via `ST_GAME_MODE_EXCLUDE`; extra always-game classes (for a
 //! windowed game with an arbitrary class) via `ST_GAME_MODE_CLASSES`. Both are
 //! comma-separated, case-insensitive substring matches.
+//! Windows without an app-class use the owning executable's basename, resolved
+//! from the compositor-reported PID. Window titles are not used as identities.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -63,6 +65,25 @@ const DEFAULT_EXCLUDED: &[&str] = &[
 /// case-insensitively as substrings of the window's resource class / app-id.
 const DEFAULT_GAME_CLASSES: &[&str] = &["steam_app_", "gamescope", "lutris"];
 
+/// Exact identities: short standalone names must not match unrelated apps.
+const STANDALONE_GAMES: &[&str] = &["z3d"];
+
+/// Native Wayland apps may omit app_id (including Z3D's default winit window).
+/// Resolve their identity in the user session, where /proc/PID/exe is readable.
+/// A missing/exited process leaves the identity unknown; never infer from title.
+fn window_identity(class: &str, pid: Option<u32>) -> String {
+    if !class.is_empty() {
+        return class.to_string();
+    }
+    pid.filter(|&pid| pid > 0)
+        .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).ok())
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
 /// True when game-mode auto-detection is enabled (`ST_GAME_MODE`, default on).
 fn enabled() -> bool {
     !matches!(
@@ -99,10 +120,10 @@ fn game_classes() -> Vec<String> {
 /// fullscreen and not a known browser / video player.
 fn is_game(state: &FocusState, excluded: &[String], games: &[String]) -> bool {
     let cls = state.class.to_ascii_lowercase();
-    if games.iter().any(|g| cls.contains(g.as_str())) {
+    if STANDALONE_GAMES.contains(&cls.as_str()) || games.iter().any(|g| cls.contains(g.as_str())) {
         return true;
     }
-    if !state.fullscreen {
+    if !state.fullscreen || cls.is_empty() {
         return false;
     }
     !excluded.iter().any(|e| cls.contains(e.as_str()))
@@ -182,6 +203,10 @@ fn spawn_wlroots_poll(
                 let game = is_game(&state, &excluded, &games);
                 if last != Some(game) {
                     last = Some(game);
+                    eprintln!(
+                        "[gamemode] game={game} fullscreen={} identity={:?}",
+                        state.fullscreen, state.class
+                    );
                     on_change(game);
                 }
             }
@@ -204,7 +229,12 @@ fn query_hyprland() -> Option<FocusState> {
     let window: serde_json::Value = serde_json::from_str(&json).ok()?;
     Some(FocusState {
         fullscreen: window["fullscreen"].as_u64().unwrap_or(0) > 0,
-        class: window["class"].as_str().unwrap_or_default().to_string(),
+        class: window_identity(
+            window["class"].as_str().unwrap_or_default(),
+            window["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok()),
+        ),
     })
 }
 
@@ -224,10 +254,14 @@ fn parse_sway_focus(json: &str) -> Option<FocusState> {
                 .filter(|class| !class.is_empty())
                 .or_else(|| node["window_properties"]["class"].as_str())
                 .unwrap_or_default();
+            let class = window_identity(
+                class,
+                node["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()),
+            );
             // An empty focused workspace is not a fullscreen application.
             return Some(FocusState {
                 fullscreen: fullscreen && !class.is_empty(),
-                class: class.to_string(),
+                class,
             });
         }
         for field in ["nodes", "floating_nodes"] {
@@ -250,14 +284,21 @@ fn parse_sway_focus(json: &str) -> Option<FocusState> {
 
 const KWIN_SCRIPT: &str = r#"
 function report(w) {
-    var fs = false, cls = "";
-    if (w) { fs = (w.fullScreen === true); cls = "" + (w.resourceClass || ""); }
-    callDBus("org.st.GameMode", "/org/st/GameMode", "org.st.GameMode", "report", fs, cls);
+    var fs = false, cls = "", pid = "";
+    if (w) {
+        fs = (w.fullScreen === true);
+        cls = "" + (w.resourceClass || "");
+        pid = "" + (w.pid || "");
+    }
+    callDBus("org.st.GameMode", "/org/st/GameMode", "org.st.GameMode", "report", fs, cls, pid);
 }
 function hook(w) {
     report(w);
     if (w && w.fullScreenChanged) {
         w.fullScreenChanged.connect(function() { report(workspace.activeWindow); });
+    }
+    if (w && w.windowClassChanged) {
+        w.windowClassChanged.connect(function() { report(workspace.activeWindow); });
     }
 }
 if (workspace.windowActivated) workspace.windowActivated.connect(hook);
@@ -276,8 +317,11 @@ impl KwinReceiver {
     // KWin's callDBus uses the literal method name, so pin the wire name to
     // lowercase `report` (zbus would otherwise expose it as `Report`).
     #[zbus(name = "report")]
-    fn report(&self, fullscreen: bool, class: String) {
-        *self.shared.lock().unwrap() = FocusState { fullscreen, class };
+    fn report(&self, fullscreen: bool, class: String, pid: String) {
+        *self.shared.lock().unwrap() = FocusState {
+            fullscreen,
+            class: window_identity(&class, pid.parse().ok()),
+        };
         self.dirty.store(true, Ordering::SeqCst);
     }
 }
@@ -335,6 +379,10 @@ fn spawn_kwin(stop: Arc<AtomicBool>, on_change: Arc<dyn Fn(bool) + Send + Sync>)
                     let game = is_game(&state, &excluded, &games);
                     if last != Some(game) {
                         last = Some(game);
+                        eprintln!(
+                            "[gamemode] game={game} fullscreen={} identity={:?}",
+                            state.fullscreen, state.class
+                        );
                         on_change(game);
                     }
                 }
@@ -428,6 +476,50 @@ mod tests {
         let (ex, ga) = lists();
         assert!(is_game(&st(false, "steam_app_730"), &ex, &ga));
         assert!(is_game(&st(false, "gamescope"), &ex, &ga));
+    }
+
+    #[test]
+    fn windowed_z3d_is_game() {
+        let (ex, ga) = lists();
+        assert!(is_game(&st(false, "z3d"), &ex, &ga));
+        assert!(!is_game(&st(false, "z3d-editor"), &ex, &ga));
+    }
+
+    #[test]
+    fn window_identity_preserves_class_and_resolves_missing_app_id() {
+        let pid = Some(std::process::id());
+        assert_eq!(window_identity("firefox", pid), "firefox");
+        let executable = std::env::current_exe().unwrap();
+        assert_eq!(
+            window_identity("", pid),
+            executable.file_name().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn unknown_identity_does_not_grab_even_when_fullscreen() {
+        let (ex, ga) = lists();
+        for pid in [None, Some(0), Some(u32::MAX)] {
+            let identity = window_identity("", pid);
+            assert!(identity.is_empty());
+            assert!(!is_game(&st(true, &identity), &ex, &ga));
+        }
+    }
+
+    #[test]
+    fn kwin_report_resolves_pid_when_app_id_is_empty() {
+        let receiver = KwinReceiver {
+            shared: Arc::new(Mutex::new(FocusState::default())),
+            dirty: Arc::new(AtomicBool::new(false)),
+        };
+        receiver.report(false, String::new(), std::process::id().to_string());
+        assert!(receiver.dirty.load(Ordering::SeqCst));
+        let state = receiver.shared.lock().unwrap().clone();
+        assert!(!state.fullscreen);
+        assert_eq!(state.class, window_identity("", Some(std::process::id())));
+        // Losing focus clears the fallback identity as well.
+        receiver.report(false, String::new(), String::new());
+        assert!(receiver.shared.lock().unwrap().class.is_empty());
     }
 
     #[test]

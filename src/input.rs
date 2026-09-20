@@ -232,10 +232,9 @@ pub struct InputRuntime {
     next_client_id: AtomicU32,
     active_controller_id: AtomicU32,
     /// Session-sourced "game mode" hint: the in-session tray agent detected a
-    /// fullscreen game-class window focused (compositor query — root can't see
-    /// the session) and pushed it over the control socket. ORed into
-    /// `CursorState.app_grab` so the client enters relative capture. Works where
-    /// the warp detector can't (e.g. NVIDIA, no cursor-position readback).
+    /// game window focused (compositor query — root can't see the session)
+    /// and pushed it over the control socket. Allows missing KMS cursor data
+    /// to signal mouselook while preserving visible in-game menu cursors.
     game_mode: AtomicBool,
     inner: Mutex<InputRuntimeInner>,
     active_clients: Mutex<HashMap<u32, ActiveInputClient>>,
@@ -4329,6 +4328,41 @@ mod tests {
         let inner = runtime.inner.lock().unwrap();
         assert!(inner.cursor_state.visible);
         assert!(inner.cursor_shape.is_some());
+    }
+
+    #[test]
+    fn windowed_game_hint_gates_missing_kms_cursor_without_hiding_menus() {
+        let (runtime, _) = cooperative_runtime();
+        let cursor = CapturedCursor {
+            pixels: vec![255; 4].into(),
+            x: 500,
+            y: 300,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width: 1,
+            height: 1,
+            shape_serial: 42,
+            visible: true,
+        };
+        runtime.update_cursor(Some(&cursor));
+        runtime.update_cursor(None);
+        assert!(runtime.inner.lock().unwrap().cursor_state.visible);
+
+        runtime.set_game_mode(true);
+        assert!(runtime.inner.lock().unwrap().cursor_state.visible);
+        runtime.update_cursor(None);
+        assert!(!runtime.inner.lock().unwrap().cursor_state.visible);
+
+        // Opening a menu restores the pointer even while the game stays focused.
+        runtime.update_cursor(Some(&cursor));
+        assert!(runtime.inner.lock().unwrap().cursor_state.visible);
+        runtime.update_cursor(None);
+        assert!(!runtime.inner.lock().unwrap().cursor_state.visible);
+
+        // Alt-tab must release capture even if KMS still has no cursor sample.
+        runtime.set_game_mode(false);
+        runtime.update_cursor(None);
+        assert!(runtime.inner.lock().unwrap().cursor_state.visible);
     }
 
     #[test]
