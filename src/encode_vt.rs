@@ -61,6 +61,24 @@ extern "C" {
     fn CFBooleanGetValue(boolean: *const c_void) -> u8;
     fn CFArrayGetCount(array: *const c_void) -> isize;
     fn CFArrayGetValueAtIndex(array: *const c_void, idx: isize) -> *const c_void;
+    fn CFArrayCreate(
+        allocator: CFAllocatorRef,
+        values: *const CFTypeRef,
+        count: isize,
+        callbacks: *const c_void,
+    ) -> CFTypeRef;
+    fn CFDictionaryCreate(
+        allocator: CFAllocatorRef,
+        keys: *const CFTypeRef,
+        values: *const CFTypeRef,
+        count: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> CFDictionaryRef;
+    // Only their addresses are passed to CoreFoundation; the layouts stay opaque.
+    static kCFTypeArrayCallBacks: c_void;
+    static kCFTypeDictionaryKeyCallBacks: c_void;
+    static kCFTypeDictionaryValueCallBacks: c_void;
 }
 
 const K_CF_NUMBER_SINT32_TYPE: isize = 3;
@@ -158,6 +176,8 @@ extern "C" {
     static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
     static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
+    static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
+    static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
     static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
     static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
@@ -172,6 +192,9 @@ pub struct VTEncoder {
     nal_rx: Receiver<EncodedUnit>,
     frame_count: i64,
     framerate: u32,
+    force_keyframe: bool,
+    keyframe_properties: CFDictionaryRef,
+    rate_limits_supported: bool,
 }
 
 unsafe impl Send for VTEncoder {}
@@ -220,15 +243,8 @@ impl VTEncoder {
                 kVTProfileLevel_H264_Baseline_AutoLevel as CFTypeRef,
             );
 
-            let bitrate = cf_number_i32(bitrate_bps.min(i32::MAX as u32) as i32);
-            VTSessionSetProperty(
-                session,
-                kVTCompressionPropertyKey_AverageBitRate,
-                bitrate as CFTypeRef,
-            );
-            CFRelease(bitrate as CFTypeRef);
-
-            let keyframe_interval = cf_number_i32(framerate.max(1).min(i32::MAX as u32) as i32);
+            // Recovery is requested explicitly instead of bursting an IDR every second.
+            let keyframe_interval = cf_number_i32(i32::MAX);
             VTSessionSetProperty(
                 session,
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
@@ -245,13 +261,32 @@ impl VTEncoder {
             CFRelease(fps as CFTypeRef);
         }
 
-        Ok(Self {
+        let keyframe_properties = unsafe {
+            CFDictionaryCreate(
+                kCFAllocatorDefault,
+                &kVTEncodeFrameOptionKey_ForceKeyFrame,
+                &kCFBooleanTrue,
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        };
+        let mut encoder = Self {
             session,
             _callback_ctx: ctx_ptr,
             nal_rx,
             frame_count: 0,
             framerate: framerate.max(1),
-        })
+            force_keyframe: true,
+            keyframe_properties,
+            rate_limits_supported: true,
+        };
+        encoder.update_bitrate(bitrate_bps)?;
+        Ok(encoder)
+    }
+
+    pub fn request_keyframe(&mut self) {
+        self.force_keyframe = true;
     }
 
     pub fn encode_pixel_buffer(&mut self, pixel_buffer: CVPixelBufferRef) -> Result<(), String> {
@@ -263,8 +298,12 @@ impl VTEncoder {
                 self.session,
                 pixel_buffer,
                 pts,
-                K_CM_TIME_INVALID,
-                ptr::null(),
+                cm_time(1, self.framerate as i32),
+                if self.force_keyframe {
+                    self.keyframe_properties
+                } else {
+                    ptr::null()
+                },
                 ptr::null_mut(),
                 ptr::null_mut(),
             )
@@ -272,6 +311,7 @@ impl VTEncoder {
         if status != 0 {
             return Err(format!("VTCompressionSessionEncodeFrame failed: {status}"));
         }
+        self.force_keyframe = false;
         Ok(())
     }
 
@@ -291,6 +331,37 @@ impl VTEncoder {
             return Err(format!(
                 "VTSessionSetProperty(AverageBitRate) failed: {status}"
             ));
+        }
+        if !self.rate_limits_supported {
+            return Ok(());
+        }
+        // AverageBitRate alone permits sustained bursts above the network budget.
+        // Update the hard limit with it, using 1s and 50% recovery-frame headroom.
+        let bytes =
+            cf_number_i32((u64::from(bitrate_bps) * 3 / 16).clamp(1, i32::MAX as u64) as i32);
+        let seconds = cf_number_i32(1);
+        let status = unsafe {
+            let limits = CFArrayCreate(
+                kCFAllocatorDefault,
+                [bytes, seconds].as_ptr(),
+                2,
+                &kCFTypeArrayCallBacks,
+            );
+            let status = VTSessionSetProperty(
+                self.session,
+                kVTCompressionPropertyKey_DataRateLimits,
+                limits,
+            );
+            CFRelease(limits);
+            CFRelease(bytes);
+            CFRelease(seconds);
+            status
+        };
+        if status != 0 {
+            // Optional on some VideoToolbox encoders. Keep the average-rate
+            // update usable and report the missing burst cap once.
+            self.rate_limits_supported = false;
+            eprintln!("[encoder] VideoToolbox DataRateLimits unavailable ({status}); using AverageBitRate");
         }
         Ok(())
     }
@@ -316,6 +387,7 @@ impl Drop for VTEncoder {
             VTCompressionSessionCompleteFrames(self.session, K_CM_TIME_INVALID);
             VTCompressionSessionInvalidate(self.session);
             CFRelease(self.session as CFTypeRef);
+            CFRelease(self.keyframe_properties);
             drop(Box::from_raw(self._callback_ctx));
         }
     }
@@ -334,7 +406,7 @@ unsafe fn is_keyframe(sample_buffer: CMSampleBufferRef) -> bool {
     if dict.is_null() {
         return true;
     }
-    let not_sync = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync as *const c_void);
+    let not_sync = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync);
     if not_sync.is_null() {
         return true; // key absent → is sync
     }
@@ -453,5 +525,101 @@ extern "C" fn vt_output_callback(
             data: annex_b,
             is_recovery: keyframe,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" {
+        fn CVPixelBufferCreate(
+            allocator: CFAllocatorRef,
+            width: usize,
+            height: usize,
+            pixel_format: u32,
+            attributes: CFDictionaryRef,
+            buffer: *mut CVPixelBufferRef,
+        ) -> i32;
+        fn CVPixelBufferLockBaseAddress(buffer: CVPixelBufferRef, flags: u64) -> i32;
+        fn CVPixelBufferUnlockBaseAddress(buffer: CVPixelBufferRef, flags: u64) -> i32;
+        fn CVPixelBufferGetBaseAddress(buffer: CVPixelBufferRef) -> *mut u8;
+        fn CVPixelBufferGetBytesPerRow(buffer: CVPixelBufferRef) -> usize;
+        fn CVPixelBufferRelease(buffer: CVPixelBufferRef);
+    }
+
+    struct TestBuffer(CVPixelBufferRef);
+
+    impl Drop for TestBuffer {
+        fn drop(&mut self) {
+            unsafe { CVPixelBufferRelease(self.0) };
+        }
+    }
+
+    fn noise_frame(encoder: &mut VTEncoder, seed: &mut u32) -> Vec<EncodedUnit> {
+        let mut raw = ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    640,
+                    360,
+                    u32::from_be_bytes(*b"BGRA"),
+                    ptr::null(),
+                    &mut raw
+                ),
+                0
+            );
+        }
+        let buffer = TestBuffer(raw);
+        unsafe {
+            assert_eq!(CVPixelBufferLockBaseAddress(buffer.0, 0), 0);
+            let len = CVPixelBufferGetBytesPerRow(buffer.0) * 360;
+            let bytes = std::slice::from_raw_parts_mut(CVPixelBufferGetBaseAddress(buffer.0), len);
+            for pixel in bytes.chunks_exact_mut(4) {
+                *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                pixel.copy_from_slice(&[*seed as u8, (*seed >> 8) as u8, (*seed >> 16) as u8, 255]);
+            }
+            assert_eq!(CVPixelBufferUnlockBaseAddress(buffer.0, 0), 0);
+        }
+        encoder.encode_pixel_buffer(buffer.0).unwrap();
+        encoder.flush();
+        encoder.receive_nals()
+    }
+
+    #[test]
+    fn native_encoder_honors_recovery_and_dynamic_bitrate() {
+        let mut encoder = VTEncoder::new(640, 360, 12_000_000, 60).unwrap();
+        let mut seed = 7;
+        let mut before = 0;
+        for i in 0..90 {
+            let units = noise_frame(&mut encoder, &mut seed);
+            assert!(!units.is_empty(), "encoder produced no frame at {i}");
+            if i >= 30 {
+                before += units.iter().map(|u| u.data.len()).sum::<usize>();
+            }
+        }
+        encoder.request_keyframe();
+        assert!(
+            noise_frame(&mut encoder, &mut seed)
+                .iter()
+                .any(|u| u.is_recovery),
+            "a recovery request must emit a sync frame on the existing session"
+        );
+        encoder.update_bitrate(1_000_000).unwrap();
+        let mut after = 0;
+        let mut delivered = 0;
+        for i in 0..120 {
+            let units = noise_frame(&mut encoder, &mut seed);
+            if i >= 60 {
+                delivered += units.len();
+                after += units.iter().map(|u| u.data.len()).sum::<usize>();
+            }
+        }
+        assert!(delivered > 0, "bitrate change stopped all output");
+        assert!(
+            after < before / 2,
+            "bitrate reduction did not affect output: {before} -> {after} bytes"
+        );
     }
 }

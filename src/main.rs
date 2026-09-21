@@ -888,11 +888,11 @@ fn should_schedule_bitrate_reconfigure(
     let delta_kbps = current_kbps.abs_diff(target_kbps);
 
     if target_kbps < current_kbps {
-        let min_delta = (current_kbps / 10).max(2_500);
+        let min_delta = (current_kbps / 10).max(250);
         now.duration_since(last_reconfigure) >= Duration::from_millis(750)
             && delta_kbps >= min_delta
     } else {
-        let min_delta = (current_kbps / 10).max(5_000);
+        let min_delta = (current_kbps / 10).max(500);
         now.duration_since(last_reconfigure) >= Duration::from_secs(4) && delta_kbps >= min_delta
     }
 }
@@ -2307,7 +2307,9 @@ fn run_shared_pipeline(
                 request_next_keyframe(&mut encoder);
             }
             #[cfg(target_os = "macos")]
-            let _ = video_bc.take_keyframe_request(); // VT encoder always starts with IDR
+            if video_bc.take_keyframe_request() || frame.force_keyframe {
+                encoder.request_keyframe();
+            }
 
             #[cfg(target_os = "macos")]
             {
@@ -2327,6 +2329,9 @@ fn run_shared_pipeline(
                     target_bitrate,
                     last_encoder_reconfigure,
                 ) {
+                    // Back off on failure too: a rejected property must not turn
+                    // the capture loop into a per-frame reconfiguration/log storm.
+                    last_encoder_reconfigure = Instant::now();
                     let next_config = if forced_br > 0 {
                         let mut c = current_config.clone();
                         c.bitrate_kbps = forced_br;
@@ -2343,7 +2348,6 @@ fn run_shared_pipeline(
                                 current_config.bitrate_kbps, next_config.bitrate_kbps
                             );
                             current_config = next_config;
-                            last_encoder_reconfigure = Instant::now();
                         }
                         Err(err) => {
                             eprintln!(
@@ -6072,5 +6076,26 @@ mod bitrate_verifier_tests {
         feed(&mut v, 20_000, 60, 1);
         // Before the grace deadline, no verdict yet.
         assert!(!v.check_and_take_failure(t0 + Duration::from_millis(500)));
+    }
+}
+
+#[cfg(test)]
+mod bitrate_hysteresis_tests {
+    use super::*;
+
+    #[test]
+    fn low_bandwidth_changes_are_not_trapped_by_multi_megabit_thresholds() {
+        let settled = Instant::now() - Duration::from_secs(5);
+        assert!(should_schedule_bitrate_reconfigure(5_000, 4_000, settled));
+        assert!(should_schedule_bitrate_reconfigure(5_000, 5_500, settled));
+        assert!(!should_schedule_bitrate_reconfigure(5_000, 5_100, settled));
+        assert!(!should_schedule_bitrate_reconfigure(
+            5_000,
+            4_000,
+            Instant::now()
+        ));
+        assert!(!should_schedule_bitrate_reconfigure(
+            50_000, 49_000, settled
+        ));
     }
 }

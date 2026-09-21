@@ -945,7 +945,10 @@ esac
         assert!(error.contains("uid=1001"));
         assert!(error.contains("manager unavailable"));
         let calls = std::fs::read_to_string(systemctl.with_extension("calls")).unwrap();
-        let mut calls: Vec<_> = calls.split("END\n").filter(|call| !call.is_empty()).collect();
+        let mut calls: Vec<_> = calls
+            .split("END\n")
+            .filter(|call| !call.is_empty())
+            .collect();
         calls.sort_unstable();
         assert_eq!(calls.len(), 2);
         for (call, uid) in calls.iter().zip([1000, 1001]) {

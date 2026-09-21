@@ -125,6 +125,7 @@ jobs:
         run: |
           python3 scripts/test_macos_bundle.py
           cargo test --release --locked updater::tests
+          cargo test --release --locked encode_vt::tests
 
       - name: Build Unix release
         if: matrix.build_kind == 'unix'

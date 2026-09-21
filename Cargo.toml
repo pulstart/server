@@ -1,6 +1,6 @@
 [package]
 name = "st-server"
-version = "0.9.13"
+version = "0.9.16"
 edition = "2021"
 
 [dependencies]

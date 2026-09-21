@@ -15,9 +15,10 @@ fn http_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout_read(Duration::from_secs(10))
-            .timeout_write(Duration::from_secs(10))
+            .timeout(Duration::from_secs(5))
+            .timeout_connect(Duration::from_secs(3))
+            .timeout_read(Duration::from_secs(5))
+            .timeout_write(Duration::from_secs(5))
             .build()
     })
 }
@@ -215,7 +216,10 @@ impl ApiTunnelState {
     }
 
     pub fn ensure_punch_socket(&self, listen_port: u16) -> Result<Vec<String>, String> {
-        let has_socket = self.punch_socket.lock().unwrap().is_some();
+        // Serialize cache inspection and refresh: a simultaneous warm-up must
+        // not run a second STUN reader after an attempt has started punching.
+        let mut socket_guard = self.punch_socket.lock().unwrap();
+        let has_socket = socket_guard.is_some();
         let cached = self.local_candidates.lock().unwrap().clone();
         let stun_fresh = match *self.last_stun.lock().unwrap() {
             Some(t) => t.elapsed() < STUN_REFRESH_TTL,
@@ -233,7 +237,6 @@ impl ApiTunnelState {
             return Ok(self.augment_with_portmap(cached));
         }
 
-        let mut socket_guard = self.punch_socket.lock().unwrap();
         if socket_guard.is_none() {
             let socket =
                 UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind punch socket: {e}"))?;
@@ -247,11 +250,13 @@ impl ApiTunnelState {
             .map_err(|e| format!("punch socket local_addr: {e}"))?
             .port();
         let port = if port == 0 { listen_port } else { port };
+        socket
+            .set_nonblocking(false)
+            .map_err(|e| format!("configure STUN socket: {e}"))?;
         let candidates = st_protocol::tunnel::gather_candidates_with_stun(port, Some(socket));
-        drop(socket_guard);
-
         *self.local_candidates.lock().unwrap() = candidates.clone();
         *self.last_stun.lock().unwrap() = Some(Instant::now());
+        drop(socket_guard);
         let augmented = self.augment_with_portmap(candidates);
         self.update_hole_punch_ready();
         Ok(augmented)
@@ -696,23 +701,21 @@ pub fn start_api_registration(
                 }
             };
 
-            let body = serde_json::json!({
-                "token": token,
-                "role": "host",
-                "peer_id": peer_id,
-                "lease_id": lease_id,
-                "hostname": hostname,
-                "candidates": local_candidates,
-                "public_key": tunnel_state.public_key_b64(),
-            })
-            .to_string();
-            let ok = http_agent()
-                .post(&format!("{api_url}/api/register"))
-                .set("Content-Type", "application/json")
-                .send_string(&body)
-                .is_ok();
+            let response = post_api_value(
+                &api_url,
+                "register",
+                serde_json::json!({
+                    "token": token,
+                    "role": "host",
+                    "peer_id": peer_id,
+                    "lease_id": lease_id,
+                    "hostname": hostname,
+                    "candidates": local_candidates,
+                    "public_key": tunnel_state.public_key_b64(),
+                }),
+            );
 
-            if ok {
+            if let Some(response) = response {
                 if failures > 0 || !tunnel_state.is_connected() {
                     println!("[api] Connected to API server");
                 }
@@ -720,73 +723,22 @@ pub fn start_api_registration(
                 tunnel_state.connected.store(true, Ordering::Relaxed);
                 registered_token = Some(token.clone());
 
-                let discovery =
-                    post_api_value(&api_url, "session", serde_json::json!({"token": token}));
-                let client_identity = discovery.as_ref().and_then(|value| {
-                    Some((
-                        value["client"]["peer_id"].as_str()?.to_string(),
-                        value["client"]["lease_id"].as_str()?.to_string(),
-                    ))
-                });
-                let client_joined = client_identity.is_some();
-                if let Some(value) = discovery.as_ref() {
-                    tunnel_state.set_relay_port(value["relay_port"].as_u64().map(|p| p as u16));
-                }
-
-                let synchronized = client_identity.and_then(|(client_peer_id, client_lease_id)| {
-                    let session = post_api_value(
-                        &api_url,
-                        "session",
-                        serde_json::json!({
-                            "token": token,
-                            "role": "host",
-                            "peer_id": peer_id,
-                            "lease_id": lease_id,
-                            "expected_partner_peer_id": client_peer_id,
-                            "expected_partner_lease_id": client_lease_id,
-                        }),
-                    )?;
-                    if session["client"]["peer_id"].as_str() != Some(&client_peer_id)
-                        || session["client"]["lease_id"].as_str() != Some(&client_lease_id)
-                    {
-                        return None;
-                    }
-                    let key = post_api_value(
-                        &api_url,
-                        "key",
-                        serde_json::json!({
-                            "token": token,
-                            "role": "host",
-                            "peer_id": peer_id,
-                            "lease_id": lease_id,
-                            "expected_partner_peer_id": client_peer_id,
-                            "expected_partner_lease_id": client_lease_id,
-                            "public_key": tunnel_state.public_key_b64(),
-                        }),
-                    )?;
-                    let candidates = post_api_value(
-                        &api_url,
-                        "candidates",
-                        serde_json::json!({
-                            "token": token,
-                            "role": "host",
-                            "peer_id": peer_id,
-                            "lease_id": lease_id,
-                            "expected_partner_peer_id": client_peer_id,
-                            "expected_partner_lease_id": client_lease_id,
-                            "candidates": local_candidates,
-                        }),
-                    )?;
-                    for response in [&key, &candidates] {
-                        if response["partner_peer_id"].as_str() != Some(&client_peer_id)
-                            || response["partner_lease_id"].as_str() != Some(&client_lease_id)
-                        {
-                            return None;
-                        }
-                    }
+                // One atomic response replaces register + discovery + session +
+                // key + candidates. Never combine a request with a later lease.
+                let session = &response["session"];
+                tunnel_state.set_relay_port(
+                    session["relay_port"]
+                        .as_u64()
+                        .and_then(|port| u16::try_from(port).ok())
+                        .filter(|port| *port != 0),
+                );
+                let synchronized = (|| {
+                    let client = &session["client"];
+                    let client_peer_id = client["peer_id"].as_str()?.to_string();
+                    let client_lease_id = client["lease_id"].as_str()?.to_string();
                     let shared_secret = tunnel_state
-                        .shared_secret_from_partner_b64(key["partner_key"].as_str()?)?;
-                    let addrs = candidates["partner_candidates"]
+                        .shared_secret_from_partner_b64(client["public_key"].as_str()?)?;
+                    let addrs = client["candidates"]
                         .as_array()?
                         .iter()
                         .filter_map(|value| value.as_str()?.parse().ok())
@@ -798,7 +750,7 @@ pub fn start_api_registration(
                         shared_secret,
                         addrs,
                     ))
-                });
+                })();
 
                 if let Some((session, client_peer_id, client_lease_id, shared_secret, addrs)) =
                     synchronized
@@ -828,21 +780,14 @@ pub fn start_api_registration(
                     tunnel_state.update_pending_client_relay(None);
                 }
 
-                // Poll cadence:
-                //   - 250 ms while the client is joined and no session is
-                //     active yet — the client may post a /api/punch nonce at
-                //     any moment, and we need the hole-punch task to see it
-                //     fast so the host starts probing while the client is
-                //     still inside its 10 s hole_punch window.
-                //   - 1 s once a session is established (no urgency).
-                //   - 3 s when no client is joined (idle polling).
-                let session_active = tunnel_state.is_punch_session_active();
-                let sleep_ms = if session_active {
+                // Keep first-connect detection below half a second. Each poll
+                // now needs only one HTTP round trip, including lease renewal.
+                let sleep_ms = if tunnel_state.is_punch_session_active()
+                    || tunnel_state.is_relay_session_active()
+                {
                     1000
-                } else if client_joined {
-                    250
                 } else {
-                    3000
+                    250
                 };
                 if interruptible_sleep_ms(&control, sleep_ms) {
                     break;
