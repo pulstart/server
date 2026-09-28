@@ -9,6 +9,7 @@ use libloading::Library;
 use std::ffi::{c_char, c_uint, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 type Device = *mut c_void;
 type Ret = c_uint;
@@ -20,6 +21,7 @@ struct Nvml {
     set_locked: unsafe extern "C" fn(Device, c_uint, c_uint) -> Ret,
     reset_locked: unsafe extern "C" fn(Device) -> Ret,
     supported: unsafe extern "C" fn(Device, *mut c_uint, *mut c_uint) -> Ret,
+    utilization: unsafe extern "C" fn(Device, *mut [c_uint; 2]) -> Ret,
     error: unsafe extern "C" fn(Ret) -> *const c_char,
     shutdown: unsafe extern "C" fn() -> Ret,
     device: Device,
@@ -47,6 +49,9 @@ impl Nvml {
                     .map_err(|e| e.to_string())?,
                 supported: *lib
                     .get(b"nvmlDeviceGetSupportedMemoryClocks\0")
+                    .map_err(|e| e.to_string())?,
+                utilization: *lib
+                    .get(b"nvmlDeviceGetUtilizationRates\0")
                     .map_err(|e| e.to_string())?,
                 error: *lib.get(b"nvmlErrorString\0").map_err(|e| e.to_string())?,
                 shutdown: *lib.get(b"nvmlShutdown\0").map_err(|e| e.to_string())?,
@@ -87,6 +92,44 @@ impl Nvml {
             .min()
             .unwrap_or(max);
         Ok((floor, max))
+    }
+}
+
+/// 3D/compute utilisation of an NVIDIA GPU, resampled at most every 250 ms.
+pub struct GpuLoad {
+    nvml: Nvml,
+    busy: bool,
+    sampled_at: Option<Instant>,
+}
+
+// SAFETY: see `ClockFloor`.
+unsafe impl Send for GpuLoad {}
+
+impl GpuLoad {
+    /// Something else — a game — keeps the 3D engine at least this busy.
+    const BUSY_PERCENT: c_uint = 50;
+    const RESAMPLE: Duration = Duration::from_millis(250);
+
+    pub fn open(render_node: &str) -> Option<Self> {
+        let nvml = Nvml::open(&nvidia_bus_id(render_node)?).ok()?;
+        Some(Self {
+            nvml,
+            busy: false,
+            sampled_at: None,
+        })
+    }
+
+    pub fn busy(&mut self, now: Instant) -> bool {
+        if self
+            .sampled_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= Self::RESAMPLE)
+        {
+            let mut rates = [0 as c_uint; 2];
+            let ret = unsafe { (self.nvml.utilization)(self.nvml.device, &mut rates) };
+            self.busy = ret == 0 && rates[0] >= Self::BUSY_PERCENT;
+            self.sampled_at = Some(now);
+        }
+        self.busy
     }
 }
 
@@ -191,6 +234,17 @@ pub fn release_stale() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ST_TEST_GPU_FLOOR=1 <test-binary> live_gpu_load --nocapture`
+    #[test]
+    fn live_gpu_load() {
+        if std::env::var_os("ST_TEST_GPU_FLOOR").is_none() {
+            return;
+        }
+        let mut load = GpuLoad::open("/dev/dri/renderD128").expect("nvml");
+        let t0 = Instant::now();
+        eprintln!("[load] idle busy={}", load.busy(t0));
+    }
 
     /// Engages the floor on the display GPU and checks it holds P3 (root).
     /// `ST_TEST_GPU_FLOOR=1 sudo -E <test-binary> live_clock_floor --nocapture`

@@ -975,17 +975,18 @@ fn log_abr_decrease(
     peer: impl std::fmt::Display,
     from_kbps: u32,
     to_kbps: u32,
+    loss: adaptive_bitrate::LossEvidence,
     fb: &st_protocol::TransportFeedback,
     backlog_us: u32,
 ) {
     println!(
         "[abr] {peer}: {from_kbps} -> {to_kbps} kbps (lost {}/{} pkts, dropped {}/{} frames, \
          late {}, backlog {} ms, owd {:+} ms, recv {} kbps)",
-        fb.lost_packets,
-        fb.received_packets + fb.lost_packets,
-        fb.dropped_frames,
-        fb.completed_frames + fb.dropped_frames,
-        fb.late_packets,
+        loss.lost,
+        loss.received + loss.lost,
+        loss.dropped,
+        loss.completed + loss.dropped,
+        loss.late,
         backlog_us / 1000,
         fb.owd_trend_us / 1000,
         fb.recv_video_kbps
@@ -4441,7 +4442,14 @@ async fn handle_client(
                             let prev_kbps = bitrate_controller.recommended_kbps();
                             let next_kbps = bitrate_controller.apply_feedback(feedback);
                             if next_kbps < prev_kbps {
-                                log_abr_decrease(addr, prev_kbps, next_kbps, &feedback, backlog_us);
+                                log_abr_decrease(
+                                    addr,
+                                    prev_kbps,
+                                    next_kbps,
+                                    bitrate_controller.judged_loss(),
+                                    &feedback,
+                                    backlog_us,
+                                );
                             }
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                         }
@@ -5494,7 +5502,14 @@ fn handle_punched_client(
                             let prev_kbps = bitrate_controller.recommended_kbps();
                             let next_kbps = bitrate_controller.apply_feedback(fb);
                             if next_kbps < prev_kbps {
-                                log_abr_decrease(peer, prev_kbps, next_kbps, &fb, backlog_us);
+                                log_abr_decrease(
+                                    peer,
+                                    prev_kbps,
+                                    next_kbps,
+                                    bitrate_controller.judged_loss(),
+                                    &fb,
+                                    backlog_us,
+                                );
                             }
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                             if (fb.lost_packets > 0 || fb.dropped_frames > 0)

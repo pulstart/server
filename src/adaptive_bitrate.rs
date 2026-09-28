@@ -766,6 +766,73 @@ fn recompute_target(inner: &mut AdaptiveBitrateInner) {
         .clamp(inner.min_kbps, inner.max_kbps);
 }
 
+/// Loss counts summed over consecutive feedback windows until they are enough
+/// to judge a ratio: one dropped frame in a quiet desktop's 5-frame window
+/// reads as 20% loss. A lone random Wi-Fi drop isn't congestion and a cut
+/// can't prevent it (FEC and recovery keyframes handle those); it only costs
+/// picture quality.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LossEvidence {
+    pub received: u32,
+    pub lost: u32,
+    pub late: u32,
+    pub completed: u32,
+    pub dropped: u32,
+    since: Option<Instant>,
+}
+
+impl LossEvidence {
+    const MIN_FRAMES: u32 = 20;
+    const MIN_PACKETS: u32 = 100;
+    const MAX_AGE: Duration = Duration::from_secs(1);
+    /// This much loss is conclusive in any window.
+    const CONCLUSIVE_LOST: u32 = 10;
+    const CONCLUSIVE_DROPPED: u32 = 3;
+
+    fn add(&mut self, fb: &TransportFeedback, now: Instant) {
+        self.received = self.received.saturating_add(fb.received_packets);
+        self.lost = self.lost.saturating_add(fb.lost_packets);
+        self.late = self.late.saturating_add(fb.late_packets);
+        self.completed = self.completed.saturating_add(fb.completed_frames);
+        self.dropped = self.dropped.saturating_add(fb.dropped_frames);
+        self.since.get_or_insert(now);
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        self.completed + self.dropped >= Self::MIN_FRAMES
+            || self.received + self.lost >= Self::MIN_PACKETS
+            || self.lost >= Self::CONCLUSIVE_LOST
+            || self.dropped >= Self::CONCLUSIVE_DROPPED
+            || self
+                .since
+                .is_some_and(|since| now.saturating_duration_since(since) >= Self::MAX_AGE)
+    }
+
+    fn ratio(part: u32, rest: u32) -> f32 {
+        if part == 0 {
+            0.0
+        } else {
+            part as f32 / (part + rest) as f32
+        }
+    }
+
+    /// (heavy, moderate) loss; a ratio needs a few events behind it.
+    fn verdict(&self) -> (bool, bool) {
+        let frames = Self::ratio(self.dropped, self.completed);
+        let packets = Self::ratio(self.lost, self.received);
+        let late = if self.received > 0 {
+            self.late as f32 / self.received as f32
+        } else {
+            0.0
+        };
+        let heavy = (self.dropped >= 2 && frames >= 0.15) || (self.lost >= 5 && packets >= 0.10);
+        let moderate = (self.dropped >= 2 && frames >= 0.05)
+            || (self.lost >= 3 && packets >= 0.04)
+            || (self.received >= Self::MIN_PACKETS && late >= 0.15);
+        (heavy, moderate)
+    }
+}
+
 pub struct ClientRateController {
     recommended_kbps: u32,
     min_kbps: u32,
@@ -787,6 +854,8 @@ pub struct ClientRateController {
     /// settle bitrate near real capacity on a buffer-bloated path.
     send_backlog_us: u32,
     encoder_kbps: u32,
+    evidence: LossEvidence,
+    judged: LossEvidence,
 }
 
 impl ClientRateController {
@@ -811,7 +880,14 @@ impl ClientRateController {
             seen_completed_frame: false,
             send_backlog_us: 0,
             encoder_kbps: 0,
+            evidence: LossEvidence::default(),
+            judged: LossEvidence::default(),
         }
+    }
+
+    /// The loss evidence behind the latest judgement, for logs.
+    pub fn judged_loss(&self) -> LossEvidence {
+        self.judged
     }
 
     /// Feed the latest server-side encode→send backlog (µs) before `apply_feedback`.
@@ -874,41 +950,25 @@ impl ClientRateController {
 
         let startup = !self.seen_completed_frame;
 
-        let packet_total = feedback
-            .received_packets
-            .saturating_add(feedback.lost_packets);
-        let packet_loss_ratio = if packet_total > 0 {
-            feedback.lost_packets as f32 / packet_total as f32
+        self.evidence.add(&feedback, now);
+        let (heavy, moderate) = if startup || self.evidence.ready(now) {
+            self.judged = std::mem::take(&mut self.evidence);
+            self.judged.verdict()
         } else {
-            0.0
-        };
-
-        let frame_total = feedback
-            .completed_frames
-            .saturating_add(feedback.dropped_frames);
-        let frame_loss_ratio = if frame_total > 0 {
-            feedback.dropped_frames as f32 / frame_total as f32
-        } else {
-            0.0
-        };
-
-        let late_ratio = if feedback.received_packets > 0 {
-            feedback.late_packets as f32 / feedback.received_packets as f32
-        } else {
-            0.0
+            (false, false)
         };
 
         // Late packets are reordering/redundancy, not loss — a healthy FEC stream
         // always carries some (parity + delayed-duplicate FrameStart arrive after
         // their frame completes). They depress the bitrate only through the
-        // dedicated `late_ratio >= 0.15` branch above. Treating *any* late packet
+        // dedicated late-ratio branch of the verdict. Treating *any* late packet
         // as a hard impairment here would zero the clean-interval counter every
         // window, so the up-probe could never fire and the controller stayed
         // pinned at its floor on an otherwise clean link.
         let has_any_impairment = feedback.dropped_frames > 0 || feedback.lost_packets > 0;
         let probe_failed = has_any_impairment && self.probe_failed_recently(now);
 
-        if frame_loss_ratio >= 0.15 || packet_loss_ratio >= 0.10 {
+        if heavy {
             // Heavy loss — significant reduction
             self.clean_intervals = 0;
             if probe_failed {
@@ -921,7 +981,7 @@ impl ClientRateController {
                 self.stable_kbps = self.recommended_kbps;
                 self.clear_pending_probe();
             }
-        } else if frame_loss_ratio >= 0.05 || packet_loss_ratio >= 0.04 || late_ratio >= 0.15 {
+        } else if moderate {
             // Moderate loss — gentle reduction
             self.clean_intervals = 0;
             if probe_failed {
@@ -1398,6 +1458,50 @@ mod tests {
         );
         assert!(next < 8_000);
         assert!(next >= 2_000);
+    }
+
+    fn small_window(received: u32, lost: u32, completed: u32, dropped: u32) -> TransportFeedback {
+        TransportFeedback {
+            interval_ms: 100,
+            received_packets: received,
+            lost_packets: lost,
+            completed_frames: completed,
+            dropped_frames: dropped,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn controller_ignores_lone_drops_in_quiet_windows() {
+        // Seen live on a mostly static desktop: "dropped 1/5 frames" and
+        // "lost 1/22 pkts" each cut 20%.
+        let start = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 100_000, 20_000, start);
+        let mut now = start;
+        for fb in [
+            small_window(40, 0, 3, 0),
+            small_window(21, 1, 1, 0),
+            small_window(59, 0, 4, 1),
+            small_window(30, 0, 3, 0),
+        ] {
+            now += Duration::from_millis(400);
+            assert_eq!(controller.apply_feedback_at(fb, now), 20_000);
+        }
+    }
+
+    #[test]
+    fn controller_cuts_on_sustained_loss_across_small_windows() {
+        let start = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 100_000, 20_000, start);
+        controller.apply_feedback_at(small_window(40, 0, 5, 0), start);
+        let mut now = start;
+        let mut kbps = 20_000;
+        for _ in 0..3 {
+            now += Duration::from_millis(100);
+            kbps = controller.apply_feedback_at(small_window(20, 2, 4, 1), now);
+        }
+        assert!(kbps < 20_000, "three drops in 15 frames must cut");
+        assert_eq!(controller.judged_loss().dropped, 3);
     }
 
     #[test]

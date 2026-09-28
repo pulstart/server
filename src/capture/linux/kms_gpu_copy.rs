@@ -502,6 +502,114 @@ impl Drop for Gles {
     }
 }
 
+/// On NVIDIA the scanout reaches RAM one of two ways. The 3D engine converts it
+/// to NV12 first and moves 5.5 MB (1.1 ms for 1440p FP16); the copy engine moves
+/// the raw 29.5 MB and converts on the CPU (2.5 ms) but never waits behind a
+/// game, which time-slices the 3D engine (21-24 ms a frame). Use the 3D engine
+/// only while it measures faster, and don't try it while the GPU is busy.
+struct ReadbackChooser {
+    gl: bool,
+    gl_ms: Option<f64>,
+    vk_ms: Option<f64>,
+    /// Samples taken on the current GL stint / ever on the copy engine; the
+    /// first ones carry one-off setup (imports, targets) and aren't judged.
+    gl_samples: u32,
+    vk_samples: u32,
+    /// While on GL, the next frame to refresh the copy engine's baseline.
+    vk_refresh_at: std::time::Instant,
+    retry_at: std::time::Instant,
+    backoff: std::time::Duration,
+    gl_since: std::time::Instant,
+}
+
+impl ReadbackChooser {
+    const BASE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+    /// GL that has held up this long earns a fresh backoff.
+    const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
+    /// A single GL frame this many times the copy engine's cost means the 3D
+    /// engine is contended.
+    const SPIKE: f64 = 3.0;
+    const WARMUP: u32 = 2;
+    const VK_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            gl: false,
+            gl_ms: None,
+            vk_ms: None,
+            gl_samples: 0,
+            vk_samples: 0,
+            vk_refresh_at: now,
+            retry_at: now,
+            backoff: Self::BASE_BACKOFF,
+            gl_since: now,
+        }
+    }
+
+    fn use_gl(&mut self, now: std::time::Instant, gpu_busy: bool) -> bool {
+        if self.gl && gpu_busy {
+            self.fall_back(now, "GPU busy");
+        } else if !self.gl && !gpu_busy && self.vk_ms.is_some() && now >= self.retry_at {
+            self.gl = true;
+            self.gl_ms = None;
+            self.gl_samples = 0;
+            self.gl_since = now;
+            self.vk_refresh_at = now + Self::VK_REFRESH;
+        } else if self.gl && now >= self.vk_refresh_at {
+            // One copy-engine frame keeps the baseline GL is judged against current.
+            self.vk_refresh_at = now + Self::VK_REFRESH;
+            return false;
+        }
+        self.gl
+    }
+
+    fn record(&mut self, gl: bool, took: std::time::Duration, now: std::time::Instant) {
+        let ms = took.as_secs_f64() * 1000.0;
+        let ewma = |prev: Option<f64>| prev.map_or(ms, |p| p + (ms - p) / 8.0);
+        let samples = if gl {
+            &mut self.gl_samples
+        } else {
+            &mut self.vk_samples
+        };
+        *samples += 1;
+        if *samples <= Self::WARMUP {
+            return;
+        }
+        if !gl {
+            // Fast down, slow up: GL has to beat the copy engine's good case.
+            self.vk_ms = Some(match self.vk_ms {
+                Some(prev) if ms < prev => ms,
+                prev => ewma(prev),
+            });
+            return;
+        }
+        let first = self.gl_ms.is_none();
+        let gl_ms = ewma(self.gl_ms);
+        self.gl_ms = Some(gl_ms);
+        let vk_ms = self.vk_ms.unwrap_or(f64::MAX);
+        if ms > vk_ms * Self::SPIKE || gl_ms > vk_ms {
+            self.fall_back(now, "3D engine slower");
+        } else if first {
+            println!(
+                "[kms] scanout readback on the 3D engine ({ms:.1} ms vs copy engine {vk_ms:.1} ms)"
+            );
+        } else if now.saturating_duration_since(self.gl_since) >= Self::SETTLED {
+            self.backoff = Self::BASE_BACKOFF;
+        }
+    }
+
+    fn fall_back(&mut self, now: std::time::Instant, why: &str) {
+        println!(
+            "[kms] scanout readback on the copy engine ({why}); retrying the 3D engine in {:?}",
+            self.backoff
+        );
+        self.gl = false;
+        self.retry_at = now + self.backoff;
+        self.backoff = (self.backoff * 2).min(Self::MAX_BACKOFF);
+    }
+}
+
 pub struct KmsStabilizer {
     gles: Gles,
     program: glow::Program,
@@ -522,9 +630,11 @@ pub struct KmsStabilizer {
     ram_pool: RamPool,
     ram_mode: bool,
     logged_ram_fallback: bool,
-    /// Copy-engine readback used ahead of the GL one in RAM mode.
+    /// Copy-engine readback, alternated with the GL one by `chooser`.
     vk: Option<VkReadback>,
     vk_tried: bool,
+    chooser: ReadbackChooser,
+    gpu_load: Option<crate::gpu_clock::GpuLoad>,
     vk_fail_streak: u32,
     vk_unsupported_logged: Option<String>,
     render_node: String,
@@ -595,6 +705,8 @@ impl KmsStabilizer {
             logged_ram_fallback: false,
             vk: None,
             vk_tried: false,
+            chooser: ReadbackChooser::new(std::time::Instant::now()),
+            gpu_load: None,
             vk_fail_streak: 0,
             vk_unsupported_logged: None,
             render_node: render_node.to_string(),
@@ -693,9 +805,37 @@ impl KmsStabilizer {
         } else {
             DstFormat::Bgra
         };
-        if let Some(data) = self.vk_readback(src, drm_format, width, height, dst) {
-            return Ok(data);
+        self.prepare_copy_engine();
+        let now = std::time::Instant::now();
+        let gl = self.vk.is_none() || {
+            let busy = self.gpu_load.as_mut().is_some_and(|load| load.busy(now));
+            self.chooser.use_gl(now, busy)
+        };
+        if !gl {
+            if let Some(data) = self.vk_readback(src, drm_format, width, height, dst) {
+                self.chooser
+                    .record(false, now.elapsed(), std::time::Instant::now());
+                return Ok(data);
+            }
         }
+        let result = self.gl_readback(src, drm_format, width, height, preferred);
+        if gl && self.vk.is_some() && result.is_ok() {
+            self.chooser
+                .record(true, now.elapsed(), std::time::Instant::now());
+        }
+        result
+    }
+
+    /// 3D-engine readback: the blit converts to NV12 (or BGRA) on the GPU,
+    /// then a PBO moves it to RAM.
+    fn gl_readback(
+        &mut self,
+        src: &DmaBufPlane,
+        drm_format: u32,
+        width: u32,
+        height: u32,
+        preferred: bool,
+    ) -> Result<FrameData, String> {
         let nv12 = preferred && width.is_multiple_of(4) && height.is_multiple_of(2);
         let (pass, tex_w, tex_h) = if nv12 {
             self.ensure_nv12(width, height)?;
@@ -729,6 +869,7 @@ impl KmsStabilizer {
             Ok(vk) => {
                 println!("[kms] scanout readback on the Vulkan copy engine");
                 self.vk = Some(vk);
+                self.gpu_load = crate::gpu_clock::GpuLoad::open(&self.render_node);
             }
             Err(e) => eprintln!("[kms] copy-engine readback unavailable ({e}); using GL"),
         }
@@ -744,7 +885,6 @@ impl KmsStabilizer {
         dst: DstFormat,
     ) -> Option<FrameData> {
         const FAIL_LIMIT: u32 = 3;
-        self.prepare_copy_engine();
         match self
             .vk
             .as_mut()?
@@ -1467,6 +1607,86 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn chooser_takes_the_faster_3d_engine_and_leaves_it_under_load() {
+        let t0 = Instant::now();
+        let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
+        let mut c = ReadbackChooser::new(t0);
+        // Copy engine first, until it has a measurement.
+        for _ in 0..=ReadbackChooser::WARMUP {
+            assert!(!c.use_gl(t0, false));
+            c.record(false, ms(2.5), t0);
+        }
+        // Idle GPU: try the 3D engine and keep it while it is faster, however
+        // slow its first (setup) frames.
+        assert!(c.use_gl(t0, false));
+        for _ in 0..ReadbackChooser::WARMUP {
+            c.record(true, ms(40.0), t0);
+        }
+        assert!(c.use_gl(t0, false));
+        for _ in 0..20 {
+            c.record(true, ms(1.1), t0);
+        }
+        assert!(c.use_gl(t0, false));
+        // A game starts: one 3D frame behind its time slice falls back.
+        c.record(true, ms(22.0), t0);
+        assert!(!c.use_gl(t0, false));
+        // Not retried before the backoff, nor while the GPU stays busy.
+        assert!(!c.use_gl(t0 + Duration::from_secs(1), false));
+        assert!(!c.use_gl(t0 + Duration::from_secs(3), true));
+        // The game ends: the 3D engine is retried.
+        assert!(c.use_gl(t0 + Duration::from_secs(3), false));
+    }
+
+    #[test]
+    fn chooser_refreshes_a_stale_copy_engine_baseline() {
+        let t0 = Instant::now();
+        let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
+        let mut c = ReadbackChooser::new(t0);
+        // A slow start (setup, a busy CPU) inflates the copy engine's baseline.
+        for _ in 0..=ReadbackChooser::WARMUP {
+            c.record(false, ms(19.0), t0);
+        }
+        assert!(c.use_gl(t0, false));
+        for _ in 0..=ReadbackChooser::WARMUP {
+            c.record(true, ms(5.0), t0);
+        }
+        assert!(c.use_gl(t0, false), "5 ms beats the stale 19 ms");
+        // The periodic copy-engine frame shows 2.7 ms: GL at 5 ms loses.
+        let later = t0 + ReadbackChooser::VK_REFRESH;
+        assert!(!c.use_gl(later, false));
+        c.record(false, ms(2.7), later);
+        assert!(c.use_gl(later, false));
+        c.record(true, ms(5.0), later);
+        assert!(!c.use_gl(later, false));
+    }
+
+    #[test]
+    fn chooser_backs_off_when_the_3d_engine_keeps_losing() {
+        let t0 = Instant::now();
+        let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
+        let mut c = ReadbackChooser::new(t0);
+        for _ in 0..=ReadbackChooser::WARMUP {
+            c.record(false, ms(2.5), t0);
+        }
+        let mut now = t0;
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            assert!(c.use_gl(now, false));
+            for _ in 0..=ReadbackChooser::WARMUP {
+                c.record(true, ms(3.0), now);
+            }
+            assert!(!c.use_gl(now, false));
+            let retry = c.retry_at;
+            waits.push(retry - now);
+            now = retry;
+        }
+        assert_eq!(waits, [2, 4, 8, 16].map(Duration::from_secs));
+        // Busy GPU on the 3D path: back to the copy engine at once.
+        assert!(c.use_gl(now, false));
+        assert!(!c.use_gl(now, true));
+    }
+
+    #[test]
     fn slot_pool_reuses_only_after_lease_drop() {
         let mut pool = SlotPool::new(2);
         let a = pool.acquire().expect("slot a");
@@ -1775,6 +1995,8 @@ pub(crate) mod tests {
         stab.ram_mode = true;
         stab.force_nv12 = Some(true);
         stab.vk_tried = !copy_engine;
+        // Measure the requested path, not the chooser's pick.
+        stab.chooser.retry_at = Instant::now() + Duration::from_secs(86_400);
         stab
     }
 

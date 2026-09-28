@@ -1,3 +1,19 @@
+# 0.9.22
+
+Server-only release; no wire format change.
+
+- The server picks the faster way to read the screen by itself. When no game
+  is loading the GPU it converts the frame on the GPU first and copies a
+  third of the data (1.2 ms instead of 3.0 at 1440p, and far less CPU); when
+  a game time-slices the 3D engine it uses the copy engine, which games can't
+  stall. It measures both continuously and switches back within seconds of
+  a game ending. Colour-accuracy settings that make the desktop 16-bit no
+  longer cost extra when idle.
+- The bitrate controller no longer cuts on a single random Wi-Fi drop. It
+  judged loss per feedback window, so on a quiet desktop one lost frame out
+  of five read as 20% loss and cut the bitrate by a fifth, over and over.
+  It now gathers enough evidence first; sustained loss still cuts as fast.
+
 # 0.9.21
 
 Server-only release; no wire format change.
