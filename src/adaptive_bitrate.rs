@@ -996,7 +996,9 @@ impl ClientRateController {
             }
         } else if has_any_impairment {
             self.clean_intervals = 0;
-            if probe_failed {
+            // Packets the client repaired from parity are counted as lost too;
+            // only a frame that was really lost says the probe overshot.
+            if probe_failed && feedback.dropped_frames > 0 {
                 self.revert_failed_probe(now);
             }
         } else if self.send_backlog_us >= Self::BACKLOG_REDUCE_US {
@@ -1549,6 +1551,41 @@ mod tests {
             now + ClientRateController::BASE_PROBE_BACKOFF - Duration::from_secs(1),
         );
         assert_eq!(before_retry_window, 6_000);
+    }
+
+    #[test]
+    fn a_probe_survives_packets_the_client_repaired() {
+        let start = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(2_000, 12_000, 6_000, start);
+        let clean = TransportFeedback {
+            interval_ms: 500,
+            received_packets: 180,
+            completed_frames: 60,
+            ..Default::default()
+        };
+        let mut now = start;
+        for _ in 0..ClientRateController::CLEAN_INTERVALS_FOR_UPGRADE {
+            now += Duration::from_millis(500);
+            controller.apply_feedback_at(clean, now);
+        }
+        now += ClientRateController::UPGRADE_COOLDOWN;
+        let probed = controller.apply_feedback_at(clean, now);
+        assert!(probed > 6_000);
+
+        let repaired = TransportFeedback {
+            lost_packets: 2,
+            ..clean
+        };
+        let kept = controller.apply_feedback_at(repaired, now + Duration::from_millis(500));
+        assert_eq!(kept, probed, "FEC-repaired loss must not undo the probe");
+
+        let lost_frame = TransportFeedback {
+            lost_packets: 3,
+            dropped_frames: 1,
+            ..clean
+        };
+        let reverted = controller.apply_feedback_at(lost_frame, now + Duration::from_millis(1_000));
+        assert_eq!(reverted, 6_000);
     }
 
     /// Feeds 500 ms clean windows whose received rate is `pct` of the current

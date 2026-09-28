@@ -2,6 +2,11 @@
 
 Server-only release; no wire format change.
 
+- The bitrate climb is no longer undone by packets the client repaired. A
+  probe was reverted (and the climb delayed 16-90 s) as soon as any packet in
+  the window counted as lost, but the client counts packets it repaired from
+  parity too: the live log showed 24.4 -> 20.3 Mbps for "2 of 270 lost, 0
+  frames dropped". Only a frame that was really lost fails a probe now.
 - No more multi-frame freezes while gaming. Every so often the server tries
   the faster (GPU-side) way of reading the screen; with a game running it
   could wait out the game's whole GPU time slice, and the live log showed
