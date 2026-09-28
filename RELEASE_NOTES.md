@@ -1,3 +1,19 @@
+# 0.9.20
+
+Server-only release; no wire format change.
+
+- Fix: every cursor shape change (hovering links, text fields, window edges)
+  stalled KMS capture for 11-15 ms while the 256x256 cursor image was read out
+  of video memory. About once a second of desktop use a frame overran, which
+  pushed adaptive fps down. The read now uses streaming loads: ~1 ms.
+- Fix: KMS capture leaked a GPU buffer handle on every frame for the whole
+  session, pinning each buffer it had seen (e.g. a closed game's swapchain)
+  and growing kernel memory.
+- Fix: a session started while the cursor was hidden (inside a game) never
+  showed a remote cursor, even after leaving the game.
+- Frame-rate step-down logs split the encode time into upload and encode.
+  Capture overrun logs split cursor/scanout from copy time.
+
 # 0.9.19
 
 Server-only release; no wire format change.

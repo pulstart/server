@@ -2764,12 +2764,13 @@ fn run_shared_pipeline(
                 // Don't stack an fps rebuild on a pending bitrate/resolution one.
                 if pending_encoder_rebuild.is_none() {
                     if let Some(sample) = frame_rate_tracker.take_sample(now) {
+                        let stages = encoder_stage_note(&mut encoder);
                         if let Some(new_fps) = adaptive_fps.apply_at(&sample, now) {
                             let mut new_config = current_config.clone();
                             new_config.framerate = new_fps;
                             let backend = encoder_backend(&encoder);
                             println!(
-                                "[adapt-fps] {} fps {} -> {} (delivered {:.0}, overrun {:.0}%, encode {:.1}ms)",
+                                "[adapt-fps] {} fps {} -> {} (delivered {:.0}, overrun {:.0}%, encode {:.1}ms{stages})",
                                 encoder_backend_name(backend),
                                 current_config.framerate,
                                 new_fps,
@@ -2910,6 +2911,19 @@ fn encode_and_broadcast(
         });
     }
     encoded_bytes
+}
+
+/// Per-stage split of the encode time since the last call, for logs.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn encoder_stage_note(encoder: &mut EncoderKind) -> String {
+    match encoder {
+        #[cfg(target_os = "linux")]
+        EncoderKind::Vulkan(e) => e
+            .take_stage_means()
+            .map(|(upload, encode)| format!(": upload {upload:.1?} + encode {encode:.1?}"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]

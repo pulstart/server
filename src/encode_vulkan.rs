@@ -141,6 +141,8 @@ pub struct VulkanEncoder {
     _nv12_claim: Nv12Claim,
     /// `ST_TRACE`: per-frame (upload, encode) times, logged in batches.
     stage_times: Option<Vec<(std::time::Duration, std::time::Duration)>>,
+    /// (upload, encode, frames) since the last `take_stage_means`.
+    stage_sum: (std::time::Duration, std::time::Duration, u32),
 }
 
 unsafe impl Send for VulkanEncoder {}
@@ -181,6 +183,7 @@ impl VulkanEncoder {
             height: config.height,
             _nv12_claim: Nv12Claim::new(),
             stage_times: None,
+            stage_sum: Default::default(),
         };
         if encoder.nv12.is_null() {
             return Err("av_frame_alloc failed".into());
@@ -207,6 +210,7 @@ impl VulkanEncoder {
             cost = format!(", {frame_cost:.1?}/frame");
         }
         encoder.force_keyframe_next = true;
+        encoder.stage_sum = Default::default();
         encoder.stage_times = std::env::var_os("ST_TRACE").map(|_| Vec::with_capacity(240));
         println!(
             "[vulkan] {name} encoder opened ({}x{}, {}kbps, {}fps{cost})",
@@ -453,8 +457,12 @@ impl VulkanEncoder {
             send_and_collect(self.codec_ctx, hw)
         })();
         ffi::av_frame_free(&mut hw);
+        let (upload, encode) = (uploaded - start, uploaded.elapsed());
+        self.stage_sum.0 += upload;
+        self.stage_sum.1 += encode;
+        self.stage_sum.2 += 1;
         if let Some(times) = self.stage_times.as_mut() {
-            times.push((uploaded - start, uploaded.elapsed()));
+            times.push((upload, encode));
             if times.len() == times.capacity() {
                 let pct = |v: &mut Vec<std::time::Duration>, q: usize| {
                     v.sort();
@@ -471,6 +479,12 @@ impl VulkanEncoder {
             }
         }
         result
+    }
+
+    /// Mean (upload, encode) per frame since the previous call.
+    pub fn take_stage_means(&mut self) -> Option<(std::time::Duration, std::time::Duration)> {
+        let (upload, encode, frames) = std::mem::take(&mut self.stage_sum);
+        (frames > 0).then(|| (upload / frames, encode / frames))
     }
 
     pub fn reset_for_keyframe(&mut self) {

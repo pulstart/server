@@ -402,34 +402,36 @@ fn is_cursor_plane(card: &Card, plane_handle: control::plane::Handle) -> bool {
     false
 }
 
-/// Find the cursor plane for the same CRTC as the primary plane.
+/// The cursor plane that can drive the primary plane's CRTC, bound or not: a
+/// hidden cursor leaves it unbound, and matching only the current binding lost
+/// the cursor for a whole session started while a game hid it.
 fn find_cursor_plane(
     card: &Card,
     primary_plane_handle: control::plane::Handle,
 ) -> Option<control::plane::Handle> {
-    let primary = card.get_plane(primary_plane_handle).ok()?;
-    let primary_crtc = primary.crtc()?;
-
-    let planes = card.plane_handles().ok()?;
-    for &handle in planes.iter() {
-        if let Ok(plane) = card.get_plane(handle) {
-            if plane.crtc() == Some(primary_crtc) && is_cursor_plane(card, handle) {
-                return Some(handle);
-            }
-        }
-    }
-    None
+    let crtc = card.get_plane(primary_plane_handle).ok()?.crtc()?;
+    let resources = card.resource_handles().ok()?;
+    card.plane_handles()
+        .ok()?
+        .iter()
+        .filter_map(|&handle| Some((handle, card.get_plane(handle).ok()?)))
+        .filter(|(_, plane)| {
+            plane.crtc() == Some(crtc)
+                || resources
+                    .filter_crtcs(plane.possible_crtcs())
+                    .contains(&crtc)
+        })
+        .filter(|&(handle, _)| is_cursor_plane(card, handle))
+        .max_by_key(|(_, plane)| plane.crtc() == Some(crtc))
+        .map(|(handle, _)| handle)
 }
 
 /// Read the cursor's on-screen position from atomic plane properties.
 ///
-/// Returns `(x, y)` in CRTC pixels. Atomic drivers (AMD/Intel) expose `CRTC_X`/
-/// `CRTC_Y`; NVIDIA drives the cursor through the *legacy* DRM cursor API
-/// (`drmModeMoveCursor`) and exposes none of the `CRTC_*` props, and drm-rs
-/// doesn't surface `drmModeGetPlane`'s legacy `crtc_x/y`. There is no readback
-/// path for the legacy position, so we fall back to `(0, 0)`: in hover-absolute
-/// the client renders the cursor at its own local pointer and only needs the
-/// shape + a visible flag, so an unknown server position is harmless there.
+/// Returns `(x, y)` in CRTC pixels, or `(0, 0)` where the props are hidden:
+/// nvidia-drm shows `CRTC_X`/`CRTC_Y` only to atomic clients, and this fd isn't
+/// one (a position change would then trigger a full capture). Hover-absolute
+/// renders at the client's own pointer, so an unknown position is harmless there.
 fn read_cursor_position(
     card: &Card,
     cursor_handle: control::plane::Handle,
@@ -593,7 +595,9 @@ fn capture_cursor(
     let pitch = fb2.pitches()[0];
 
     // Export GEM handle as DMA-BUF fd for mmap
-    let fd = match card.buffer_to_prime_fd(gem_handle, 0x02) {
+    let exported = card.buffer_to_prime_fd(gem_handle, 0x02);
+    close_gem_handles(card, &gem_buffers);
+    let fd = match exported {
         Ok(fd) => fd,
         Err(e) => {
             cursor_diag(&format!("cursor buffer_to_prime_fd failed: {e}"));
@@ -636,9 +640,7 @@ fn capture_cursor(
     let src = mapped as *const u8;
 
     for row in 0..cursor_h as usize {
-        let start = row * pitch as usize;
-        let slice = unsafe { std::slice::from_raw_parts(src.add(start), row_bytes) };
-        pixels.extend_from_slice(slice);
+        unsafe { copy_from_wc(&mut pixels, src.add(row * pitch as usize), row_bytes) };
     }
 
     unsafe {
@@ -679,6 +681,59 @@ fn capture_cursor(
         shape_serial: serial,
         visible: true,
     })
+}
+
+/// GETFB2 creates a new GEM handle per call; each pins its buffer and a prime
+/// cache entry in this fd until closed.
+fn close_gem_handles(card: &Card, handles: &[Option<drm::buffer::Handle>; 4]) {
+    for (i, handle) in handles.iter().enumerate() {
+        if let Some(h) = *handle {
+            if !handles[..i].contains(&Some(h)) {
+                let _ = card.close_buffer(h);
+            }
+        }
+    }
+}
+
+/// Append `len` bytes from a write-combined mapping (a cursor buffer in VRAM).
+/// Plain loads cost a PCIe round trip each (256 KiB: 11–15 ms); SSE4.1
+/// streaming loads fetch whole lines (~1 ms).
+///
+/// # Safety
+/// `src..src+len` must be readable.
+unsafe fn copy_from_wc(dst: &mut Vec<u8>, src: *const u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return copy_from_wc_sse41(dst, src, len);
+    }
+    dst.extend_from_slice(std::slice::from_raw_parts(src, len));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn copy_from_wc_sse41(dst: &mut Vec<u8>, src: *const u8, len: usize) {
+    use std::arch::x86_64::{__m128i, _mm_storeu_si128, _mm_stream_load_si128};
+    let head = src.align_offset(64).min(len);
+    let lines = (len - head) / 64;
+    dst.extend_from_slice(std::slice::from_raw_parts(src, head));
+    dst.reserve(lines * 64);
+    let out = dst.as_mut_ptr().add(dst.len()) as *mut __m128i;
+    let body = src.add(head) as *const __m128i;
+    for line in 0..lines {
+        let (s, d) = (body.add(line * 4), out.add(line * 4));
+        let v = [
+            _mm_stream_load_si128(s),
+            _mm_stream_load_si128(s.add(1)),
+            _mm_stream_load_si128(s.add(2)),
+            _mm_stream_load_si128(s.add(3)),
+        ];
+        for (i, v) in v.into_iter().enumerate() {
+            _mm_storeu_si128(d.add(i), v);
+        }
+    }
+    dst.set_len(dst.len() + lines * 64);
+    let done = head + lines * 64;
+    dst.extend_from_slice(std::slice::from_raw_parts(src.add(done), len - done));
 }
 
 /// Capture a single frame from the given plane, returning a CapturedFrame with DMA-BUF planes.
@@ -784,26 +839,23 @@ fn capture_frame(
         .unwrap_or(drm_fourcc::DrmModifier::Linear)
         .into();
 
-    // Export each plane's GEM handle as a DMA-BUF fd
-    let mut planes = Vec::new();
+    // Export each plane's GEM handle as a DMA-BUF fd (DRM_RDWR = 0x02)
     let gem_buffers = fb2.buffers();
-    for (i, gem) in gem_buffers.iter().enumerate() {
-        let gem_handle = match gem {
-            Some(h) => *h,
-            None => break,
-        };
-        // DRM_RDWR = 0x02
-        let owned_fd = card
-            .buffer_to_prime_fd(gem_handle, 0x02)
-            .map_err(|e| format!("buffer_to_prime_fd: {e}"))?;
-
-        planes.push(DmaBufPlane {
-            fd: owned_fd,
-            offset: fb2.offsets()[i],
-            pitch: fb2.pitches()[i],
-            modifier,
-        });
-    }
+    let planes = gem_buffers
+        .iter()
+        .map_while(|gem| *gem)
+        .enumerate()
+        .map(|(i, gem_handle)| {
+            Ok(DmaBufPlane {
+                fd: card.buffer_to_prime_fd(gem_handle, 0x02)?,
+                offset: fb2.offsets()[i],
+                pitch: fb2.pitches()[i],
+                modifier,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>();
+    close_gem_handles(card, &gem_buffers);
+    let planes = planes.map_err(|e| format!("buffer_to_prime_fd: {e}"))?;
 
     if planes.is_empty() {
         return Err("Framebuffer has no planes".into());
@@ -1051,8 +1103,10 @@ impl CaptureBackend for KmsCapture {
                     continue;
                 }
 
+                let scanout;
                 match capture_frame(&card, current_plane, cursor_handle, Some(&mut cursor_cache)) {
                     Ok(mut frame) => {
+                        scanout = now.elapsed();
                         let dims = (frame.width, frame.height);
                         if !logged_fmt {
                             if let FrameData::DmaBuf {
@@ -1185,7 +1239,11 @@ impl CaptureBackend for KmsCapture {
                 if took > target_interval
                     && last_overrun_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
                 {
-                    eprintln!("[kms] capture took {took:.2?} (> {target_interval:.2?} interval)");
+                    eprintln!(
+                        "[kms] capture took {took:.2?} (> {target_interval:.2?} interval; \
+                         scanout+cursor {scanout:.2?}, copy {:.2?})",
+                        took - scanout
+                    );
                     last_overrun_log = Some(Instant::now());
                 }
             }
@@ -1703,5 +1761,65 @@ mod tests {
         assert_eq!(fnv1a_u32(b"HDMI-A-1"), fnv1a_u32(b"HDMI-A-1"));
         assert_ne!(fnv1a_u32(b"HDMI-A-1"), fnv1a_u32(b"DP-2"));
         assert_ne!(fnv1a_u32(b""), 0);
+    }
+
+    #[test]
+    fn copy_from_wc_matches_plain_copy_at_any_alignment() {
+        let src: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+        for offset in [0, 1, 15, 16, 63, 64, 100] {
+            for len in [0, 1, 63, 64, 65, 1000, 3000] {
+                let mut out = vec![9u8; 5];
+                unsafe { copy_from_wc(&mut out, src.as_ptr().add(offset), len) };
+                assert_eq!(out[..5], [9; 5]);
+                assert_eq!(
+                    out[5..],
+                    src[offset..offset + len],
+                    "offset {offset} len {len}"
+                );
+            }
+        }
+    }
+
+    /// Capture must not leak GETFB2's GEM handles, the cursor plane must be
+    /// found, and reading its image must not stall the capture thread (root).
+    /// `ST_TEST_KMS_CURSOR=1 sudo -E <test-binary> live_cursor_and_handles --nocapture`
+    #[test]
+    fn live_cursor_and_handles() {
+        if std::env::var_os("ST_TEST_KMS_CURSOR").is_none() {
+            return;
+        }
+        let (card, _) = Card::open(false).unwrap();
+        card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
+            .unwrap();
+        let plane = find_active_plane(&card).unwrap();
+        for _ in 0..100 {
+            drop(capture_frame(&card, plane, None, None).unwrap());
+        }
+        let fb = card.get_plane(plane).unwrap().framebuffer().unwrap();
+        let handles = card.get_planar_framebuffer(fb).unwrap().buffers();
+        close_gem_handles(&card, &handles);
+        let next = u32::from(handles[0].unwrap());
+        assert!(
+            next <= 4,
+            "GEM handles leak: handle {next} after 100 captures"
+        );
+
+        let cursor = find_cursor_plane(&card, plane).expect("cursor plane");
+        let mut times = Vec::new();
+        for _ in 0..20 {
+            let t = Instant::now();
+            if capture_cursor(&card, cursor, None).is_none() {
+                eprintln!("[cursor] hidden; read cost not measured");
+                return;
+            }
+            times.push(t.elapsed());
+        }
+        times.sort();
+        eprintln!("[cursor] read p50={:.2?} max={:.2?}", times[10], times[19]);
+        assert!(
+            times[10] < Duration::from_millis(3),
+            "cursor read {:.2?}",
+            times[10]
+        );
     }
 }
