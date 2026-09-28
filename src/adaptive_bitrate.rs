@@ -3,11 +3,15 @@ use st_protocol::{
     TransportFeedback,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub struct AdaptiveBitrateState {
     inner: Mutex<AdaptiveBitrateInner>,
+    /// Bitrate the running encoder was actually built with (it lags the
+    /// target while a rebuild is gated by hysteresis).
+    encoder_kbps: AtomicU32,
 }
 
 struct AdaptiveBitrateInner {
@@ -44,7 +48,16 @@ impl AdaptiveBitrateState {
                 clients: HashMap::new(),
                 client_ceilings: HashMap::new(),
             }),
+            encoder_kbps: AtomicU32::new(0),
         }
+    }
+
+    pub fn set_encoder_kbps(&self, kbps: u32) {
+        self.encoder_kbps.store(kbps, Ordering::Relaxed);
+    }
+
+    pub fn encoder_kbps(&self) -> u32 {
+        self.encoder_kbps.load(Ordering::Relaxed)
     }
 
     pub fn limits(&self) -> (u32, u32, u32) {
@@ -770,6 +783,7 @@ pub struct ClientRateController {
     /// client's reported cap→send) balloons. Reacting to it is the only way to
     /// settle bitrate near real capacity on a buffer-bloated path.
     send_backlog_us: u32,
+    encoder_kbps: u32,
 }
 
 impl ClientRateController {
@@ -793,6 +807,7 @@ impl ClientRateController {
             probe_backoff_until: now - Duration::from_secs(1),
             seen_completed_frame: false,
             send_backlog_us: 0,
+            encoder_kbps: 0,
         }
     }
 
@@ -802,6 +817,15 @@ impl ClientRateController {
         self.send_backlog_us = us;
     }
 
+    pub fn recommended_kbps(&self) -> u32 {
+        self.recommended_kbps
+    }
+
+    /// Feed the running encoder's bitrate before `apply_feedback`; 0 = unknown.
+    pub fn note_encoder_kbps(&mut self, kbps: u32) {
+        self.encoder_kbps = kbps;
+    }
+
     pub fn apply_feedback(&mut self, feedback: TransportFeedback) -> u32 {
         self.apply_feedback_at(feedback, Instant::now())
     }
@@ -809,6 +833,11 @@ impl ClientRateController {
     const DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(2);
     const UPGRADE_COOLDOWN: Duration = Duration::from_secs(8);
     const CLEAN_INTERVALS_FOR_UPGRADE: u32 = 6;
+    /// Received video at this share of the target = encoder is budget-limited.
+    const BUDGET_LIMITED_PCT: u64 = 80;
+    const FAST_UPGRADE_COOLDOWN: Duration = Duration::from_secs(2);
+    const FAST_CLEAN_INTERVALS: u32 = 2;
+    const FAST_STEP_PCT: u32 = 20;
     const STABLE_INTERVALS_FOR_PROMOTION: u32 = 18;
     const PROBE_FAILURE_WINDOW: Duration = Duration::from_secs(8);
     const BASE_PROBE_BACKOFF: Duration = Duration::from_secs(16);
@@ -939,20 +968,43 @@ impl ClientRateController {
         } else {
             self.clean_intervals = self.clean_intervals.saturating_add(1);
             self.promote_stable_bitrate(now);
-            if self.clean_intervals >= Self::CLEAN_INTERVALS_FOR_UPGRADE
-                && self.can_increase(now)
+            // The encoder spending (nearly) its whole budget means picture
+            // quality is bitrate-limited right now: climb in big, quick steps.
+            // Otherwise content fits and a slow probe is enough.
+            let budget = match self.encoder_kbps {
+                0 => self.recommended_kbps,
+                kbps => kbps.min(self.recommended_kbps),
+            };
+            let fast = self.probe_failures == 0
+                && feedback.recv_video_kbps as u64 * 100
+                    >= budget as u64 * Self::BUDGET_LIMITED_PCT;
+            let (clean_needed, cooldown) = if fast {
+                (Self::FAST_CLEAN_INTERVALS, Self::FAST_UPGRADE_COOLDOWN)
+            } else {
+                (Self::CLEAN_INTERVALS_FOR_UPGRADE, Self::UPGRADE_COOLDOWN)
+            };
+            if self.clean_intervals >= clean_needed
+                && now.duration_since(self.last_increase) >= cooldown
+                && now >= self.probe_backoff_until
                 && self.recommended_kbps < self.max_kbps
             {
-                let step = self.increase_step_kbps();
+                let step = if fast {
+                    (self.recommended_kbps / 100 * Self::FAST_STEP_PCT).max(2_000)
+                } else {
+                    self.increase_step_kbps()
+                };
                 let mut next = self
                     .recommended_kbps
                     .saturating_add(step)
                     .min(self.max_kbps);
-                // B1: clamp the probe ceiling to ~110% of measured receive rate
-                // so we never probe far past what the path is actually carrying.
+                // B1: never probe far past what the path demonstrably carries —
+                // ~110% of the measured receive rate for a slow probe; a fast
+                // climb may run up to 150% ahead of an encoder still waiting
+                // for its rebuild.
                 if feedback.recv_video_kbps > 0 {
-                    let capacity_ceiling =
-                        ((feedback.recv_video_kbps as u64 * 110) / 100).min(u32::MAX as u64) as u32;
+                    let lead_pct = if fast { 150 } else { 110 };
+                    let capacity_ceiling = ((feedback.recv_video_kbps as u64 * lead_pct) / 100)
+                        .min(u32::MAX as u64) as u32;
                     next = next.min(capacity_ceiling.max(self.recommended_kbps));
                 }
                 if next > self.recommended_kbps {
@@ -970,11 +1022,6 @@ impl ClientRateController {
 
     fn can_decrease(&self, now: Instant) -> bool {
         now.duration_since(self.last_decrease) >= Self::DOWNGRADE_COOLDOWN
-    }
-
-    fn can_increase(&self, now: Instant) -> bool {
-        now.duration_since(self.last_increase) >= Self::UPGRADE_COOLDOWN
-            && now >= self.probe_backoff_until
     }
 
     fn probe_failed_recently(&self, now: Instant) -> bool {
@@ -1395,6 +1442,89 @@ mod tests {
             now + ClientRateController::BASE_PROBE_BACKOFF - Duration::from_secs(1),
         );
         assert_eq!(before_retry_window, 6_000);
+    }
+
+    /// Feeds 500 ms clean windows whose received rate is `pct` of the current
+    /// target; returns the target after `secs`.
+    fn climb(controller: &mut ClientRateController, now: &mut Instant, pct: u32, secs: u32) -> u32 {
+        let mut kbps = controller.recommended_kbps;
+        for _ in 0..secs * 2 {
+            *now += Duration::from_millis(500);
+            kbps = controller.apply_feedback_at(
+                TransportFeedback {
+                    interval_ms: 500,
+                    received_packets: 1_000,
+                    completed_frames: 60,
+                    recv_video_kbps: kbps / 100 * pct,
+                    ..Default::default()
+                },
+                *now,
+            );
+        }
+        kbps
+    }
+
+    #[test]
+    fn controller_climbs_fast_while_the_encoder_is_budget_limited() {
+        let mut now = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 100_000, 20_000, now);
+        let kbps = climb(&mut controller, &mut now, 95, 12);
+        assert!(kbps >= 50_000, "{kbps}");
+    }
+
+    #[test]
+    fn controller_fast_climb_leads_a_lagging_encoder_by_at_most_half() {
+        let mut now = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 100_000, 20_000, now);
+        controller.note_encoder_kbps(20_000);
+        let mut kbps = 20_000;
+        for _ in 0..40 {
+            now += Duration::from_millis(500);
+            kbps = controller.apply_feedback_at(
+                TransportFeedback {
+                    interval_ms: 500,
+                    received_packets: 1_000,
+                    completed_frames: 60,
+                    recv_video_kbps: 19_000,
+                    ..Default::default()
+                },
+                now,
+            );
+        }
+        assert!((24_000..=28_500).contains(&kbps), "{kbps}");
+    }
+
+    #[test]
+    fn controller_holds_while_the_encoder_undershoots() {
+        let mut now = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 100_000, 20_000, now);
+        assert_eq!(climb(&mut controller, &mut now, 30, 60), 20_000);
+    }
+
+    #[test]
+    fn controller_fast_climb_reverts_one_step_on_loss_then_slows() {
+        let mut now = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 100_000, 20_000, now);
+        let before = climb(&mut controller, &mut now, 95, 4);
+        let probed = climb(&mut controller, &mut now, 95, 2);
+        assert!(probed > before);
+        now += Duration::from_millis(500);
+        let reverted = controller.apply_feedback_at(
+            TransportFeedback {
+                interval_ms: 500,
+                received_packets: 1_000,
+                lost_packets: 20,
+                completed_frames: 60,
+                dropped_frames: 1,
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(
+            reverted < probed && reverted >= before,
+            "{before} {probed} {reverted}"
+        );
+        assert_eq!(climb(&mut controller, &mut now, 95, 10), reverted);
     }
 
     #[test]

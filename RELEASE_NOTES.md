@@ -14,6 +14,15 @@ Server-only release; no wire format change.
   replaced by newer ones, never dropped.
 - Latency stats (client overlay) now start when the frame is sampled, so they
   include the capture readback.
+- Bitrate climbs fast when the picture needs it: while the encoder is using
+  its whole budget on a clean link, the target rises 20% every 2 s (20 to
+  90 Mbps in about 25 s), instead of creeping up ~10% per probe. Simple
+  content that fits its budget still probes slowly.
+- Fix: every bitrate or frame-rate change rebuilt the Vulkan encoder with a
+  14-frame self-test that competed with the live encoder, stalling the stream
+  (p99 88 ms) and tripping the frame-rate controller into more rebuilds.
+  Rebuilds of the running codec now skip it: p99 12 ms through a full climb.
+- Each bitrate cut logs the client feedback that caused it.
 
 # 0.9.18
 

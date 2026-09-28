@@ -172,7 +172,12 @@ fn create_linux_encoder_with_hint(
                     .map(EncoderKind::Vaapi)
             }
             EncoderBackend::Vulkan if encode_vulkan::enabled() => {
-                encode_vulkan::VulkanEncoder::with_config(config, render_node_hint, gate_frame_cost)
+                let check = if gate_frame_cost {
+                    encode_vulkan::OpenCheck::Gate
+                } else {
+                    encode_vulkan::OpenCheck::Prove
+                };
+                encode_vulkan::VulkanEncoder::with_config(config, render_node_hint, check)
                     .map(EncoderKind::Vulkan)
             }
             EncoderBackend::Vulkan => Err("disabled by ST_VULKAN_ENCODE".into()),
@@ -290,9 +295,11 @@ fn create_encoder_for_backend(
             .map(EncoderKind::Vaapi)
             .map_err(|err| format!("VAAPI reconfigure failed: {err}")),
         #[cfg(target_os = "linux")]
-        EncoderBackend::Vulkan => encode_vulkan::VulkanEncoder::with_config(config, None, false)
-            .map(EncoderKind::Vulkan)
-            .map_err(|err| format!("Vulkan reconfigure failed: {err}")),
+        EncoderBackend::Vulkan => {
+            encode_vulkan::VulkanEncoder::with_config(config, None, encode_vulkan::OpenCheck::Trust)
+                .map(EncoderKind::Vulkan)
+                .map_err(|err| format!("Vulkan reconfigure failed: {err}"))
+        }
         #[cfg(target_os = "linux")]
         EncoderBackend::Nvenc => encode::NvencEncoder::with_config(config)
             .map(EncoderKind::Nvenc)
@@ -961,6 +968,28 @@ impl BitrateVerifier {
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 /// `rebuild_only`: the encoder can't retarget in place, so every change
 /// restarts the stream on an IDR; only take larger, rarer steps.
+/// One line per ABR cut with the feedback window that caused it.
+fn log_abr_decrease(
+    peer: impl std::fmt::Display,
+    from_kbps: u32,
+    to_kbps: u32,
+    fb: &st_protocol::TransportFeedback,
+    backlog_us: u32,
+) {
+    println!(
+        "[abr] {peer}: {from_kbps} -> {to_kbps} kbps (lost {}/{} pkts, dropped {}/{} frames, \
+         late {}, backlog {} ms, owd {:+} ms, recv {} kbps)",
+        fb.lost_packets,
+        fb.received_packets + fb.lost_packets,
+        fb.dropped_frames,
+        fb.completed_frames + fb.dropped_frames,
+        fb.late_packets,
+        backlog_us / 1000,
+        fb.owd_trend_us / 1000,
+        fb.recv_video_kbps
+    );
+}
+
 fn should_schedule_bitrate_reconfigure(
     current_kbps: u32,
     target_kbps: u32,
@@ -974,7 +1003,7 @@ fn should_schedule_bitrate_reconfigure(
     let now = Instant::now();
     let delta_kbps = current_kbps.abs_diff(target_kbps);
     let (step_divisor, down_wait, up_wait) = if rebuild_only {
-        (5, Duration::from_secs(2), Duration::from_secs(8))
+        (5, Duration::from_secs(2), Duration::from_secs(4))
     } else {
         (10, Duration::from_millis(750), Duration::from_secs(4))
     };
@@ -2626,6 +2655,7 @@ fn run_shared_pipeline(
                     ));
                 }
 
+                rate_control.set_encoder_kbps(current_config.bitrate_kbps);
                 let forced_br = control.forced_bitrate_kbps();
                 // ABR targets the on-wire budget; the encoder gets that minus FEC
                 // parity + audio overhead (B3) so on-wire rate matches intent.
@@ -4381,9 +4411,14 @@ async fn handle_client(
                             dup_first_shared.store(dup_on, Ordering::Relaxed);
                             // Bufferbloat: feed the server-side cap→send backlog so
                             // ABR can downshift on WiFi queue growth (zero loss).
-                            bitrate_controller
-                                .note_send_backlog_us(send_backlog_shared.load(Ordering::Relaxed));
+                            let backlog_us = send_backlog_shared.load(Ordering::Relaxed);
+                            bitrate_controller.note_send_backlog_us(backlog_us);
+                            bitrate_controller.note_encoder_kbps(rate_control.encoder_kbps());
+                            let prev_kbps = bitrate_controller.recommended_kbps();
                             let next_kbps = bitrate_controller.apply_feedback(feedback);
+                            if next_kbps < prev_kbps {
+                                log_abr_decrease(addr, prev_kbps, next_kbps, &feedback, backlog_us);
+                            }
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                         }
                         ControlMessage::ClientBitratePreference(max_kbps) => {
@@ -5426,9 +5461,14 @@ fn handle_punched_client(
                                 dup_first_shared.store(dup_on, Ordering::Relaxed);
                             }
                             // Bufferbloat: feed the server-side cap→send backlog.
-                            bitrate_controller
-                                .note_send_backlog_us(send_backlog_shared.load(Ordering::Relaxed));
+                            let backlog_us = send_backlog_shared.load(Ordering::Relaxed);
+                            bitrate_controller.note_send_backlog_us(backlog_us);
+                            bitrate_controller.note_encoder_kbps(rate_control.encoder_kbps());
+                            let prev_kbps = bitrate_controller.recommended_kbps();
                             let next_kbps = bitrate_controller.apply_feedback(fb);
+                            if next_kbps < prev_kbps {
+                                log_abr_decrease(peer, prev_kbps, next_kbps, &fb, backlog_us);
+                            }
                             rate_control.update_client_target(sub.vid_sub_id, next_kbps);
                             if (fb.lost_packets > 0 || fb.dropped_frames > 0)
                                 && last_transport_recovery_keyframe.elapsed()
@@ -6288,13 +6328,13 @@ mod bitrate_hysteresis_tests {
             true
         ));
         assert!(!should_schedule_bitrate_reconfigure(
-            20_000, 26_000, settled, true
-        ));
-        assert!(should_schedule_bitrate_reconfigure(
             20_000,
             26_000,
-            Instant::now() - Duration::from_secs(9),
+            Instant::now() - Duration::from_secs(3),
             true
+        ));
+        assert!(should_schedule_bitrate_reconfigure(
+            20_000, 26_000, settled, true
         ));
     }
 }

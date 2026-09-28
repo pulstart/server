@@ -113,6 +113,18 @@ unsafe fn create_device(render_node: Option<&str>) -> Result<*mut ffi::AVBufferR
     Ok(vk)
 }
 
+/// How much of a freshly opened encoder to exercise before use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpenCheck {
+    /// Encode test frames and reject a codec too slow for the frame rate.
+    Gate,
+    /// Encode test frames to prove the device works end-to-end.
+    Prove,
+    /// The same codec already runs live; test frames would only contend with
+    /// it on the encode engine and stall the stream.
+    Trust,
+}
+
 pub struct VulkanEncoder {
     codec_ctx: *mut ffi::AVCodecContext,
     frames_ref: *mut ffi::AVBufferRef,
@@ -140,7 +152,7 @@ impl VulkanEncoder {
     pub fn with_config(
         config: &EncoderConfig,
         render_node: Option<&str>,
-        gate_frame_cost: bool,
+        check: OpenCheck,
     ) -> Result<Self, String> {
         if config.is_hdr() || config.is_yuv444() {
             return Err("Vulkan encode path is SDR 4:2:0 only".into());
@@ -173,28 +185,31 @@ impl VulkanEncoder {
         if encoder.nv12.is_null() {
             return Err("av_frame_alloc failed".into());
         }
-        let frame_cost = unsafe {
+        unsafe {
             encoder.init_frames(render_node)?;
             encoder.open(codec, name, config)?;
+        }
+        let mut cost = String::new();
+        if check != OpenCheck::Trust {
             // Opening can succeed on a device that then fails to encode; prove
             // frames end-to-end so selection falls through instead.
-            encoder
-                .measure_frame_cost()
-                .map_err(|e| format!("{name} self-test: {e}"))?
-        };
-        let budget = std::time::Duration::from_secs_f64(
-            MAX_FRAME_BUDGET_SHARE / config.framerate.max(1) as f64,
-        );
-        if gate_frame_cost && frame_cost > budget {
-            return Err(format!(
-                "{name} too slow for {}fps ({frame_cost:.1?}/frame, budget {budget:.1?})",
-                config.framerate
-            ));
+            let frame_cost = unsafe { encoder.measure_frame_cost() }
+                .map_err(|e| format!("{name} self-test: {e}"))?;
+            let budget = std::time::Duration::from_secs_f64(
+                MAX_FRAME_BUDGET_SHARE / config.framerate.max(1) as f64,
+            );
+            if check == OpenCheck::Gate && frame_cost > budget {
+                return Err(format!(
+                    "{name} too slow for {}fps ({frame_cost:.1?}/frame, budget {budget:.1?})",
+                    config.framerate
+                ));
+            }
+            cost = format!(", {frame_cost:.1?}/frame");
         }
         encoder.force_keyframe_next = true;
         encoder.stage_times = std::env::var_os("ST_TRACE").map(|_| Vec::with_capacity(240));
         println!(
-            "[vulkan] {name} encoder opened ({}x{}, {}kbps, {}fps, {frame_cost:.1?}/frame)",
+            "[vulkan] {name} encoder opened ({}x{}, {}kbps, {}fps{cost})",
             config.width, config.height, config.bitrate_kbps, config.framerate
         );
         Ok(encoder)
@@ -617,11 +632,12 @@ mod tests {
         const RED_709: (u8, u8, u8) = (63, 102, 240);
         let (w, h) = (640u32, 360u32);
         let av1 = EncoderConfig::from_env_with_framerate_and_codec(w, h, 60, Codec::Av1);
-        assert!(VulkanEncoder::with_config(&av1, Some(&render_node()), false).is_err());
+        assert!(VulkanEncoder::with_config(&av1, Some(&render_node()), OpenCheck::Prove).is_err());
         for codec in [Codec::H264, Codec::Hevc] {
             let config = EncoderConfig::from_env_with_framerate_and_codec(w, h, 60, codec);
-            let mut enc = VulkanEncoder::with_config(&config, Some(&render_node()), false)
-                .unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+            let mut enc =
+                VulkanEncoder::with_config(&config, Some(&render_node()), OpenCheck::Prove)
+                    .unwrap_or_else(|e| panic!("{codec:?}: {e}"));
             let mut units = Vec::new();
             let mut keyframes = Vec::new();
             for i in 0..20 {
@@ -674,8 +690,8 @@ mod tests {
         const BLUE_709: (u8, u8, u8) = (32, 240, 118);
         let (w, h) = (640u32, 360u32);
         let config = EncoderConfig::from_env_with_framerate_and_codec(w, h, 60, Codec::Hevc);
-        let mut enc =
-            VulkanEncoder::with_config(&config, Some(&render_node()), false).expect("vulkan");
+        let mut enc = VulkanEncoder::with_config(&config, Some(&render_node()), OpenCheck::Prove)
+            .expect("vulkan");
         let (mut stab, src) = kms::painted_readback_source(&render_node(), w, h);
         let mut units = Vec::new();
         for _ in 0..5 {
@@ -722,8 +738,8 @@ mod tests {
         let (w, h) = (first.width, first.height);
         drop(first);
         let config = EncoderConfig::from_env_with_framerate_and_codec(w, h, 120, Codec::H264);
-        let mut enc =
-            VulkanEncoder::with_config(&config, Some(&render_node()), false).expect("vulkan");
+        let mut enc = VulkanEncoder::with_config(&config, Some(&render_node()), OpenCheck::Prove)
+            .expect("vulkan");
         for loaded in [false, true] {
             let stop = Arc::new(AtomicBool::new(false));
             let load = loaded.then(|| {
@@ -837,8 +853,8 @@ mod tests {
         let source = ScrollingSource::new(w, h);
         let frames: Vec<Vec<u8>> = (0..64).map(|n| source.frame(n)).collect();
         let config = EncoderConfig::from_env_with_framerate_and_codec(w, h, 120, Codec::H264);
-        let mut enc =
-            VulkanEncoder::with_config(&config, Some(&render_node()), false).expect("vulkan");
+        let mut enc = VulkanEncoder::with_config(&config, Some(&render_node()), OpenCheck::Prove)
+            .expect("vulkan");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let load = std::env::var_os("ST_TEST_PACED_LOAD").map(|_| {
             crate::capture::linux::kms_gpu_copy::tests::spawn_gpu_load(
@@ -931,8 +947,9 @@ mod tests {
             .into_iter()
             .map(|(codec, fps)| {
                 let config = EncoderConfig::from_env_with_framerate_and_codec(w, h, fps, codec);
-                let enc = VulkanEncoder::with_config(&config, Some(&render_node()), false)
-                    .unwrap_or_else(|e| panic!("{codec:?}@{fps}: {e}"));
+                let enc =
+                    VulkanEncoder::with_config(&config, Some(&render_node()), OpenCheck::Prove)
+                        .unwrap_or_else(|e| panic!("{codec:?}@{fps}: {e}"));
                 (format!("{codec:?}@{fps}").to_lowercase(), enc)
             })
             .collect();
