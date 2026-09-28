@@ -254,22 +254,27 @@ impl NativeFence {
         }
     }
 
-    /// Flush and block until all GL work submitted so far has completed.
-    /// `false` means no fence could be waited on; the caller must `glFinish`.
-    fn wait(&self, display: egl::Display, gl: &glow::Context) -> bool {
+    /// Flush and wait until all GL work submitted so far has completed, or
+    /// `limit` passes (`None`: up to a second, then `Unavailable`).
+    fn wait(
+        &self,
+        display: egl::Display,
+        gl: &glow::Context,
+        limit: Option<std::time::Duration>,
+    ) -> FenceWait {
         use std::os::fd::AsRawFd;
         let dpy = display.as_ptr();
         let attribs = [EGL_NONE_INT];
         let sync = unsafe { (self.create)(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, attribs.as_ptr()) };
         if sync.is_null() {
-            return false;
+            return FenceWait::Unavailable;
         }
         // The sync_file only materializes once the fence is flushed.
         unsafe { gl.flush() };
         let raw = unsafe { (self.dup)(dpy, sync) };
         unsafe { (self.destroy)(dpy, sync) };
         if raw < 0 {
-            return false;
+            return FenceWait::Unavailable;
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut pfd = libc::pollfd {
@@ -277,16 +282,32 @@ impl NativeFence {
             events: libc::POLLIN,
             revents: 0,
         };
+        let deadline = limit.map(|limit| std::time::Instant::now() + limit);
         loop {
-            match unsafe { libc::poll(&mut pfd, 1, 1000) } {
-                n if n > 0 => return true,
+            let timeout_ms = match deadline {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    left.as_micros().div_ceil(1000).max(1) as i32
+                }
+                None => 1000,
+            };
+            match unsafe { libc::poll(&mut pfd, 1, timeout_ms) } {
+                n if n > 0 => return FenceWait::Signaled,
                 n if n < 0
                     && std::io::Error::last_os_error().kind()
                         == std::io::ErrorKind::Interrupted => {}
-                _ => return false,
+                0 if deadline.is_some() => return FenceWait::TimedOut,
+                _ => return FenceWait::Unavailable,
             }
         }
     }
+}
+
+enum FenceWait {
+    Signaled,
+    TimedOut,
+    /// No fence could be waited on; the caller must `glFinish`.
+    Unavailable,
 }
 
 // --- EGL context -----------------------------------------------------------
@@ -479,13 +500,20 @@ impl Gles {
         ))
     }
 
-    fn wait_gpu(&self) {
-        if !self
+    /// Waits for the GPU; `false` means `limit` passed first and the work is
+    /// still queued.
+    fn wait_gpu(&self, limit: Option<std::time::Duration>) -> bool {
+        let waited = self
             .fence
             .as_ref()
-            .is_some_and(|fence| fence.wait(self.display, &self.gl))
-        {
-            unsafe { self.gl.finish() };
+            .map(|fence| fence.wait(self.display, &self.gl, limit));
+        match waited {
+            Some(FenceWait::Signaled) => true,
+            Some(FenceWait::TimedOut) => false,
+            Some(FenceWait::Unavailable) | None => {
+                unsafe { self.gl.finish() };
+                true
+            }
         }
     }
 }
@@ -499,6 +527,24 @@ impl Drop for Gles {
             (self.gbm.device_destroy)(self.gbm_device);
             libc::close(self.device_fd);
         }
+    }
+}
+
+enum GlError {
+    /// The 3D engine was still busy at the deadline; the work is left queued.
+    Busy,
+    Failed(String),
+}
+
+impl From<String> for GlError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<&str> for GlError {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.to_string())
     }
 }
 
@@ -599,6 +645,20 @@ impl ReadbackChooser {
         }
     }
 
+    /// How long a GL frame may wait for the 3D engine: the point at which it
+    /// would be judged a spike anyway (generous while the first frames still
+    /// carry setup).
+    fn gl_deadline(&self) -> std::time::Duration {
+        const WARMUP_LIMIT: std::time::Duration = std::time::Duration::from_millis(40);
+        const FLOOR_MS: f64 = 3.0;
+        match self.vk_ms {
+            Some(vk_ms) if self.gl_samples >= Self::WARMUP => {
+                std::time::Duration::from_secs_f64((vk_ms * Self::SPIKE).max(FLOOR_MS) / 1000.0)
+            }
+            _ => WARMUP_LIMIT,
+        }
+    }
+
     fn fall_back(&mut self, now: std::time::Instant, why: &str) {
         println!(
             "[kms] scanout readback on the copy engine ({why}); retrying the 3D engine in {:?}",
@@ -634,6 +694,8 @@ pub struct KmsStabilizer {
     vk: Option<VkReadback>,
     vk_tried: bool,
     chooser: ReadbackChooser,
+    /// Scanout image a timed-out GL frame may still be reading.
+    abandoned_image: Option<egl::Image>,
     gpu_load: Option<crate::gpu_clock::GpuLoad>,
     vk_fail_streak: u32,
     vk_unsupported_logged: Option<String>,
@@ -706,6 +768,7 @@ impl KmsStabilizer {
             vk: None,
             vk_tried: false,
             chooser: ReadbackChooser::new(std::time::Instant::now()),
+            abandoned_image: None,
             gpu_load: None,
             vk_fail_streak: 0,
             vk_unsupported_logged: None,
@@ -751,7 +814,7 @@ impl KmsStabilizer {
                 // Barrier: the copy must be finished on the GPU before we return,
                 // so the caller can let KWin overwrite the source and so the
                 // encoder reads completed pixels.
-                self.gles.wait_gpu();
+                self.gles.wait_gpu(None);
                 let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
             });
         match result {
@@ -818,12 +881,25 @@ impl KmsStabilizer {
                 return Ok(data);
             }
         }
-        let result = self.gl_readback(src, drm_format, width, height, preferred);
-        if gl && self.vk.is_some() && result.is_ok() {
-            self.chooser
-                .record(true, now.elapsed(), std::time::Instant::now());
+        let limit = (gl && self.vk.is_some()).then(|| self.chooser.gl_deadline());
+        match self.gl_readback(src, drm_format, width, height, preferred, limit) {
+            Ok(data) => {
+                if gl && self.vk.is_some() {
+                    self.chooser
+                        .record(true, now.elapsed(), std::time::Instant::now());
+                }
+                Ok(data)
+            }
+            Err(GlError::Busy) => {
+                // A game holds the 3D engine: take this frame from the copy
+                // engine instead of waiting out the time slice.
+                self.chooser
+                    .fall_back(std::time::Instant::now(), "3D engine busy");
+                self.vk_readback(src, drm_format, width, height, dst)
+                    .ok_or_else(|| "copy-engine readback failed after the 3D engine stalled".into())
+            }
+            Err(GlError::Failed(e)) => Err(e),
         }
-        result
     }
 
     /// 3D-engine readback: the blit converts to NV12 (or BGRA) on the GPU,
@@ -835,7 +911,11 @@ impl KmsStabilizer {
         width: u32,
         height: u32,
         preferred: bool,
-    ) -> Result<FrameData, String> {
+        limit: Option<std::time::Duration>,
+    ) -> Result<FrameData, GlError> {
+        if let Some(image) = self.abandoned_image.take() {
+            let _ = self.gles.egl.destroy_image(self.gles.display, image);
+        }
         let nv12 = preferred && width.is_multiple_of(4) && height.is_multiple_of(2);
         let (pass, tex_w, tex_h) = if nv12 {
             self.ensure_nv12(width, height)?;
@@ -850,8 +930,13 @@ impl KmsStabilizer {
         .ok_or("RAM stabilizer target missing")?;
         let (fbo, pbo) = (target.framebuffer, target.pbo);
         let src_image = self.draw_blit(fbo, src, drm_format, width, height, pass)?;
-        let result = self.read_back(fbo, pbo, tex_w, tex_h);
-        let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
+        let result = self.read_back(fbo, pbo, tex_w, tex_h, limit);
+        if matches!(result, Err(GlError::Busy)) {
+            // The GPU still reads the image; free it once a later frame runs.
+            self.abandoned_image = Some(src_image);
+        } else {
+            let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
+        }
         result.map(if nv12 {
             FrameData::RamNv12
         } else {
@@ -915,13 +1000,15 @@ impl KmsStabilizer {
 
     /// Read an RGBA8 `fbo` of `width`x`height` texels into a pooled buffer,
     /// waiting on the fence (not inside `glReadPixels`) for the GPU work.
+    /// `Busy` when the GPU is still at it after `limit`.
     fn read_back(
         &self,
         fbo: glow::Framebuffer,
         pbo: Option<glow::Buffer>,
         width: u32,
         height: u32,
-    ) -> Result<crate::capture::RamBuf, String> {
+        limit: Option<std::time::Duration>,
+    ) -> Result<crate::capture::RamBuf, GlError> {
         let len = width as usize * height as usize * 4;
         let gl = &self.gles.gl;
         unsafe {
@@ -939,21 +1026,24 @@ impl KmsStabilizer {
                         glow::UNSIGNED_BYTE,
                         glow::PixelPackData::BufferOffset(0),
                     );
-                    self.gles.wait_gpu();
-                    let ptr = gl.map_buffer_range(
-                        glow::PIXEL_PACK_BUFFER,
-                        0,
-                        len as i32,
-                        glow::MAP_READ_BIT,
-                    );
-                    let result = if ptr.is_null() {
-                        Err("map readback buffer failed".to_string())
+                    let result = if self.gles.wait_gpu(limit) {
+                        let ptr = gl.map_buffer_range(
+                            glow::PIXEL_PACK_BUFFER,
+                            0,
+                            len as i32,
+                            glow::MAP_READ_BIT,
+                        );
+                        if ptr.is_null() {
+                            Err(GlError::Failed("map readback buffer failed".to_string()))
+                        } else {
+                            let buf = self
+                                .ram_pool
+                                .copy_from(std::slice::from_raw_parts(ptr, len));
+                            gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+                            Ok(buf)
+                        }
                     } else {
-                        let buf = self
-                            .ram_pool
-                            .copy_from(std::slice::from_raw_parts(ptr, len));
-                        gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
-                        Ok(buf)
+                        Err(GlError::Busy)
                     };
                     gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
                     result
@@ -961,18 +1051,21 @@ impl KmsStabilizer {
                 None => {
                     // Settle the draw first so glReadPixels only waits on its
                     // own transfer.
-                    self.gles.wait_gpu();
-                    let mut buf = self.ram_pool.take(len);
-                    gl.read_pixels(
-                        0,
-                        0,
-                        width as i32,
-                        height as i32,
-                        glow::RGBA,
-                        glow::UNSIGNED_BYTE,
-                        glow::PixelPackData::Slice(Some(&mut buf)),
-                    );
-                    Ok(buf)
+                    if self.gles.wait_gpu(limit) {
+                        let mut buf = self.ram_pool.take(len);
+                        gl.read_pixels(
+                            0,
+                            0,
+                            width as i32,
+                            height as i32,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut buf)),
+                        );
+                        Ok(buf)
+                    } else {
+                        Err(GlError::Busy)
+                    }
                 }
             };
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -1335,6 +1428,9 @@ impl Drop for KmsStabilizer {
         if let Some(vk) = self.vk.take() {
             vk.park();
         }
+        if let Some(image) = self.abandoned_image.take() {
+            let _ = self.gles.egl.destroy_image(self.gles.display, image);
+        }
         self.destroy_targets();
         unsafe {
             self.gles.gl.delete_program(self.program);
@@ -1605,6 +1701,27 @@ fn quad_vertices(flip_y: bool) -> [f32; 16] {
 pub(crate) mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn gl_frames_wait_for_the_3d_engine_no_longer_than_they_would_be_judged() {
+        let t0 = Instant::now();
+        let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
+        let mut c = ReadbackChooser::new(t0);
+        for _ in 0..=ReadbackChooser::WARMUP {
+            c.record(false, ms(2.8), t0);
+        }
+        assert!(c.use_gl(t0, false));
+        // Setup frames get room; a stall of a game's whole time slice does not.
+        assert_eq!(c.gl_deadline(), Duration::from_millis(40));
+        for _ in 0..ReadbackChooser::WARMUP {
+            c.record(true, ms(9.0), t0);
+        }
+        let deadline = c.gl_deadline();
+        assert!(deadline >= ms(8.0) && deadline <= ms(9.0), "{deadline:?}");
+        // A very fast copy engine still leaves a usable floor.
+        c.vk_ms = Some(0.5);
+        assert_eq!(c.gl_deadline(), Duration::from_millis(3));
+    }
 
     #[test]
     fn chooser_takes_the_faster_3d_engine_and_leaves_it_under_load() {

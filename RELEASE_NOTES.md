@@ -1,3 +1,15 @@
+# 0.9.24
+
+Server-only release; no wire format change.
+
+- No more multi-frame freezes while gaming. Every so often the server tries
+  the faster (GPU-side) way of reading the screen; with a game running it
+  could wait out the game's whole GPU time slice, and the live log showed
+  those retries freezing capture for 41, 95 and 194 ms at a time. A GPU-side
+  frame now gets only as long as it would need to be judged too slow, then
+  that same frame is taken from the copy engine instead, so a failed retry
+  costs a few milliseconds.
+
 # 0.9.23
 
 Server-only release; no wire format change.
