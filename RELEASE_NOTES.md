@@ -17,6 +17,9 @@ Server-only release; no wire format change.
   read as overload even though no frame was waiting. It now counts an
   overrun only when a newer frame was held back by it, and judges headroom
   for stepping up from encoder busy time.
+- Reconnecting is ~0.6 s faster: a codec the encoder self-test found too slow
+  (HEVC at 1440p120 on NVIDIA) is remembered for 10 minutes instead of being
+  opened and tested again on every connect.
 - Frame-rate step-down logs split the encode time into upload and encode.
   Capture overrun logs split cursor/scanout from copy time.
 

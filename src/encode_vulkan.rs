@@ -29,6 +29,13 @@ const MAX_GOP: u32 = 65_535;
 /// to the next codec instead of capping the frame rate.
 const MAX_FRAME_BUDGET_SHARE: f64 = 0.6;
 
+/// Gate rejections by (codec, width, height, fps): re-measuring on every
+/// connect cost ~0.5 s (HEVC at 1440p120). Expires so a verdict taken under
+/// a game's load (the self-test reads ~3x high) isn't kept for good.
+static TOO_SLOW: Mutex<Vec<(CodecKey, std::time::Instant)>> = Mutex::new(Vec::new());
+type CodecKey = (Codec, u32, u32, u32);
+const TOO_SLOW_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn enabled() -> bool {
     !matches!(
         std::env::var("ST_VULKAN_ENCODE").as_deref(),
@@ -163,6 +170,17 @@ impl VulkanEncoder {
             return Err("Vulkan encode path needs even dimensions".into());
         }
         let name = codec_name(config.codec).ok_or("Vulkan encode path has no AV1 support")?;
+        let key: CodecKey = (config.codec, config.width, config.height, config.framerate);
+        if check == OpenCheck::Gate {
+            let mut slow = TOO_SLOW.lock().unwrap();
+            slow.retain(|(_, at)| at.elapsed() < TOO_SLOW_TTL);
+            if slow.iter().any(|(k, _)| *k == key) {
+                return Err(format!(
+                    "{name} too slow for {}fps (measured recently)",
+                    key.3
+                ));
+            }
+        }
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
         let name_c = CString::new(name).unwrap();
         let codec = unsafe { ffi::avcodec_find_encoder_by_name(name_c.as_ptr()) };
@@ -202,6 +220,10 @@ impl VulkanEncoder {
                 MAX_FRAME_BUDGET_SHARE / config.framerate.max(1) as f64,
             );
             if check == OpenCheck::Gate && frame_cost > budget {
+                TOO_SLOW
+                    .lock()
+                    .unwrap()
+                    .push((key, std::time::Instant::now()));
                 return Err(format!(
                     "{name} too slow for {}fps ({frame_cost:.1?}/frame, budget {budget:.1?})",
                     config.framerate
