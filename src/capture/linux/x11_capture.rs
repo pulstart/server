@@ -345,7 +345,6 @@ impl CaptureBackend for X11Capture {
             );
             let mut state = state;
             let pool = RamPool::default();
-            let target_interval = target_frame_interval();
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;
 
@@ -402,6 +401,10 @@ impl CaptureBackend for X11Capture {
                     // Clear the error flag and continue
                     X_ERROR_OCCURRED.store(false, Ordering::SeqCst);
                 }
+
+                // Re-read: adaptive fps retargets a running capture.
+
+                let target_interval = target_frame_interval();
 
                 let elapsed = frame_start.elapsed();
                 if elapsed < target_interval {

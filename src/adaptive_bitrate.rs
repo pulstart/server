@@ -535,6 +535,7 @@ pub struct AdaptiveFrameRate {
     current_fps: u32,
     ladder: Vec<u32>,
     clean_windows: u32,
+    bad_windows: u32,
     last_change: Instant,
     last_change_was_up: bool,
     up_failures: u32,
@@ -547,15 +548,21 @@ impl AdaptiveFrameRate {
     /// Latency-first: react down quickly, but not so fast we thrash on a single
     /// noisy window.
     const DOWN_COOLDOWN: Duration = Duration::from_secs(2);
-    const UP_COOLDOWN: Duration = Duration::from_secs(8);
+    /// Every change rebuilds the encoder and costs an IDR, so probing up is
+    /// rare and a mild shortfall must repeat before it steps down.
+    const UP_COOLDOWN: Duration = Duration::from_secs(15);
     /// Sustained clean windows required before an up-probe.
-    const CLEAN_WINDOWS_FOR_UP: u32 = 6;
+    const CLEAN_WINDOWS_FOR_UP: u32 = 10;
     /// A down-step within this long of an up-step counts the up-probe as failed.
-    const PROBE_WINDOW: Duration = Duration::from_secs(6);
-    const BASE_UP_BACKOFF: Duration = Duration::from_secs(15);
+    const PROBE_WINDOW: Duration = Duration::from_secs(10);
+    const BASE_UP_BACKOFF: Duration = Duration::from_secs(30);
     /// Can't-sustain thresholds (latency-first — bias toward stepping down).
     const OVERRUN_TRIP: f32 = 0.10;
     const DELIVER_TRIP: f32 = 0.92;
+    /// Shortfalls this bad step down on the first window.
+    const SEVERE_OVERRUN: f32 = 0.30;
+    const SEVERE_DELIVER: f32 = 0.75;
+    const BAD_WINDOWS_FOR_DOWN: u32 = 2;
     /// Upward guard: only probe up with real encoder headroom and a near-full
     /// delivered cadence at the current level.
     const UP_ENCODE_HEADROOM: f32 = 0.65;
@@ -575,6 +582,7 @@ impl AdaptiveFrameRate {
             current_fps: ceiling_fps,
             ladder: Self::build_ladder(ceiling_fps, floor_fps),
             clean_windows: 0,
+            bad_windows: 0,
             last_change: now,
             last_change_was_up: false,
             up_failures: 0,
@@ -658,7 +666,12 @@ impl AdaptiveFrameRate {
 
         if cant_sustain {
             self.clean_windows = 0;
-            if now.duration_since(self.last_change) < Self::DOWN_COOLDOWN {
+            self.bad_windows = self.bad_windows.saturating_add(1);
+            let severe = sample.overrun_ratio > Self::SEVERE_OVERRUN
+                || sample.delivered_fps < self.current_fps as f32 * Self::SEVERE_DELIVER;
+            if now.duration_since(self.last_change) < Self::DOWN_COOLDOWN
+                || (!severe && self.bad_windows < Self::BAD_WINDOWS_FOR_DOWN)
+            {
                 return None;
             }
             // Capture-bound (frames arrive slowly, encoder keeps up): go straight
@@ -680,10 +693,12 @@ impl AdaptiveFrameRate {
             self.current_fps = next;
             self.last_change = now;
             self.last_change_was_up = false;
+            self.bad_windows = 0;
             return Some(next);
         }
 
         // Sustaining the current level.
+        self.bad_windows = 0;
         self.clean_windows = self.clean_windows.saturating_add(1);
         // Reward a long clean stretch by forgiving one past up-failure.
         if self
@@ -1640,6 +1655,25 @@ mod tests {
         // Delivered looks fine, but most frames blew the budget — still drop.
         let res = afr.apply_at(&load(118.0, 12.0, 0.40), start + Duration::from_secs(3));
         assert_eq!(res, Some(90));
+    }
+
+    #[test]
+    fn adaptive_fps_needs_repeated_mild_shortfall_to_step_down() {
+        let start = Instant::now();
+        let mut afr = AdaptiveFrameRate::with_enabled(true, 120, start);
+        let mild = load(118.0, 7.0, 0.15);
+        let mut t = start + Duration::from_secs(3);
+        assert_eq!(afr.apply_at(&mild, t), None, "one mild window is noise");
+        t += Duration::from_secs(1);
+        assert_eq!(afr.apply_at(&load(120.0, 4.0, 0.0), t), None);
+        t += Duration::from_secs(1);
+        assert_eq!(
+            afr.apply_at(&mild, t),
+            None,
+            "a clean window resets the count"
+        );
+        t += Duration::from_secs(1);
+        assert_eq!(afr.apply_at(&mild, t), Some(90));
     }
 
     #[test]

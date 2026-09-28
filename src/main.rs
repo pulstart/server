@@ -162,7 +162,7 @@ fn create_linux_encoder_with_hint(
     config: &EncoderConfig,
     render_node_hint: Option<&str>,
     backends: &[EncoderBackend],
-    live_session: bool,
+    gate_frame_cost: bool,
 ) -> Result<EncoderKind, String> {
     let mut failures = Vec::new();
     for &backend in backends {
@@ -172,7 +172,7 @@ fn create_linux_encoder_with_hint(
                     .map(EncoderKind::Vaapi)
             }
             EncoderBackend::Vulkan if encode_vulkan::enabled() => {
-                encode_vulkan::VulkanEncoder::with_config(config, render_node_hint, !live_session)
+                encode_vulkan::VulkanEncoder::with_config(config, render_node_hint, gate_frame_cost)
                     .map(EncoderKind::Vulkan)
             }
             EncoderBackend::Vulkan => Err("disabled by ST_VULKAN_ENCODE".into()),
@@ -250,10 +250,15 @@ fn open_linux_encoder_for_aggregate(
         (LOAD_RESISTANT_BACKENDS, any_hardware),
         (REMAINING_BACKENDS, false),
     ] {
-        for &codec in &codec_candidates {
-            if hardware_only && !capabilities.hardware_codecs.supports(codec) {
-                continue;
-            }
+        let pass: Vec<_> = codec_candidates
+            .iter()
+            .copied()
+            .filter(|codec| !hardware_only || capabilities.hardware_codecs.supports(*codec))
+            .collect();
+        for (index, &codec) in pass.iter().enumerate() {
+            // The cost self-test only picks between load-resistant codecs:
+            // it runs noisy under load, and the last one still beats NVENC.
+            let gate_frame_cost = !live_session && index + 1 < pass.len();
             let mut candidate_capabilities = capabilities;
             candidate_capabilities.supported_codecs = single_codec_support(codec);
             let config = aggregate_encoder_config(base, candidate_capabilities, control)?;
@@ -261,7 +266,7 @@ fn open_linux_encoder_for_aggregate(
                 &config,
                 capture_render_node,
                 backends,
-                live_session,
+                gate_frame_cost,
             ) {
                 Ok(encoder) => return Ok((config, encoder)),
                 Err(error) => failures.push(format!("{}: {error}", codec_name(codec))),
@@ -2031,6 +2036,10 @@ fn run_shared_pipeline(
         adaptive_bitrate::AdaptiveFrameRate::from_env(current_config.framerate, Instant::now());
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut frame_rate_tracker = adaptive_bitrate::EncodeRateTracker::new(Instant::now());
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut last_encode_at: Option<Instant> = None;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut carried_keyframe = false;
     #[cfg(target_os = "linux")]
     let _ = capture::take_unchanged_capture_ticks();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2312,7 +2321,8 @@ fn run_shared_pipeline(
             trace_capture_frames += 1;
         }
         // Drain stale frames — only encode the newest
-        let (frame, frame_captured_micros) = {
+        #[allow(unused_mut)]
+        let (mut frame, frame_captured_micros) = {
             let mut latest = frame;
             let mut latest_captured_micros = frame_captured_micros;
             // A capture-requested keyframe (e.g. KMS seat/session switch) must
@@ -2330,6 +2340,19 @@ fn run_shared_pipeline(
             latest.force_keyframe = force_keyframe;
             (latest, latest_captured_micros)
         };
+
+        // PipeWire/NvFBC keep their start rate after adaptive fps lowers the
+        // encoder's; frames beyond it would overspend its per-frame budget.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            let min_gap =
+                std::time::Duration::from_secs_f64(0.75 / current_config.framerate.max(1) as f64);
+            if last_encode_at.is_some_and(|at| at.elapsed() < min_gap) {
+                carried_keyframe |= frame.force_keyframe;
+                continue;
+            }
+            frame.force_keyframe |= std::mem::take(&mut carried_keyframe);
+        }
 
         // Only encode when there are subscribers (save GPU/CPU when idle)
         if video_bc.subscriber_count() > 0 {
@@ -2678,6 +2701,10 @@ fn run_shared_pipeline(
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             let encode_start = Instant::now();
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                last_encode_at = Some(encode_start);
+            }
             let _encoded_bytes = encode_and_broadcast(
                 &mut encoder,
                 &video_bc,

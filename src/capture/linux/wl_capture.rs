@@ -436,7 +436,6 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
     let output = state.output.as_ref().ok_or("No wl_output")?.clone();
 
     let mut shm_buffer: Option<ShmBuffer> = None;
-    let target_interval = target_frame_interval();
     let trace = std::env::var_os("ST_TRACE").is_some();
     let mut dropped_frames = 0usize;
 
@@ -553,6 +552,8 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
         }
 
         // Throttle to target frame rate
+        // Re-read: adaptive fps retargets a running capture.
+        let target_interval = target_frame_interval();
         let elapsed = frame_start.elapsed();
         if elapsed < target_interval {
             thread::sleep(target_interval - elapsed);

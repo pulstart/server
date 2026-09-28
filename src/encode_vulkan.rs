@@ -127,6 +127,8 @@ pub struct VulkanEncoder {
     width: u32,
     height: u32,
     _nv12_claim: Nv12Claim,
+    /// `ST_TRACE`: per-frame (upload, encode) times, logged in batches.
+    stage_times: Option<Vec<(std::time::Duration, std::time::Duration)>>,
 }
 
 unsafe impl Send for VulkanEncoder {}
@@ -166,6 +168,7 @@ impl VulkanEncoder {
             width: config.width,
             height: config.height,
             _nv12_claim: Nv12Claim::new(),
+            stage_times: None,
         };
         if encoder.nv12.is_null() {
             return Err("av_frame_alloc failed".into());
@@ -189,6 +192,7 @@ impl VulkanEncoder {
             ));
         }
         encoder.force_keyframe_next = true;
+        encoder.stage_times = std::env::var_os("ST_TRACE").map(|_| Vec::with_capacity(240));
         println!(
             "[vulkan] {name} encoder opened ({}x{}, {}kbps, {}fps, {frame_cost:.1?}/frame)",
             config.width, config.height, config.bitrate_kbps, config.framerate
@@ -317,12 +321,12 @@ impl VulkanEncoder {
             );
         }
         let mut best = std::time::Duration::MAX;
-        for i in 0..10 {
+        for i in 0..14 {
             let start = std::time::Instant::now();
             if self.upload_and_encode()?.is_empty() {
                 return Err("no packet produced".into());
             }
-            if i >= 4 {
+            if i >= 6 {
                 best = best.min(start.elapsed());
             }
         }
@@ -411,6 +415,8 @@ impl VulkanEncoder {
         if hw.is_null() {
             return Err("av_frame_alloc failed".into());
         }
+        let start = std::time::Instant::now();
+        let mut uploaded = start;
         let result = (|| {
             let ret = ffi::av_hwframe_get_buffer(self.frames_ref, hw, 0);
             if ret < 0 {
@@ -420,6 +426,7 @@ impl VulkanEncoder {
             if ret < 0 {
                 return Err(format!("upload: {}", ffmpeg_err(ret)));
             }
+            uploaded = std::time::Instant::now();
             (*hw).pts = self.frame_index;
             self.frame_index += 1;
             self.colorspace.apply_to_frame(hw);
@@ -431,6 +438,23 @@ impl VulkanEncoder {
             send_and_collect(self.codec_ctx, hw)
         })();
         ffi::av_frame_free(&mut hw);
+        if let Some(times) = self.stage_times.as_mut() {
+            times.push((uploaded - start, uploaded.elapsed()));
+            if times.len() == times.capacity() {
+                let pct = |v: &mut Vec<std::time::Duration>, q: usize| {
+                    v.sort();
+                    v[v.len() * q / 100]
+                };
+                let (mut up, mut enc): (Vec<_>, Vec<_>) = times.drain(..).unzip();
+                eprintln!(
+                    "[vulkan] upload p50={:.2?} p95={:.2?} | encode p50={:.2?} p95={:.2?}",
+                    pct(&mut up, 50),
+                    pct(&mut up, 95),
+                    pct(&mut enc, 50),
+                    pct(&mut enc, 95)
+                );
+            }
+        }
         result
     }
 
@@ -684,6 +708,8 @@ mod tests {
             return;
         }
         crate::capture::set_target_fps(120);
+        // Full-rate capture: damage skip would pace a static desktop at 4 fps.
+        std::env::set_var("ST_KMS_DAMAGE", "0");
         let (tx, rx) = crossbeam_channel::bounded(4);
         let mut capture = KmsCapture::new();
         capture
@@ -740,6 +766,131 @@ mod tests {
             assert_eq!(decoded.len(), 240, "every captured frame must decode");
         }
         capture.stop();
+    }
+
+    /// Desktop-like NV12 (text-ish high-frequency blocks over gradients)
+    /// scrolling 4 px per frame; solid frames encode trivially fast.
+    struct ScrollingSource {
+        wide: Vec<u8>,
+        stride: usize,
+        w: usize,
+        h: usize,
+    }
+
+    impl ScrollingSource {
+        fn new(w: u32, h: u32) -> Self {
+            let (w, h) = (w as usize, h as usize);
+            let stride = w + 1024;
+            let mut wide = vec![0u8; stride * h * 3 / 2];
+            let hash = |a: usize, b: usize| {
+                let mut x =
+                    (a as u32).wrapping_mul(0x9e37_79b1) ^ (b as u32).wrapping_mul(0x85eb_ca6b);
+                x ^= x >> 15;
+                x.wrapping_mul(0x2c1b_3c6d) >> 24
+            };
+            for y in 0..h {
+                for x in 0..stride {
+                    let glyph = hash(x / 3, y / 5) & 3 == 0 && (y / 24) % 3 != 2;
+                    wide[y * stride + x] = if glyph {
+                        20 + (hash(x, y) & 31) as u8
+                    } else {
+                        150 + ((x / 7 + y / 11) % 80) as u8
+                    };
+                }
+            }
+            for y in 0..h / 2 {
+                for x in 0..stride / 2 {
+                    let i = stride * h + y * stride + x * 2;
+                    wide[i] = 110 + ((x / 40 + y / 30) % 40) as u8;
+                    wide[i + 1] = 120 + ((x / 25) % 30) as u8;
+                }
+            }
+            Self { wide, stride, w, h }
+        }
+
+        fn frame(&self, n: usize) -> Vec<u8> {
+            let (w, h, stride) = (self.w, self.h, self.stride);
+            let off = (n * 4) % 1024;
+            let mut out = vec![0u8; w * h * 3 / 2];
+            for y in 0..h {
+                out[y * w..(y + 1) * w]
+                    .copy_from_slice(&self.wide[y * stride + off..y * stride + off + w]);
+            }
+            for y in 0..h / 2 {
+                let src = stride * h + y * stride + off;
+                out[w * h + y * w..w * h + (y + 1) * w].copy_from_slice(&self.wide[src..src + w]);
+            }
+            out
+        }
+    }
+
+    /// Paced 1440p120 encode of scrolling desktop content, split into upload
+    /// (memcpy + transfer submit) and encode (submit + wait) per frame.
+    /// `ST_TEST_VULKAN_ENCODE=1 cargo test --release vulkan_paced_bench -- --nocapture`
+    #[test]
+    fn vulkan_paced_bench() {
+        if !live_enabled() {
+            return;
+        }
+        let (w, h) = (2560u32, 1440u32);
+        let source = ScrollingSource::new(w, h);
+        let frames: Vec<Vec<u8>> = (0..64).map(|n| source.frame(n)).collect();
+        let config = EncoderConfig::from_env_with_framerate_and_codec(w, h, 120, Codec::H264);
+        let mut enc =
+            VulkanEncoder::with_config(&config, Some(&render_node()), false).expect("vulkan");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load = std::env::var_os("ST_TEST_PACED_LOAD").map(|_| {
+            crate::capture::linux::kms_gpu_copy::tests::spawn_gpu_load(
+                render_node(),
+                w,
+                h,
+                std::sync::Arc::clone(&stop),
+            )
+        });
+        let (mut upload, mut encode, mut bytes) = (Vec::new(), Vec::new(), 0usize);
+        let interval = Duration::from_micros(8333);
+        let mut next = Instant::now();
+        for i in 0..600 {
+            unsafe {
+                enc.borrow_nv12(&frames[i % frames.len()]).unwrap();
+                let mut hw = ffi::av_frame_alloc();
+                let t0 = Instant::now();
+                assert!(ffi::av_hwframe_get_buffer(enc.frames_ref, hw, 0) >= 0);
+                assert!(ffi::av_hwframe_transfer_data(hw, enc.nv12, 0) >= 0);
+                let t1 = Instant::now();
+                (*hw).pts = enc.frame_index;
+                enc.frame_index += 1;
+                let out = send_and_collect(enc.codec_ctx, hw).unwrap();
+                let t2 = Instant::now();
+                ffi::av_frame_free(&mut hw);
+                if i >= 60 {
+                    upload.push(t1 - t0);
+                    encode.push(t2 - t1);
+                    bytes += out.iter().map(|u| u.data.len()).sum::<usize>();
+                }
+            }
+            next += interval;
+            if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(load) = load {
+            load.join().unwrap();
+        }
+        let p = |v: &mut Vec<Duration>, q: usize| {
+            v.sort();
+            v[(v.len() * q / 100).min(v.len() - 1)]
+        };
+        eprintln!(
+            "[paced] upload p50={:.2?} p95={:.2?} | encode p50={:.2?} p95={:.2?} p99={:.2?} | {:.1} Mbps",
+            p(&mut upload, 50),
+            p(&mut upload, 95),
+            p(&mut encode, 50),
+            p(&mut encode, 95),
+            p(&mut encode, 99),
+            bytes as f64 * 8.0 / (540.0 / 120.0) / 1e6
+        );
     }
 
     /// Per-frame NV12 encode latency at 1440p, Vulkan vs NVENC, idle and with

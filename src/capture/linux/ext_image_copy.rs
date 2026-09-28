@@ -465,8 +465,6 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
     let (mut width, mut height) = state.size.ok_or("compositor did not send buffer_size")?;
     let mut chosen_format =
         pick_shm_format(&state.shm_formats).ok_or("compositor offered no usable wl_shm format")?;
-
-    let target_interval = target_frame_interval();
     let trace = std::env::var_os("ST_TRACE").is_some();
     let mut dropped_frames = 0usize;
     let mut shm_buffer: Option<ShmBuffer> = None;
@@ -569,6 +567,10 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
             }
             Err(TrySendError::Disconnected(_)) => break,
         }
+
+        // Re-read: adaptive fps retargets a running capture.
+
+        let target_interval = target_frame_interval();
 
         let elapsed = frame_start.elapsed();
         if elapsed < target_interval {

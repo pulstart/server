@@ -26,6 +26,8 @@
 //! `gbm_probe`), EGL via `khronos-egl`, GL via `glow`.
 
 use super::super::{DmaBufPlane, FrameData, FrameLease, FrameLeaseOps, RamPool};
+use super::csc::DstFormat;
+use super::kms_vk_copy::{ReadbackError, VkReadback};
 use crossbeam_channel::{Receiver, Sender};
 use glow::HasContext as _;
 use khronos_egl as egl;
@@ -520,6 +522,12 @@ pub struct KmsStabilizer {
     ram_pool: RamPool,
     ram_mode: bool,
     logged_ram_fallback: bool,
+    /// Copy-engine readback used ahead of the GL one in RAM mode.
+    vk: Option<VkReadback>,
+    vk_tried: bool,
+    vk_fail_streak: u32,
+    vk_unsupported_logged: Option<String>,
+    render_node: String,
     width: u32,
     height: u32,
     /// Tests pin the readback format; the global claim count is shared.
@@ -585,6 +593,11 @@ impl KmsStabilizer {
             ram_pool: RamPool::default(),
             ram_mode: false,
             logged_ram_fallback: false,
+            vk: None,
+            vk_tried: false,
+            vk_fail_streak: 0,
+            vk_unsupported_logged: None,
+            render_node: render_node.to_string(),
             width: 0,
             height: 0,
             #[cfg(test)]
@@ -675,6 +688,14 @@ impl KmsStabilizer {
             .unwrap_or_else(crate::capture::nv12_ram_preferred);
         #[cfg(not(test))]
         let preferred = crate::capture::nv12_ram_preferred();
+        let dst = if preferred && width.is_multiple_of(2) && height.is_multiple_of(2) {
+            DstFormat::Nv12
+        } else {
+            DstFormat::Bgra
+        };
+        if let Some(data) = self.vk_readback(src, drm_format, width, height, dst) {
+            return Ok(data);
+        }
         let nv12 = preferred && width.is_multiple_of(4) && height.is_multiple_of(2);
         let (pass, tex_w, tex_h) = if nv12 {
             self.ensure_nv12(width, height)?;
@@ -696,6 +717,56 @@ impl KmsStabilizer {
         } else {
             FrameData::Ram
         })
+    }
+
+    /// Copy-engine readback; `None` sends this frame through GL instead.
+    fn vk_readback(
+        &mut self,
+        src: &DmaBufPlane,
+        drm_format: u32,
+        width: u32,
+        height: u32,
+        dst: DstFormat,
+    ) -> Option<FrameData> {
+        const FAIL_LIMIT: u32 = 3;
+        if !self.vk_tried {
+            self.vk_tried = true;
+            if super::kms_vk_copy::enabled() {
+                match VkReadback::new(&self.render_node) {
+                    Ok(vk) => {
+                        println!("[kms] scanout readback on the Vulkan copy engine");
+                        self.vk = Some(vk);
+                    }
+                    Err(e) => eprintln!("[kms] copy-engine readback unavailable ({e}); using GL"),
+                }
+            }
+        }
+        match self
+            .vk
+            .as_mut()?
+            .readback(src, drm_format, width, height, dst)
+        {
+            Ok(data) => {
+                self.vk_fail_streak = 0;
+                Some(data)
+            }
+            Err(ReadbackError::Unsupported(what)) => {
+                if self.vk_unsupported_logged.as_ref() != Some(&what) {
+                    eprintln!("[kms] copy-engine readback can't take {what}; using GL for it");
+                    self.vk_unsupported_logged = Some(what);
+                }
+                None
+            }
+            Err(ReadbackError::Failed(e)) => {
+                self.vk_fail_streak += 1;
+                eprintln!("[kms] copy-engine readback failed ({e})");
+                if self.vk_fail_streak >= FAIL_LIMIT {
+                    eprintln!("[kms] disabling copy-engine readback; using GL");
+                    self.vk = None;
+                }
+                None
+            }
+        }
     }
 
     /// Read an RGBA8 `fbo` of `width`x`height` texels into a pooled buffer,
@@ -1424,19 +1495,71 @@ pub(crate) mod tests {
     }
 
     const AR24: u32 = 0x3432_5241;
+    const AB4H: u32 = 0x4834_4241;
 
     /// Scanout stand-in: a renderable gbm BO exported as a DMA-BUF.
     pub(crate) struct TestSource {
         bo: *mut c_void,
         plane: DmaBufPlane,
+        fourcc: u32,
     }
 
     impl TestSource {
         fn new(gles: &Gles, width: u32, height: u32) -> Self {
+            Self::with_format(gles, width, height, AR24).expect("gbm_bo_create(source)")
+        }
+
+        fn with_format(gles: &Gles, width: u32, height: u32, fourcc: u32) -> Option<Self> {
+            Self::with_modifier(gles, width, height, fourcc, None)
+        }
+
+        /// `modifier` pins the tiling, e.g. the uncompressed block-linear one
+        /// NVIDIA scans out (gbm's default is a compressed layout).
+        fn with_modifier(
+            gles: &Gles,
+            width: u32,
+            height: u32,
+            fourcc: u32,
+            modifier: Option<u64>,
+        ) -> Option<Self> {
+            type CreateWithModifiers = unsafe extern "C" fn(
+                *mut c_void,
+                u32,
+                u32,
+                u32,
+                *const u64,
+                u32,
+                u32,
+            ) -> *mut c_void;
             let bo = unsafe {
-                (gles.gbm.bo_create)(gles.gbm_device, width, height, AR24, GBM_BO_USE_RENDERING)
+                match modifier {
+                    Some(m) => {
+                        let create = gles
+                            ._gbm_lib()
+                            .get::<CreateWithModifiers>(b"gbm_bo_create_with_modifiers2\0")
+                            .ok()?;
+                        create(
+                            gles.gbm_device,
+                            width,
+                            height,
+                            fourcc,
+                            &m,
+                            1,
+                            GBM_BO_USE_RENDERING,
+                        )
+                    }
+                    None => (gles.gbm.bo_create)(
+                        gles.gbm_device,
+                        width,
+                        height,
+                        fourcc,
+                        GBM_BO_USE_RENDERING,
+                    ),
+                }
             };
-            assert!(!bo.is_null(), "gbm_bo_create(source)");
+            if bo.is_null() {
+                return None;
+            }
             let fd = unsafe { (gles.gbm.bo_get_fd)(bo) };
             assert!(fd >= 0, "gbm_bo_get_fd(source)");
             let plane = DmaBufPlane {
@@ -1445,7 +1568,13 @@ pub(crate) mod tests {
                 pitch: unsafe { (gles.gbm.bo_get_stride)(bo) },
                 modifier: unsafe { (gles.gbm.bo_get_modifier)(bo) },
             };
-            Self { bo, plane }
+            Some(Self { bo, plane, fourcc })
+        }
+    }
+
+    impl Gles {
+        fn _gbm_lib(&self) -> &Library {
+            &self.gbm._lib
         }
     }
 
@@ -1572,7 +1701,7 @@ pub(crate) mod tests {
         let image = create_dmabuf_image(
             &gles.egl,
             gles.display,
-            AR24,
+            src.fourcc,
             w,
             h,
             src.plane.fd.as_raw_fd(),
@@ -1633,13 +1762,47 @@ pub(crate) mod tests {
             .expect("stabilize")
     }
 
+    /// A RAM-mode stabilizer emitting NV12, pinned to the copy engine or GL.
+    pub(crate) fn nv12_stabilizer(node: &str, copy_engine: bool) -> KmsStabilizer {
+        let mut stab = KmsStabilizer::new(node).expect("stabilizer");
+        stab.ram_mode = true;
+        stab.force_nv12 = Some(true);
+        stab.vk_tried = !copy_engine;
+        stab
+    }
+
+    /// A painted scanout-like source (NVIDIA block-linear, uncompressed).
+    pub(crate) fn scanout_like_source(
+        stab: &KmsStabilizer,
+        w: u32,
+        h: u32,
+        fourcc: u32,
+    ) -> Option<TestSource> {
+        let src = TestSource::with_modifier(&stab.gles, w, h, fourcc, Some(0x0300_0000_0060_6014))?;
+        paint_source(stab, &src, w, h);
+        Some(src)
+    }
+
+    pub(crate) fn source_plane(src: &TestSource) -> &DmaBufPlane {
+        &src.plane
+    }
+
+    pub(crate) fn served_by_copy_engine(stab: &KmsStabilizer) -> bool {
+        stab.vk.is_some() && stab.vk_unsupported_logged.is_none()
+    }
+
+    pub(crate) fn thread_cpu_time() -> Duration {
+        thread_cpu()
+    }
+
     pub(crate) fn destroy_source(stab: &KmsStabilizer, src: TestSource) {
         unsafe { (stab.gles.gbm.bo_destroy)(src.bo) };
     }
 
-    /// The NVIDIA readback path must emit BT.709 limited NV12 (and BGRA) in
-    /// memory row order: a wrong matrix shifts hues, a flip turns the picture
-    /// upside down. `ST_TEST_KMS_COPY=1` (needs a GPU render node).
+    /// The NVIDIA readback paths (copy engine, GL) must emit BT.709 limited
+    /// NV12 (and BGRA) in memory row order for 8-bit and FP16 scanouts: a
+    /// wrong matrix shifts hues, a flip turns the picture upside down.
+    /// `ST_TEST_KMS_COPY=1` (needs a GPU render node).
     #[test]
     fn readback_nv12_and_bgra_are_bt709_and_upright() {
         if std::env::var_os("ST_TEST_KMS_COPY").is_none() {
@@ -1647,47 +1810,71 @@ pub(crate) mod tests {
         }
         let node =
             std::env::var("ST_TEST_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-        let (w, h) = (64u32, 32u32);
-        let mut stab = KmsStabilizer::new(&node).expect("stabilizer");
-        stab.ram_mode = true;
-        let src = TestSource::new(&stab.gles, w, h);
-        paint_source(&stab, &src, w, h);
-        let planes = std::slice::from_ref(&src.plane);
-
-        stab.force_nv12 = Some(true);
-        let FrameData::RamNv12(nv12) = stab.stabilize(planes, AR24, w, h).unwrap() else {
-            panic!("expected NV12 output");
-        };
-        stab.force_nv12 = Some(false);
-        let (wu, hu) = (w as usize, h as usize);
-        assert_eq!(nv12.len(), wu * hu * 3 / 2);
         let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 1;
-        let (y_top, y_bottom) = (nv12[0], nv12[(hu - 1) * wu + wu - 1]);
-        assert!(
-            near(y_top, 63) && near(y_bottom, 32),
-            "Y {y_top} {y_bottom}"
-        );
-        let uv_top = &nv12[wu * hu..wu * hu + 2];
-        let uv_bottom = &nv12[wu * hu * 3 / 2 - 2..];
-        assert!(
-            near(uv_top[0], 102) && near(uv_top[1], 240),
-            "top CbCr {uv_top:?}"
-        );
-        assert!(
-            near(uv_bottom[0], 240) && near(uv_bottom[1], 118),
-            "bottom CbCr {uv_bottom:?}"
-        );
+        // NVIDIA's uncompressed block-linear scanout layout. Heights below
+        // one block (128 rows) read back with holes on the copy engine; real
+        // scanouts are taller, and 1440 ends on a partial block.
+        const SCANOUT_MODIFIER: u64 = 0x0300_0000_0060_6014;
+        let cases = [(AR24, true), (AB4H, true), (AR24, false), (AB4H, false)];
+        for ((fourcc, copy_engine), (w, h)) in cases
+            .into_iter()
+            .flat_map(|case| [(256u32, 256u32), (320, 1440)].map(|size| (case, size)))
+        {
+            let (wu, hu) = (w as usize, h as usize);
+            let label = format!(
+                "{} {} {w}x{h}",
+                String::from_utf8_lossy(&fourcc.to_le_bytes()),
+                if copy_engine { "copy-engine" } else { "gl" }
+            );
+            let mut stab = KmsStabilizer::new(&node).expect("stabilizer");
+            stab.ram_mode = true;
+            stab.vk_tried = !copy_engine;
+            let modifier = copy_engine.then_some(SCANOUT_MODIFIER);
+            let Some(src) = TestSource::with_modifier(&stab.gles, w, h, fourcc, modifier) else {
+                eprintln!("skip {label}: gbm can't allocate it");
+                continue;
+            };
+            paint_source(&stab, &src, w, h);
+            let planes = std::slice::from_ref(&src.plane);
 
-        let FrameData::Ram(bgra) = stab.stabilize(planes, AR24, w, h).unwrap() else {
-            panic!("expected BGRA without a claim");
-        };
-        assert_eq!(&bgra[..4], &[0, 0, 255, 255], "top row must be red");
-        assert_eq!(
-            &bgra[bgra.len() - 4..],
-            &[255, 0, 0, 255],
-            "bottom row must be blue"
-        );
-        unsafe { (stab.gles.gbm.bo_destroy)(src.bo) };
+            stab.force_nv12 = Some(true);
+            let FrameData::RamNv12(nv12) = stab.stabilize(planes, fourcc, w, h).unwrap() else {
+                panic!("{label}: expected NV12 output");
+            };
+            assert_eq!(
+                stab.vk.is_some() && stab.vk_unsupported_logged.is_none(),
+                copy_engine,
+                "{label}: path"
+            );
+            assert_eq!(nv12.len(), wu * hu * 3 / 2);
+            let (y_top, y_bottom) = (nv12[0], nv12[(hu - 1) * wu + wu - 1]);
+            assert!(
+                near(y_top, 63) && near(y_bottom, 32),
+                "{label}: Y {y_top} {y_bottom}"
+            );
+            let uv_top = &nv12[wu * hu..wu * hu + 2];
+            let uv_bottom = &nv12[wu * hu * 3 / 2 - 2..];
+            assert!(
+                near(uv_top[0], 102) && near(uv_top[1], 240),
+                "{label}: top CbCr {uv_top:?}"
+            );
+            assert!(
+                near(uv_bottom[0], 240) && near(uv_bottom[1], 118),
+                "{label}: bottom CbCr {uv_bottom:?}"
+            );
+
+            stab.force_nv12 = Some(false);
+            let FrameData::Ram(bgra) = stab.stabilize(planes, fourcc, w, h).unwrap() else {
+                panic!("{label}: expected BGRA without a claim");
+            };
+            assert_eq!(&bgra[..3], &[0, 0, 255], "{label}: top row must be red");
+            assert_eq!(
+                &bgra[bgra.len() - 4..bgra.len() - 1],
+                &[255, 0, 0],
+                "{label}: bottom row must be blue"
+            );
+            unsafe { (stab.gles.gbm.bo_destroy)(src.bo) };
+        }
     }
 
     /// Saturate the GPU for `ST_TEST_GPU_LOAD_SECS` seconds, for measuring other

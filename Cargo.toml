@@ -52,6 +52,8 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # gives a type-checked GLES2 surface, both matching the client's renderer.
 khronos-egl = { version = "6", features = ["dynamic"] }
 glow = "0.16"
+# NVIDIA scanout readback on the copy engine (dlopens libvulkan).
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tray-icon = { version = "0.21", default-features = false }

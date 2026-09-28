@@ -948,7 +948,7 @@ impl CaptureBackend for KmsCapture {
             st_protocol::thread_priority::promote_current_thread(
                 st_protocol::thread_priority::ThreadRole::Capture,
             );
-            let target_interval = target_frame_interval();
+            let mut target_interval = target_frame_interval();
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;
             // Active-session switch tracking. On a VT / fast-user switch the
@@ -1027,6 +1027,17 @@ impl CaptureBackend for KmsCapture {
 
             while running.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
+                // Adaptive fps retargets a running capture.
+                let wanted = target_frame_interval();
+                if wanted != target_interval {
+                    target_interval = wanted;
+                    if let Some(p) = pacer.as_mut() {
+                        if let Err(e) = p.set_interval(wanted) {
+                            eprintln!("[kms] timerfd re-arm failed ({e}); sleep pacing");
+                            pacer = None;
+                        }
+                    }
+                }
 
                 // Damage-skip probe (see kms_damage_skip_enabled): two cheap
                 // get_plane ioctls decide whether anything changed since the
@@ -1295,17 +1306,24 @@ impl TimerFdPacer {
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut pacer = Self {
+            fd: unsafe { OwnedFd::from_raw_fd(raw) },
+        };
+        pacer.set_interval(interval)?;
+        Ok(pacer)
+    }
 
+    fn set_interval(&mut self, interval: Duration) -> io::Result<()> {
         let spec = libc::itimerspec {
             it_interval: duration_to_timespec(interval),
             it_value: duration_to_timespec(interval),
         };
-        let rc = unsafe { libc::timerfd_settime(fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
+        let rc =
+            unsafe { libc::timerfd_settime(self.fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
+        Ok(())
     }
 
     /// Block until the next expiration. Returns the number of expirations that
@@ -1383,6 +1401,84 @@ mod tests {
             "Card::open left the process holding DRM master; the compositor \
              cannot acquire it and the screen stays black"
         );
+    }
+
+    /// Copy-engine vs GL readback of the real scanout (root): per-frame
+    /// latency and capture-thread CPU, idle and with the GPU saturated, and
+    /// both paths must produce the same NV12.
+    /// `ST_TEST_VULKAN_KMS=1 sudo -E <test-binary> live_readback_ab --nocapture`
+    #[test]
+    fn live_readback_ab() {
+        use super::super::kms_gpu_copy::tests as kms;
+        use std::sync::atomic::AtomicBool;
+        if std::env::var_os("ST_TEST_VULKAN_KMS").is_none() {
+            return;
+        }
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Capture,
+        );
+        let (card, node) = Card::open(false).unwrap();
+        let node = node.unwrap();
+        card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
+            .unwrap();
+        let plane = find_active_plane(&card).unwrap();
+        let mut vk = kms::nv12_stabilizer(&node, true);
+        let mut gl = kms::nv12_stabilizer(&node, false);
+        let stabilize = |stab: &mut KmsStabilizer| {
+            let frame = capture_frame(&card, plane, None, None).unwrap();
+            stabilize_frame(stab, &frame).unwrap()
+        };
+        let FrameData::RamNv12(a) = stabilize(&mut vk).data else {
+            panic!("copy engine: expected NV12")
+        };
+        assert!(kms::served_by_copy_engine(&vk), "copy engine not used");
+        let FrameData::RamNv12(b) = stabilize(&mut gl).data else {
+            panic!("gl: expected NV12")
+        };
+        let diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| x.abs_diff(*y) as u64)
+            .sum::<u64>() as f64
+            / a.len() as f64;
+        eprintln!("[ab] mean |copy-engine - gl| = {diff:.3}");
+        assert!(diff < 1.0, "paths disagree (mean abs diff {diff})");
+        for loaded in [false, true] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let load = loaded.then(|| {
+                let load = kms::spawn_gpu_load(node.clone(), 2560, 1440, Arc::clone(&stop));
+                thread::sleep(Duration::from_millis(500));
+                load
+            });
+            for (label, stab) in [("copy-engine", &mut vk), ("gl", &mut gl)] {
+                let mut times = Vec::new();
+                let cpu = kms::thread_cpu_time();
+                let mut next = Instant::now();
+                for _ in 0..240 {
+                    let t = Instant::now();
+                    drop(stabilize(stab));
+                    times.push(t.elapsed());
+                    next += Duration::from_micros(8333);
+                    if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                        thread::sleep(wait);
+                    }
+                }
+                let cpu = (kms::thread_cpu_time() - cpu) / 240;
+                times.sort();
+                eprintln!(
+                    "[ab] {label:<11} {:<8} p50={:>7.2?} p95={:>7.2?} p99={:>7.2?} max={:>7.2?} thread-cpu/frame={cpu:.2?}",
+                    if loaded { "gpu-load" } else { "idle" },
+                    times[120],
+                    times[228],
+                    times[237],
+                    times[239]
+                );
+            }
+            stop.store(true, Ordering::Relaxed);
+            if let Some(load) = load {
+                load.join().unwrap();
+            }
+        }
     }
 
     #[test]

@@ -1,3 +1,26 @@
+# 0.9.18
+
+Server-only release; no wire format change.
+
+- NVIDIA KMS capture reads the scanout on a GPU copy engine instead of the 3D
+  engine a game saturates. Each scanout buffer is imported once into a
+  transfer-only Vulkan queue, copied in row bands to cached host memory and
+  converted to NV12 on the CPU (AVX2/F16C, 4 threads) while the next band is
+  still copying. 1440p FP16 scanout: 2.6 ms idle and 2.6 ms at 100% GPU load
+  (the GL readback took 21-24 ms under load). Real KMS capture into the
+  Vulkan encoder now holds 120 fps with the GPU saturated (47 fps before).
+  `ST_KMS_VK_COPY=0` returns to the GL readback, which also still handles any
+  buffer the copy engine can't import.
+- Fix: adaptive frame rate never slowed KMS/X11/wlroots capture. The encoder
+  was rebuilt at 90/60 fps while capture kept delivering 120, so each frame got
+  a smaller bit budget and the rate kept bouncing (a rebuild and keyframe every
+  few seconds). Capture now follows the rate live, frames above the encoder's
+  rate are dropped for backends that can't retarget, and a mild shortfall must
+  repeat before the rate steps down.
+- Fix: under GPU load the encoder self-test could reject the last Vulkan codec
+  and fall back to NVENC, which stalls far worse. The cost gate now only picks
+  between Vulkan codecs.
+
 # 0.9.17
 
 Update hosts first; client 0.12.16 is recommended but not required (no wire

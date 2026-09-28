@@ -15,10 +15,12 @@ use crossbeam_channel::Sender;
 use st_protocol::control::OutputInfo;
 use std::time::Duration;
 
+mod csc;
 pub mod ext_image_copy;
 pub mod gbm_probe;
 pub mod kms_capture;
 pub mod kms_gpu_copy;
+mod kms_vk_copy;
 mod nvfbc_capture;
 mod pipewire_capture;
 pub mod wl_capture;
