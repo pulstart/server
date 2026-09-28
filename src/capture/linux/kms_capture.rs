@@ -1142,6 +1142,7 @@ impl CaptureBackend for KmsCapture {
                             match tx.try_send(frame) {
                                 Ok(()) => {}
                                 Err(TrySendError::Full(_)) => {
+                                    scheduler.missed();
                                     if trace && dropped_frames < 8 {
                                         eprintln!(
                                             "[trace][kms] dropped captured frame because capture channel is full"
