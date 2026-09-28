@@ -428,7 +428,11 @@ impl VaapiEncoder {
             config.height,
             scaling::Flags::FAST_BILINEAR,
         )
-        .ok();
+        .ok()
+        .map(|mut scaler| {
+            unsafe { colorspace.apply_to_scaler(scaler.as_mut_ptr()) };
+            scaler
+        });
 
         // Pre-allocate BGRA and NV12 frames for RAM path (avoid per-frame allocation)
         let bgra_frame = scaler
@@ -492,6 +496,9 @@ impl VaapiEncoder {
                 self.encode_dmabuf_via_ram(planes, *drm_format, frame.width, frame.height)
             }
             FrameData::Ram(data) => self.encode_ram(data),
+            // Only emitted while a Vulkan encoder holds an Nv12Claim; a frame
+            // caught mid-backend-switch is dropped.
+            FrameData::RamNv12(_) => Ok(Vec::new()),
         }
     }
 

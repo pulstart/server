@@ -412,7 +412,7 @@ impl NvencEncoder {
                 Pixel::NV12
             };
 
-            let scaler = scaling::Context::get(
+            let mut scaler = scaling::Context::get(
                 Pixel::BGRA,
                 config.width,
                 config.height,
@@ -422,6 +422,7 @@ impl NvencEncoder {
                 scaling::Flags::FAST_BILINEAR,
             )
             .map_err(|e| format!("scaler: {e}"))?;
+            unsafe { colorspace.apply_to_scaler(scaler.as_mut_ptr()) };
 
             Some(CpuConvert {
                 scaler,
@@ -463,6 +464,9 @@ impl NvencEncoder {
                 .ok_or("nvenc: neither CUDA nor CPU path initialised")?;
             match &frame.data {
                 FrameData::Ram(data) => cpu.fill_bgra_from_slice(data),
+                // Only emitted while a Vulkan encoder holds an Nv12Claim; a
+                // frame caught mid-backend-switch is dropped.
+                FrameData::RamNv12(_) => return Ok(Vec::new()),
                 FrameData::DmaBuf {
                     planes, drm_format, ..
                 } => cpu.fill_bgra_from_dmabuf(planes, *drm_format, frame.width, frame.height)?,
@@ -494,6 +498,7 @@ impl NvencEncoder {
             let cuda = self.cuda.as_mut().expect("cuda path present");
             match &frame.data {
                 FrameData::Ram(data) => cuda.make_frame_from_ram(data, frame.width, frame.height),
+                FrameData::RamNv12(_) => return Ok(Vec::new()),
                 FrameData::DmaBuf {
                     planes, drm_format, ..
                 } => cuda.make_frame_from_dmabuf(planes, *drm_format, frame.width, frame.height),
@@ -576,39 +581,7 @@ impl NvencEncoder {
         &mut self,
         frame: *mut ffi::AVFrame,
     ) -> Result<Vec<EncodedUnit>, String> {
-        let ret = ffi::avcodec_send_frame(self.codec_ctx, frame);
-        if ret < 0 {
-            return Err(format!("avcodec_send_frame failed: {}", ffmpeg_err(ret)));
-        }
-
-        let mut nals = Vec::new();
-        let pkt = ffi::av_packet_alloc();
-        if pkt.is_null() {
-            return Err("av_packet_alloc failed".into());
-        }
-
-        loop {
-            let ret = ffi::avcodec_receive_packet(self.codec_ctx, pkt);
-            if ret == -ffi::EAGAIN || ret == ffi::AVERROR_EOF {
-                break;
-            }
-            if ret < 0 {
-                ffi::av_packet_free(&mut { pkt });
-                return Err(format!(
-                    "avcodec_receive_packet failed: {}",
-                    ffmpeg_err(ret)
-                ));
-            }
-            let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
-            nals.push(EncodedUnit {
-                data: data.to_vec(),
-                is_recovery: ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0,
-            });
-            ffi::av_packet_unref(pkt);
-        }
-        ffi::av_packet_free(&mut { pkt });
-
-        Ok(nals)
+        send_and_collect(self.codec_ctx, frame)
     }
 
     /// Whether the CUDA zero-copy path is active (test/diagnostics).
@@ -682,6 +655,43 @@ impl Drop for NvencEncoder {
             unsafe { ffi::avcodec_free_context(&mut self.codec_ctx) };
         }
     }
+}
+
+/// Send one frame (null flushes) and drain every packet the encoder has ready.
+pub(crate) unsafe fn send_and_collect(
+    ctx: *mut ffi::AVCodecContext,
+    frame: *mut ffi::AVFrame,
+) -> Result<Vec<EncodedUnit>, String> {
+    let ret = ffi::avcodec_send_frame(ctx, frame);
+    if ret < 0 {
+        return Err(format!("avcodec_send_frame failed: {}", ffmpeg_err(ret)));
+    }
+
+    let mut nals = Vec::new();
+    let mut pkt = ffi::av_packet_alloc();
+    if pkt.is_null() {
+        return Err("av_packet_alloc failed".into());
+    }
+    let result = loop {
+        let ret = ffi::avcodec_receive_packet(ctx, pkt);
+        if ret == -ffi::EAGAIN || ret == ffi::AVERROR_EOF {
+            break Ok(nals);
+        }
+        if ret < 0 {
+            break Err(format!(
+                "avcodec_receive_packet failed: {}",
+                ffmpeg_err(ret)
+            ));
+        }
+        let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
+        nals.push(EncodedUnit {
+            data: data.to_vec(),
+            is_recovery: ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0,
+        });
+        ffi::av_packet_unref(pkt);
+    };
+    ffi::av_packet_free(&mut pkt);
+    result
 }
 
 pub(crate) fn ffmpeg_err(code: i32) -> String {

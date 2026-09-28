@@ -24,6 +24,8 @@ mod encode_sw;
 mod encode_vaapi;
 #[cfg(target_os = "macos")]
 mod encode_vt;
+#[cfg(target_os = "linux")]
+mod encode_vulkan;
 #[cfg(target_os = "windows")]
 mod encode_win;
 mod file_transfer;
@@ -124,6 +126,8 @@ enum EncoderKind {
     #[cfg(target_os = "linux")]
     Vaapi(encode_vaapi::VaapiEncoder),
     #[cfg(target_os = "linux")]
+    Vulkan(encode_vulkan::VulkanEncoder),
+    #[cfg(target_os = "linux")]
     Nvenc(encode::NvencEncoder),
     #[cfg(target_os = "windows")]
     Hardware(encode_win::WindowsHwEncoder),
@@ -135,6 +139,8 @@ enum EncoderKind {
 enum EncoderBackend {
     #[cfg(target_os = "linux")]
     Vaapi,
+    #[cfg(target_os = "linux")]
+    Vulkan,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     Nvenc,
     #[cfg(target_os = "windows")]
@@ -144,38 +150,59 @@ enum EncoderBackend {
     Software,
 }
 
+/// Backends whose GPU work isn't queued behind a GPU-bound game: VAAPI
+/// (AMD/Intel, high-priority context) and Vulkan Video (NVIDIA encode engine).
+#[cfg(target_os = "linux")]
+const LOAD_RESISTANT_BACKENDS: &[EncoderBackend] = &[EncoderBackend::Vaapi, EncoderBackend::Vulkan];
+#[cfg(target_os = "linux")]
+const REMAINING_BACKENDS: &[EncoderBackend] = &[EncoderBackend::Nvenc, EncoderBackend::Software];
+
 #[cfg(target_os = "linux")]
 fn create_linux_encoder_with_hint(
     config: &EncoderConfig,
     render_node_hint: Option<&str>,
+    backends: &[EncoderBackend],
+    live_session: bool,
 ) -> Result<EncoderKind, String> {
-    match encode_vaapi::VaapiEncoder::with_config(config, render_node_hint) {
-        Ok(e) => {
-            println!("[encoder] Using VAAPI ({:?})", config.codec);
-            Ok(EncoderKind::Vaapi(e))
-        }
-        Err(vaapi_err) => {
-            eprintln!("[encoder] VAAPI failed ({vaapi_err}), trying NVENC...");
-            match encode::NvencEncoder::with_config(config) {
-                Ok(e) => {
-                    println!("[encoder] Using NVENC ({:?})", config.codec);
-                    Ok(EncoderKind::Nvenc(e))
-                }
-                Err(nvenc_err) => {
-                    eprintln!("[encoder] NVENC failed ({nvenc_err}), trying software...");
-                    match encode_sw::SoftwareEncoder::with_config(config) {
-                        Ok(e) => {
-                            println!("[encoder] Using software encoder ({:?})", config.codec);
-                            Ok(EncoderKind::Software(e))
-                        }
-                        Err(sw_err) => Err(format!(
-                            "All encoders failed.\n  VAAPI: {vaapi_err}\n  NVENC: {nvenc_err}\n  Software: {sw_err}"
-                        )),
-                    }
-                }
+    let mut failures = Vec::new();
+    for &backend in backends {
+        let result = match backend {
+            EncoderBackend::Vaapi => {
+                encode_vaapi::VaapiEncoder::with_config(config, render_node_hint)
+                    .map(EncoderKind::Vaapi)
+            }
+            EncoderBackend::Vulkan if encode_vulkan::enabled() => {
+                encode_vulkan::VulkanEncoder::with_config(config, render_node_hint, !live_session)
+                    .map(EncoderKind::Vulkan)
+            }
+            EncoderBackend::Vulkan => Err("disabled by ST_VULKAN_ENCODE".into()),
+            EncoderBackend::Nvenc => {
+                encode::NvencEncoder::with_config(config).map(EncoderKind::Nvenc)
+            }
+            EncoderBackend::Software => {
+                encode_sw::SoftwareEncoder::with_config(config).map(EncoderKind::Software)
+            }
+        };
+        match result {
+            Ok(encoder) => {
+                println!(
+                    "[encoder] Using {} ({:?})",
+                    encoder_backend_name(backend),
+                    config.codec
+                );
+                return Ok(encoder);
+            }
+            Err(err) => {
+                eprintln!(
+                    "[encoder] {} unavailable for {:?}: {err}",
+                    encoder_backend_name(backend),
+                    config.codec
+                );
+                failures.push(format!("{}: {err}", encoder_backend_name(backend)));
             }
         }
     }
+    Err(failures.join("; "))
 }
 
 #[cfg(target_os = "linux")]
@@ -191,6 +218,7 @@ fn open_linux_encoder_for_aggregate(
     capabilities: AggregateVideoCapabilities,
     control: &ServerControl,
     capture_render_node: Option<&str>,
+    live_session: bool,
 ) -> Result<(EncoderConfig, EncoderKind), String> {
     let codec_order = if let Some(codec) = control.forced_codec() {
         encode_config::Codec::preferred_order(Some(codec))
@@ -212,14 +240,32 @@ fn open_linux_encoder_for_aggregate(
             codec_candidates.push(codec);
         }
     }
+    // A load-resistant backend on any hardware-decodable codec beats a
+    // preferred codec whose encoder stalls whenever the host GPU is busy.
     let mut failures = Vec::new();
-    for codec in codec_candidates {
-        let mut candidate_capabilities = capabilities;
-        candidate_capabilities.supported_codecs = single_codec_support(codec);
-        let config = aggregate_encoder_config(base, candidate_capabilities, control)?;
-        match create_linux_encoder_with_hint(&config, capture_render_node) {
-            Ok(encoder) => return Ok((config, encoder)),
-            Err(error) => failures.push(format!("{}: {error}", codec_name(codec))),
+    let any_hardware = codec_candidates
+        .iter()
+        .any(|codec| capabilities.hardware_codecs.supports(*codec));
+    for (backends, hardware_only) in [
+        (LOAD_RESISTANT_BACKENDS, any_hardware),
+        (REMAINING_BACKENDS, false),
+    ] {
+        for &codec in &codec_candidates {
+            if hardware_only && !capabilities.hardware_codecs.supports(codec) {
+                continue;
+            }
+            let mut candidate_capabilities = capabilities;
+            candidate_capabilities.supported_codecs = single_codec_support(codec);
+            let config = aggregate_encoder_config(base, candidate_capabilities, control)?;
+            match create_linux_encoder_with_hint(
+                &config,
+                capture_render_node,
+                backends,
+                live_session,
+            ) {
+                Ok(encoder) => return Ok((config, encoder)),
+                Err(error) => failures.push(format!("{}: {error}", codec_name(codec))),
+            }
         }
     }
     Err(format!(
@@ -238,6 +284,10 @@ fn create_encoder_for_backend(
         EncoderBackend::Vaapi => encode_vaapi::VaapiEncoder::with_config(config, None)
             .map(EncoderKind::Vaapi)
             .map_err(|err| format!("VAAPI reconfigure failed: {err}")),
+        #[cfg(target_os = "linux")]
+        EncoderBackend::Vulkan => encode_vulkan::VulkanEncoder::with_config(config, None, false)
+            .map(EncoderKind::Vulkan)
+            .map_err(|err| format!("Vulkan reconfigure failed: {err}")),
         #[cfg(target_os = "linux")]
         EncoderBackend::Nvenc => encode::NvencEncoder::with_config(config)
             .map(EncoderKind::Nvenc)
@@ -435,6 +485,8 @@ fn encoder_name(encoder: &EncoderKind) -> &'static str {
         #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(_) => "vaapi",
         #[cfg(target_os = "linux")]
+        EncoderKind::Vulkan(_) => "vulkan",
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(_) => "nvenc",
         #[cfg(target_os = "windows")]
         EncoderKind::Hardware(e) => e.backend_name(),
@@ -447,6 +499,8 @@ fn encoder_backend(encoder: &EncoderKind) -> EncoderBackend {
     match encoder {
         #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(_) => EncoderBackend::Vaapi,
+        #[cfg(target_os = "linux")]
+        EncoderKind::Vulkan(_) => EncoderBackend::Vulkan,
         #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(_) => EncoderBackend::Nvenc,
         #[cfg(target_os = "windows")]
@@ -464,6 +518,8 @@ fn encoder_backend_name(backend: EncoderBackend) -> &'static str {
     match backend {
         #[cfg(target_os = "linux")]
         EncoderBackend::Vaapi => "vaapi",
+        #[cfg(target_os = "linux")]
+        EncoderBackend::Vulkan => "vulkan",
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         EncoderBackend::Nvenc => "nvenc",
         #[cfg(target_os = "windows")]
@@ -514,7 +570,7 @@ fn select_linux_encoder(
         requested_fps: Some(framerate),
     };
     let (config, encoder) =
-        open_linux_encoder_for_aggregate(&seed, capabilities, control, capture_render_node)?;
+        open_linux_encoder_for_aggregate(&seed, capabilities, control, capture_render_node, false)?;
     let backend = encoder_backend(&encoder);
     println!(
         "[encoder] Selected {} {} with {} backend",
@@ -752,6 +808,8 @@ fn request_next_keyframe(encoder: &mut EncoderKind) {
         #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(e) => e.reset_for_keyframe(),
         #[cfg(target_os = "linux")]
+        EncoderKind::Vulkan(e) => e.reset_for_keyframe(),
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(e) => e.reset_for_keyframe(),
         #[cfg(target_os = "windows")]
         EncoderKind::Hardware(e) => e.reset_for_keyframe(),
@@ -759,11 +817,28 @@ fn request_next_keyframe(encoder: &mut EncoderKind) {
     }
 }
 
+/// Encoders whose rate control is fixed for the session lifetime.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn encoder_bitrate_fixed(encoder: &EncoderKind) -> bool {
+    #[cfg(target_os = "linux")]
+    if matches!(encoder, EncoderKind::Vulkan(_)) {
+        return true;
+    }
+    let _ = encoder;
+    false
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn update_encoder_bitrate(encoder: &mut EncoderKind, config: &EncoderConfig) -> Result<(), String> {
     match encoder {
         #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(e) => e.update_bitrate(config),
+        // Rate control is fixed per Vulkan video session; the caller rebuilds.
+        #[cfg(target_os = "linux")]
+        EncoderKind::Vulkan(_) => {
+            let _ = config;
+            Err("Vulkan encoder bitrate is fixed per session".into())
+        }
         #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(e) => e.update_bitrate(config),
         #[cfg(target_os = "windows")]
@@ -875,10 +950,13 @@ impl BitrateVerifier {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+/// `rebuild_only`: the encoder can't retarget in place, so every change
+/// restarts the stream on an IDR; only take larger, rarer steps.
 fn should_schedule_bitrate_reconfigure(
     current_kbps: u32,
     target_kbps: u32,
     last_reconfigure: Instant,
+    rebuild_only: bool,
 ) -> bool {
     if current_kbps == target_kbps {
         return false;
@@ -886,14 +964,18 @@ fn should_schedule_bitrate_reconfigure(
 
     let now = Instant::now();
     let delta_kbps = current_kbps.abs_diff(target_kbps);
+    let (step_divisor, down_wait, up_wait) = if rebuild_only {
+        (5, Duration::from_secs(2), Duration::from_secs(8))
+    } else {
+        (10, Duration::from_millis(750), Duration::from_secs(4))
+    };
 
     if target_kbps < current_kbps {
-        let min_delta = (current_kbps / 10).max(250);
-        now.duration_since(last_reconfigure) >= Duration::from_millis(750)
-            && delta_kbps >= min_delta
+        let min_delta = (current_kbps / step_divisor).max(250);
+        now.duration_since(last_reconfigure) >= down_wait && delta_kbps >= min_delta
     } else {
-        let min_delta = (current_kbps / 10).max(500);
-        now.duration_since(last_reconfigure) >= Duration::from_secs(4) && delta_kbps >= min_delta
+        let min_delta = (current_kbps / step_divisor).max(500);
+        now.duration_since(last_reconfigure) >= up_wait && delta_kbps >= min_delta
     }
 }
 
@@ -1615,6 +1697,7 @@ fn spawn_profile_encoder_rebuild(
             capabilities,
             &control,
             capture_render_hint.as_deref(),
+            true,
         )
         .map(|(config, encoder)| {
             let backend = encoder_backend(&encoder);
@@ -2331,6 +2414,7 @@ fn run_shared_pipeline(
                     current_config.bitrate_kbps,
                     target_bitrate,
                     last_encoder_reconfigure,
+                    false,
                 ) {
                     // Back off on failure too: a rejected property must not turn
                     // the capture loop into a per-frame reconfiguration/log storm.
@@ -2524,6 +2608,7 @@ fn run_shared_pipeline(
                         current_config.bitrate_kbps,
                         target_bitrate,
                         last_encoder_reconfigure,
+                        encoder_bitrate_fixed(&encoder),
                     )
                 {
                     let next_config = if forced_br > 0 {
@@ -2666,6 +2751,10 @@ fn run_shared_pipeline(
             e.flush();
         }
         #[cfg(target_os = "linux")]
+        EncoderKind::Vulkan(e) => {
+            e.flush();
+        }
+        #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(e) => {
             e.flush();
         }
@@ -2802,6 +2891,8 @@ fn encode_and_broadcast(
                 #[cfg(target_os = "windows")]
                 capture::FrameData::D3D11Texture { .. } => frame,
                 #[cfg(target_os = "linux")]
+                capture::FrameData::RamNv12(_) => frame,
+                #[cfg(target_os = "linux")]
                 capture::FrameData::DmaBuf { .. } => {
                     match capture::try_clone_frame_to_ram_bgra(frame) {
                         Ok(Some(mut composited)) => {
@@ -2839,6 +2930,8 @@ fn encode_and_broadcast(
     let result = match encoder {
         #[cfg(target_os = "linux")]
         EncoderKind::Vaapi(e) => e.encode(frame_ref),
+        #[cfg(target_os = "linux")]
+        EncoderKind::Vulkan(e) => e.encode(frame_ref),
         #[cfg(target_os = "linux")]
         EncoderKind::Nvenc(e) => e.encode(frame_ref),
         #[cfg(target_os = "windows")]
@@ -6097,16 +6190,49 @@ mod bitrate_hysteresis_tests {
     #[test]
     fn low_bandwidth_changes_are_not_trapped_by_multi_megabit_thresholds() {
         let settled = Instant::now() - Duration::from_secs(5);
-        assert!(should_schedule_bitrate_reconfigure(5_000, 4_000, settled));
-        assert!(should_schedule_bitrate_reconfigure(5_000, 5_500, settled));
-        assert!(!should_schedule_bitrate_reconfigure(5_000, 5_100, settled));
+        assert!(should_schedule_bitrate_reconfigure(
+            5_000, 4_000, settled, false
+        ));
+        assert!(should_schedule_bitrate_reconfigure(
+            5_000, 5_500, settled, false
+        ));
+        assert!(!should_schedule_bitrate_reconfigure(
+            5_000, 5_100, settled, false
+        ));
         assert!(!should_schedule_bitrate_reconfigure(
             5_000,
             4_000,
-            Instant::now()
+            Instant::now(),
+            false
         ));
         assert!(!should_schedule_bitrate_reconfigure(
-            50_000, 49_000, settled
+            50_000, 49_000, settled, false
+        ));
+    }
+
+    #[test]
+    fn rebuild_only_encoders_take_fewer_larger_steps() {
+        let settled = Instant::now() - Duration::from_secs(5);
+        assert!(!should_schedule_bitrate_reconfigure(
+            20_000, 17_000, settled, true
+        ));
+        assert!(should_schedule_bitrate_reconfigure(
+            20_000, 15_000, settled, true
+        ));
+        assert!(!should_schedule_bitrate_reconfigure(
+            20_000,
+            15_000,
+            Instant::now() - Duration::from_secs(1),
+            true
+        ));
+        assert!(!should_schedule_bitrate_reconfigure(
+            20_000, 26_000, settled, true
+        ));
+        assert!(should_schedule_bitrate_reconfigure(
+            20_000,
+            26_000,
+            Instant::now() - Duration::from_secs(9),
+            true
         ));
     }
 }

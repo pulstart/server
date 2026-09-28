@@ -85,6 +85,20 @@ impl Colorspace {
         (*ctx).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
     }
 
+    /// Make an RGB→YUV swscale context emit this colorspace's matrix and
+    /// limited range; swscale otherwise uses BT.601, mismatching the signalled
+    /// BT.709/BT.2020 and shifting hues on every CPU-converted frame.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub unsafe fn apply_to_scaler(&self, sws: *mut ffi::SwsContext) {
+        // SWS_CS_ITU709 / SWS_CS_BT2020; their Rust type varies by FFmpeg version.
+        let standard = match self.standard {
+            ColorStandard::Bt709 => 1,
+            ColorStandard::Bt2020Hdr => 9,
+        };
+        let table = ffi::sws_getCoefficients(standard);
+        ffi::sws_setColorspaceDetails(sws, table, 1, table, 0, 0, 1 << 16, 1 << 16);
+    }
+
     /// Software pixel format for this colorspace.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn sw_pixel_format(&self) -> ffi::AVPixelFormat {

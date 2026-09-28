@@ -513,11 +513,18 @@ pub struct KmsStabilizer {
     // gbm can't export a CPU/encoder-readable linear DMA-BUF (NVIDIA's gbm
     // rejects `gbm_bo_create` with `GBM_BO_USE_LINEAR` for renderable targets).
     ram_target: Option<RamTarget>,
+    /// NV12 readback target, `(w/4)x(3h/2)` RGBA8 texels holding packed Y then
+    /// CbCr rows. Built on demand while an encoder holds an `Nv12Claim`.
+    nv12_target: Option<RamTarget>,
+    nv12_program: Option<(glow::Program, Option<glow::UniformLocation>)>,
     ram_pool: RamPool,
     ram_mode: bool,
     logged_ram_fallback: bool,
     width: u32,
     height: u32,
+    /// Tests pin the readback format; the global claim count is shared.
+    #[cfg(test)]
+    force_nv12: Option<bool>,
 }
 
 /// glReadPixels fallback render target: a normal RGBA8 GL texture + FBO, not a
@@ -573,11 +580,15 @@ impl KmsStabilizer {
             pool: SlotPool::new(RING_SLOTS),
             slots: Vec::new(),
             ram_target: None,
+            nv12_target: None,
+            nv12_program: None,
             ram_pool: RamPool::default(),
             ram_mode: false,
             logged_ram_fallback: false,
             width: 0,
             height: 0,
+            #[cfg(test)]
+            force_nv12: None,
         })
     }
 
@@ -610,7 +621,7 @@ impl KmsStabilizer {
 
         let fbo = self.slots[idx].framebuffer;
         let result = self
-            .draw_blit(fbo, &src_planes[0], drm_format, width, height, false)
+            .draw_blit(fbo, &src_planes[0], drm_format, width, height, Pass::Dmabuf)
             .map(|src_image| {
                 // Barrier: the copy must be finished on the GPU before we return,
                 // so the caller can let KWin overwrite the source and so the
@@ -648,9 +659,9 @@ impl KmsStabilizer {
         }
     }
 
-    /// Readback fallback: blit the source into the plain GL FBO and read it
-    /// back as BGRA into a pooled buffer. Used when gbm can't export a linear
-    /// DMA-BUF (NVIDIA).
+    /// Readback fallback (NVIDIA: gbm can't export a linear DMA-BUF): render
+    /// the source into a plain GL target and read it back into a pooled
+    /// buffer, as NV12 when the encoder takes it, else BGRA.
     fn stabilize_ram(
         &mut self,
         src: &DmaBufPlane,
@@ -658,16 +669,47 @@ impl KmsStabilizer {
         width: u32,
         height: u32,
     ) -> Result<FrameData, String> {
-        let target = self
-            .ram_target
-            .as_ref()
-            .ok_or("RAM stabilizer target missing")?;
+        #[cfg(test)]
+        let preferred = self
+            .force_nv12
+            .unwrap_or_else(crate::capture::nv12_ram_preferred);
+        #[cfg(not(test))]
+        let preferred = crate::capture::nv12_ram_preferred();
+        let nv12 = preferred && width.is_multiple_of(4) && height.is_multiple_of(2);
+        let (pass, tex_w, tex_h) = if nv12 {
+            self.ensure_nv12(width, height)?;
+            (Pass::Nv12, width / 4, height * 3 / 2)
+        } else {
+            (Pass::Bgra, width, height)
+        };
+        let target = match pass {
+            Pass::Nv12 => self.nv12_target.as_ref(),
+            _ => self.ram_target.as_ref(),
+        }
+        .ok_or("RAM stabilizer target missing")?;
         let (fbo, pbo) = (target.framebuffer, target.pbo);
-        let src_image = self.draw_blit(fbo, src, drm_format, width, height, true)?;
+        let src_image = self.draw_blit(fbo, src, drm_format, width, height, pass)?;
+        let result = self.read_back(fbo, pbo, tex_w, tex_h);
+        let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
+        result.map(if nv12 {
+            FrameData::RamNv12
+        } else {
+            FrameData::Ram
+        })
+    }
 
+    /// Read an RGBA8 `fbo` of `width`x`height` texels into a pooled buffer,
+    /// waiting on the fence (not inside `glReadPixels`) for the GPU work.
+    fn read_back(
+        &self,
+        fbo: glow::Framebuffer,
+        pbo: Option<glow::Buffer>,
+        width: u32,
+        height: u32,
+    ) -> Result<crate::capture::RamBuf, String> {
         let len = width as usize * height as usize * 4;
         let gl = &self.gles.gl;
-        let result = unsafe {
+        unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
             let result = match pbo {
@@ -702,7 +744,7 @@ impl KmsStabilizer {
                     result
                 }
                 None => {
-                    // Settle the blit first so glReadPixels only waits on its
+                    // Settle the draw first so glReadPixels only waits on its
                     // own transfer.
                     self.gles.wait_gpu();
                     let mut buf = self.ram_pool.take(len);
@@ -720,9 +762,19 @@ impl KmsStabilizer {
             };
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             result
-        };
-        let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
-        result.map(FrameData::Ram)
+        }
+    }
+
+    fn ensure_nv12(&mut self, width: u32, height: u32) -> Result<(), String> {
+        if self.nv12_program.is_none() {
+            let program = build_nv12_program(&self.gles.gl)?;
+            let size = unsafe { self.gles.gl.get_uniform_location(program, "u_size") };
+            self.nv12_program = Some((program, size));
+        }
+        if self.nv12_target.is_none() {
+            self.nv12_target = Some(self.create_ram_target(width / 4, height * 3 / 2)?);
+        }
+        Ok(())
     }
 
     /// Queue the source→`fbo` blit. Returns the imported source image, which
@@ -734,7 +786,7 @@ impl KmsStabilizer {
         drm_format: u32,
         width: u32,
         height: u32,
-        ram: bool,
+        pass: Pass,
     ) -> Result<egl::Image, String> {
         let src_fd = {
             use std::os::fd::AsRawFd;
@@ -767,20 +819,26 @@ impl KmsStabilizer {
                 let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
                 return Err("stabilizer FBO incomplete".into());
             }
-            gl.viewport(0, 0, width as i32, height as i32);
             gl.disable(glow::BLEND);
             gl.disable(glow::DEPTH_TEST);
             gl.disable(glow::CULL_FACE);
-            gl.use_program(Some(self.program));
-            // RAM (glReadPixels) mode needs both the R/B swap (readback is GL_RGBA,
-            // encoders want BGRA bytes) and an extra vertical flip (readback origin
-            // is bottom-left). DMA-BUF mode needs neither.
-            let mode = if ram { 1 } else { 0 };
-            if let Some(loc) = self.swap_rb_uniform.as_ref() {
-                gl.uniform_1_i32(Some(loc), mode);
-            }
-            if let Some(loc) = self.flip_y_uniform.as_ref() {
-                gl.uniform_1_i32(Some(loc), mode);
+            if let (Pass::Nv12, Some((program, size))) = (pass, self.nv12_program.as_ref()) {
+                gl.viewport(0, 0, (width / 4) as i32, (height * 3 / 2) as i32);
+                gl.use_program(Some(*program));
+                gl.uniform_2_f32(size.as_ref(), width as f32, height as f32);
+            } else {
+                gl.viewport(0, 0, width as i32, height as i32);
+                gl.use_program(Some(self.program));
+                // RAM (glReadPixels) mode needs both the R/B swap (readback is
+                // GL_RGBA, encoders want BGRA bytes) and an extra vertical flip
+                // (readback origin is bottom-left). DMA-BUF mode needs neither.
+                let mode = i32::from(pass == Pass::Bgra);
+                if let Some(loc) = self.swap_rb_uniform.as_ref() {
+                    gl.uniform_1_i32(Some(loc), mode);
+                }
+                if let Some(loc) = self.flip_y_uniform.as_ref() {
+                    gl.uniform_1_i32(Some(loc), mode);
+                }
             }
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.src_texture));
@@ -1042,7 +1100,10 @@ impl KmsStabilizer {
         for slot in slots {
             self.free_slot(slot);
         }
-        if let Some(target) = self.ram_target.take() {
+        for target in [self.ram_target.take(), self.nv12_target.take()]
+            .into_iter()
+            .flatten()
+        {
             unsafe {
                 self.gles.gl.delete_framebuffer(target.framebuffer);
                 self.gles.gl.delete_texture(target.texture);
@@ -1059,6 +1120,9 @@ impl Drop for KmsStabilizer {
         self.destroy_targets();
         unsafe {
             self.gles.gl.delete_program(self.program);
+            if let Some((program, _)) = self.nv12_program.take() {
+                self.gles.gl.delete_program(program);
+            }
             self.gles.gl.delete_buffer(self.vbo);
             self.gles.gl.delete_texture(self.src_texture);
         }
@@ -1113,6 +1177,82 @@ fn create_dmabuf_image(
         &attrs,
     )
     .map_err(|e| format!("eglCreateImage(dmabuf): {e:?}"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Same-orientation copy into a linear DMA-BUF slot.
+    Dmabuf,
+    /// BGRA bytes for bottom-left-origin readback.
+    Bgra,
+    /// Packed NV12 for readback.
+    Nv12,
+}
+
+/// One pass straight from the scanout to NV12 (BT.709 limited): output texel
+/// `(x, y)` holds luma for source pixels `4x..4x+3` of row `y`; rows past `h`
+/// hold two 2x2-averaged CbCr pairs. Readback rows land in memory order, so
+/// the RGBA bytes are exactly an NV12 frame with stride `w`.
+fn build_nv12_program(gl: &glow::Context) -> Result<glow::Program, String> {
+    const VERT: &str = "attribute vec2 a_pos;\n\
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+    const FRAG: &str = "precision highp float;\n\
+uniform sampler2D u_src;\n\
+uniform vec2 u_size;\n\
+vec3 px(float x, float y) {\n\
+    return clamp(texture2D(u_src, (vec2(x, y) + 0.5) / u_size).rgb, 0.0, 1.0);\n\
+}\n\
+float luma(vec3 c) { return (16.0 + 219.0 * dot(c, vec3(0.2126, 0.7152, 0.0722))) / 255.0; }\n\
+vec2 chroma(vec3 c) {\n\
+    return (128.0 + 224.0 * vec2(dot(c, vec3(-0.114572, -0.385428, 0.5)),\n\
+                                 dot(c, vec3(0.5, -0.454153, -0.045847)))) / 255.0;\n\
+}\n\
+void main() {\n\
+    vec2 o = floor(gl_FragCoord.xy);\n\
+    float x = o.x * 4.0;\n\
+    if (o.y < u_size.y) {\n\
+        gl_FragColor = vec4(luma(px(x, o.y)), luma(px(x + 1.0, o.y)),\n\
+                            luma(px(x + 2.0, o.y)), luma(px(x + 3.0, o.y)));\n\
+    } else {\n\
+        float y = (o.y - u_size.y) * 2.0;\n\
+        vec3 a = px(x, y) + px(x + 1.0, y) + px(x, y + 1.0) + px(x + 1.0, y + 1.0);\n\
+        vec3 b = px(x + 2.0, y) + px(x + 3.0, y) + px(x + 2.0, y + 1.0) + px(x + 3.0, y + 1.0);\n\
+        gl_FragColor = vec4(chroma(a * 0.25), chroma(b * 0.25));\n\
+    }\n\
+}\n";
+    unsafe {
+        let program = gl
+            .create_program()
+            .map_err(|e| format!("create nv12 program: {e}"))?;
+        for (kind, source) in [(glow::VERTEX_SHADER, VERT), (glow::FRAGMENT_SHADER, FRAG)] {
+            let shader = gl
+                .create_shader(kind)
+                .map_err(|e| format!("create nv12 shader: {e}"))?;
+            gl.shader_source(shader, source);
+            gl.compile_shader(shader);
+            if !gl.get_shader_compile_status(shader) {
+                let log = gl.get_shader_info_log(shader);
+                gl.delete_shader(shader);
+                gl.delete_program(program);
+                return Err(format!("nv12 shader: {log}"));
+            }
+            gl.attach_shader(program, shader);
+            gl.delete_shader(shader);
+        }
+        gl.bind_attrib_location(program, 0, "a_pos");
+        gl.link_program(program);
+        if !gl.get_program_link_status(program) {
+            let log = gl.get_program_info_log(program);
+            gl.delete_program(program);
+            return Err(format!("nv12 link: {log}"));
+        }
+        gl.use_program(Some(program));
+        if let Some(loc) = gl.get_uniform_location(program, "u_src") {
+            gl.uniform_1_i32(Some(&loc), 0);
+        }
+        gl.use_program(None);
+        Ok(program)
+    }
 }
 
 fn build_gl_program(
@@ -1244,7 +1384,7 @@ fn quad_vertices(flip_y: bool) -> [f32; 16] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -1286,7 +1426,7 @@ mod tests {
     const AR24: u32 = 0x3432_5241;
 
     /// Scanout stand-in: a renderable gbm BO exported as a DMA-BUF.
-    struct TestSource {
+    pub(crate) struct TestSource {
         bo: *mut c_void,
         plane: DmaBufPlane,
     }
@@ -1311,7 +1451,7 @@ mod tests {
 
     /// A normal-priority context hammering the GPU with long fragment work,
     /// keeping a few frames queued like a GPU-bound game.
-    fn spawn_gpu_load(
+    pub(crate) fn spawn_gpu_load(
         node: String,
         width: u32,
         height: u32,
@@ -1425,6 +1565,131 @@ mod tests {
         );
     }
 
+    /// Fill the source's top half red and bottom half blue (memory order).
+    fn paint_source(stab: &KmsStabilizer, src: &TestSource, w: u32, h: u32) {
+        use std::os::fd::AsRawFd;
+        let gles = &stab.gles;
+        let image = create_dmabuf_image(
+            &gles.egl,
+            gles.display,
+            AR24,
+            w,
+            h,
+            src.plane.fd.as_raw_fd(),
+            src.plane.offset,
+            src.plane.pitch,
+            src.plane.modifier,
+        )
+        .expect("import source");
+        let gl = &gles.gl;
+        unsafe {
+            let texture = gl.create_texture().unwrap();
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            (gles.image_target_texture_2d)(glow::TEXTURE_2D, image.as_ptr() as *const c_void);
+            let fbo = gl.create_framebuffer().unwrap();
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(texture),
+                0,
+            );
+            gl.enable(glow::SCISSOR_TEST);
+            for (y, color) in [(0, [1.0, 0.0, 0.0]), (h / 2, [0.0, 0.0, 1.0])] {
+                gl.scissor(0, y as i32, w as i32, (h / 2) as i32);
+                gl.clear_color(color[0], color[1], color[2], 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            gl.disable(glow::SCISSOR_TEST);
+            gl.finish();
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(texture);
+        }
+        let _ = gles.egl.destroy_image(gles.display, image);
+    }
+
+    /// A readback-mode stabilizer plus a red-over-blue synthetic scanout.
+    pub(crate) fn painted_readback_source(
+        node: &str,
+        w: u32,
+        h: u32,
+    ) -> (KmsStabilizer, TestSource) {
+        let mut stab = KmsStabilizer::new(node).expect("stabilizer");
+        stab.ram_mode = true;
+        let src = TestSource::new(&stab.gles, w, h);
+        paint_source(&stab, &src, w, h);
+        (stab, src)
+    }
+
+    pub(crate) fn stabilize_source(
+        stab: &mut KmsStabilizer,
+        src: &TestSource,
+        w: u32,
+        h: u32,
+    ) -> FrameData {
+        stab.stabilize(std::slice::from_ref(&src.plane), AR24, w, h)
+            .expect("stabilize")
+    }
+
+    pub(crate) fn destroy_source(stab: &KmsStabilizer, src: TestSource) {
+        unsafe { (stab.gles.gbm.bo_destroy)(src.bo) };
+    }
+
+    /// The NVIDIA readback path must emit BT.709 limited NV12 (and BGRA) in
+    /// memory row order: a wrong matrix shifts hues, a flip turns the picture
+    /// upside down. `ST_TEST_KMS_COPY=1` (needs a GPU render node).
+    #[test]
+    fn readback_nv12_and_bgra_are_bt709_and_upright() {
+        if std::env::var_os("ST_TEST_KMS_COPY").is_none() {
+            return;
+        }
+        let node =
+            std::env::var("ST_TEST_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        let (w, h) = (64u32, 32u32);
+        let mut stab = KmsStabilizer::new(&node).expect("stabilizer");
+        stab.ram_mode = true;
+        let src = TestSource::new(&stab.gles, w, h);
+        paint_source(&stab, &src, w, h);
+        let planes = std::slice::from_ref(&src.plane);
+
+        stab.force_nv12 = Some(true);
+        let FrameData::RamNv12(nv12) = stab.stabilize(planes, AR24, w, h).unwrap() else {
+            panic!("expected NV12 output");
+        };
+        stab.force_nv12 = Some(false);
+        let (wu, hu) = (w as usize, h as usize);
+        assert_eq!(nv12.len(), wu * hu * 3 / 2);
+        let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 1;
+        let (y_top, y_bottom) = (nv12[0], nv12[(hu - 1) * wu + wu - 1]);
+        assert!(
+            near(y_top, 63) && near(y_bottom, 32),
+            "Y {y_top} {y_bottom}"
+        );
+        let uv_top = &nv12[wu * hu..wu * hu + 2];
+        let uv_bottom = &nv12[wu * hu * 3 / 2 - 2..];
+        assert!(
+            near(uv_top[0], 102) && near(uv_top[1], 240),
+            "top CbCr {uv_top:?}"
+        );
+        assert!(
+            near(uv_bottom[0], 240) && near(uv_bottom[1], 118),
+            "bottom CbCr {uv_bottom:?}"
+        );
+
+        let FrameData::Ram(bgra) = stab.stabilize(planes, AR24, w, h).unwrap() else {
+            panic!("expected BGRA without a claim");
+        };
+        assert_eq!(&bgra[..4], &[0, 0, 255, 255], "top row must be red");
+        assert_eq!(
+            &bgra[bgra.len() - 4..],
+            &[255, 0, 0, 255],
+            "bottom row must be blue"
+        );
+        unsafe { (stab.gles.gbm.bo_destroy)(src.bo) };
+    }
+
     /// Saturate the GPU for `ST_TEST_GPU_LOAD_SECS` seconds, for measuring other
     /// GPU consumers (e.g. NVENC) under contention.
     #[test]
@@ -1461,19 +1726,21 @@ mod tests {
         st_protocol::thread_priority::promote_current_thread(
             st_protocol::thread_priority::ThreadRole::Capture,
         );
-        // (label, gpu priority, sync_file wait, PBO readback)
+        // (label, gpu priority, sync_file wait, PBO readback, NV12 output)
         let configs = [
-            ("legacy", false, false, false),
-            ("fence+direct", true, true, false),
-            ("fence+pbo", true, true, true),
+            ("legacy", false, false, false, false),
+            ("fence+direct", true, true, false, false),
+            ("fence+pbo", true, true, true, false),
+            ("fence+pbo+nv12", true, true, true, true),
         ];
-        for (label, priority, fence, pbo) in configs {
+        for (label, priority, fence, pbo, nv12) in configs {
             if priority {
                 std::env::remove_var("ST_GPU_PRIO");
             } else {
                 std::env::set_var("ST_GPU_PRIO", "0");
             }
             let mut stab = KmsStabilizer::new(&node).expect("stabilizer");
+            stab.force_nv12 = Some(nv12);
             if !fence {
                 stab.gles.fence = None;
             }

@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Windows FFmpeg SDK. macOS uses ffmpeg@7, available on hosted runners.
-  # The pinned ffmpeg-next 8 bindings support both native library versions.
+  # Windows FFmpeg SDK. macOS uses ffmpeg@7, Linux builds FFmpeg from source
+  # (scripts/build-ffmpeg-linux.sh); ffmpeg-next 9 supports all of them.
   FFMPEG_VERSION: "8.1"
   FFMPEG_BUILD_TAG: "latest"
 
@@ -87,22 +87,42 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libavcodec-dev \
-            libavdevice-dev \
-            libavfilter-dev \
-            libavformat-dev \
-            libavutil-dev \
+            cmake \
             libdrm-dev \
+            libopus-dev \
             libpipewire-0.3-dev \
             libpulse-dev \
-            libswresample-dev \
-            libswscale-dev \
+            libva-dev \
+            libvulkan-dev \
             libwayland-dev \
+            libx264-dev \
             libx11-dev \
             libxext-dev \
             libxfixes-dev \
             libxtst-dev \
+            nasm \
             pkg-config
+
+      # Ubuntu's FFmpeg 6.1 lacks the Vulkan Video encoders the server uses on
+      # NVIDIA, so Linux builds against (and bundles) FFmpeg built from source.
+      - name: Cache FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-linux
+          key: linux-ffmpeg-${{ hashFiles('scripts/build-ffmpeg-linux.sh') }}
+
+      - name: Build FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if [[ ! -f ffmpeg-linux/lib/pkgconfig/libavcodec.pc ]]; then
+            bash scripts/build-ffmpeg-linux.sh ffmpeg-linux
+          fi
+          echo "FFMPEG_DIR=$PWD/ffmpeg-linux" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$PWD/ffmpeg-linux/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/ffmpeg-linux/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          # Cached bindings must match the selected FFmpeg version.
+          cargo clean -p ffmpeg-sys-next
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'

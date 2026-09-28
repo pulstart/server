@@ -751,7 +751,9 @@ fn stabilize_frame(
         FrameData::DmaBuf {
             planes, drm_format, ..
         } => stab.stabilize(planes, *drm_format, frame.width, frame.height)?,
-        FrameData::Ram(_) => return Err("stabilizer expects DMA-BUF frames".into()),
+        FrameData::Ram(_) | FrameData::RamNv12(_) => {
+            return Err("stabilizer expects DMA-BUF frames".into())
+        }
     };
     Ok(CapturedFrame {
         data,

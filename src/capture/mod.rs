@@ -23,6 +23,35 @@ pub fn take_unchanged_capture_ticks() -> u32 {
     UNCHANGED_CAPTURE_TICKS.swap(0, Ordering::Relaxed)
 }
 
+#[cfg(target_os = "linux")]
+static NV12_RAM_CLAIMS: AtomicU32 = AtomicU32::new(0);
+
+/// Held by an encoder that consumes [`FrameData::RamNv12`]. While any claim is
+/// alive, backends that already convert on the GPU emit NV12 instead of BGRA,
+/// cutting readback 62% and skipping a CPU colour conversion.
+#[cfg(target_os = "linux")]
+pub struct Nv12Claim(());
+
+#[cfg(target_os = "linux")]
+impl Nv12Claim {
+    pub fn new() -> Self {
+        NV12_RAM_CLAIMS.fetch_add(1, Ordering::AcqRel);
+        Self(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Nv12Claim {
+    fn drop(&mut self) {
+        NV12_RAM_CLAIMS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn nv12_ram_preferred() -> bool {
+    NV12_RAM_CLAIMS.load(Ordering::Acquire) > 0
+}
+
 /// A single plane of a DMA-BUF (GPU-accessible buffer exported via DRM).
 #[cfg(target_os = "linux")]
 pub struct DmaBufPlane {
@@ -137,7 +166,11 @@ impl RamPool {
 
 /// Frame payload: either CPU-accessible bytes or GPU DMA-BUF planes.
 pub enum FrameData {
+    /// Tightly packed BGRA.
     Ram(RamBuf),
+    /// Tightly packed NV12 (BT.709 limited): Y rows then interleaved CbCr rows.
+    #[cfg(target_os = "linux")]
+    RamNv12(RamBuf),
     #[cfg(target_os = "linux")]
     DmaBuf {
         planes: Vec<DmaBufPlane>,
@@ -278,6 +311,7 @@ pub fn try_clone_frame_to_ram_bgra(frame: &CapturedFrame) -> Result<Option<Vec<u
 
     match &frame.data {
         FrameData::Ram(data) => Ok(Some(data.to_vec())),
+        FrameData::RamNv12(_) => Ok(None),
         FrameData::DmaBuf {
             planes, drm_format, ..
         } => {

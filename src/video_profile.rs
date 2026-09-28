@@ -71,7 +71,9 @@ impl AggregateVideoCapabilities {
     pub fn preferred_codec_hardware_first(self, order: [VideoCodec; 3]) -> Option<VideoCodec> {
         order
             .into_iter()
-            .find(|codec| self.hardware_codecs.supports(*codec))
+            .find(|codec| {
+                self.hardware_codecs.supports(*codec) && self.supported_codecs.supports(*codec)
+            })
             .or_else(|| self.preferred_codec(order))
     }
 
@@ -294,6 +296,29 @@ mod tests {
         let aggregate = AggregateVideoCapabilities {
             supported_codecs: support(&[VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1]),
             hardware_codecs: support(&[VideoCodec::H264, VideoCodec::Hevc]),
+            supported_yuv444_codecs: VideoCodecSupport::empty(),
+            hardware_yuv444_codecs: VideoCodecSupport::empty(),
+            hdr_display: false,
+            requested_fps: Some(60),
+        };
+
+        assert_eq!(
+            aggregate.preferred_codec_hardware_first([
+                VideoCodec::Av1,
+                VideoCodec::Hevc,
+                VideoCodec::H264
+            ]),
+            Some(VideoCodec::Hevc)
+        );
+    }
+
+    /// The encoder fallback loop narrows `supported_codecs` to one candidate;
+    /// the hardware preference must not resurrect a codec that already failed.
+    #[test]
+    fn hardware_preference_respects_narrowed_support() {
+        let aggregate = AggregateVideoCapabilities {
+            supported_codecs: support(&[VideoCodec::Hevc]),
+            hardware_codecs: support(&[VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1]),
             supported_yuv444_codecs: VideoCodecSupport::empty(),
             hardware_yuv444_codecs: VideoCodecSupport::empty(),
             hdr_display: false,

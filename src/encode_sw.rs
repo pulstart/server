@@ -257,7 +257,7 @@ impl SoftwareEncoder {
             Pixel::YUV420P
         };
 
-        let scaler = scaling::Context::get(
+        let mut scaler = scaling::Context::get(
             Pixel::BGRA,
             config.width,
             config.height,
@@ -267,6 +267,7 @@ impl SoftwareEncoder {
             scaling::Flags::FAST_BILINEAR,
         )
         .map_err(|e| format!("scaler: {e}"))?;
+        unsafe { colorspace.apply_to_scaler(scaler.as_mut_ptr()) };
 
         let yuv_frame = VideoFrame::new(dst_pixel, config.width, config.height);
         let bgra_frame = VideoFrame::new(Pixel::BGRA, config.width, config.height);
@@ -291,6 +292,10 @@ impl SoftwareEncoder {
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedUnit>, String> {
         match &frame.data {
             FrameData::Ram(data) => self.fill_bgra_from_slice(data),
+            // Only emitted while a Vulkan encoder holds an Nv12Claim; a frame
+            // caught mid-backend-switch is dropped.
+            #[cfg(target_os = "linux")]
+            FrameData::RamNv12(_) => return Ok(Vec::new()),
             #[cfg(target_os = "windows")]
             FrameData::D3D11Texture {
                 texture,
