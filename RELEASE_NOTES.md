@@ -20,6 +20,12 @@ Server-only release; no wire format change.
 - Reconnecting is ~0.6 s faster: a codec the encoder self-test found too slow
   (HEVC at 1440p120 on NVIDIA) is remembered for 10 minutes instead of being
   opened and tested again on every connect.
+- Fix: clipboard sync never worked with the system-wide service (the
+  installer default) and logged an error every 5 s: a root service can't
+  reach the user's display. The tray agent, which runs in the user session,
+  now mirrors the clipboard to the service while a client is connected.
+  Connect notifications are shown the same way, and no longer delay the
+  connection while `notify-send` runs.
 - Frame-rate step-down logs split the encode time into upload and encode.
   Capture overrun logs split cursor/scanout from copy time.
 

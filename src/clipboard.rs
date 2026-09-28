@@ -41,6 +41,69 @@ pub fn new_suppressed_paths() -> SuppressedPaths {
     Arc::new(Mutex::new(HashSet::new()))
 }
 
+/// System mode: the root service has no display, so the in-session tray agent
+/// mirrors the user's clipboard into this over the control socket.
+#[derive(Default)]
+pub struct SessionClipboard {
+    state: Mutex<(u64, String)>,
+}
+
+impl SessionClipboard {
+    /// Current (generation, text); empty text means nothing to share.
+    pub fn get(&self) -> (u64, String) {
+        self.state.lock().unwrap().clone()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.state.lock().unwrap().0
+    }
+
+    /// Store `text`, returning the new generation (unchanged if identical).
+    pub fn set(&self, text: String) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        if state.0 == 0 || state.1 != text {
+            state.0 += 1;
+            state.1 = text;
+        }
+        state.0
+    }
+
+    /// Forget the text once no client is left to share it with.
+    pub fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.1.is_empty() {
+            state.0 += 1;
+            state.1.clear();
+        }
+    }
+}
+
+enum Board {
+    Os(arboard::Clipboard),
+    Session(Arc<SessionClipboard>),
+}
+
+impl Board {
+    fn get_text(&mut self) -> Result<String, String> {
+        match self {
+            Board::Os(board) => board.get_text().map_err(|e| e.to_string()),
+            Board::Session(session) => Some(session.get().1)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| "empty".into()),
+        }
+    }
+
+    fn set_text(&mut self, text: String) -> Result<(), String> {
+        match self {
+            Board::Os(board) => board.set_text(text).map_err(|e| e.to_string()),
+            Board::Session(session) => {
+                session.set(text);
+                Ok(())
+            }
+        }
+    }
+}
+
 pub struct ClipboardSync {
     remote_tx: Sender<String>,
     stop: Arc<AtomicBool>,
@@ -49,36 +112,25 @@ pub struct ClipboardSync {
 }
 
 impl ClipboardSync {
+    /// `session`: system mode's tray-mirrored clipboard instead of the OS one
+    /// (file detection needs the OS clipboard, so it's off there).
     pub fn start_with_file_detection(
         label: &'static str,
         outbound_tx: Sender<ControlMessage>,
         file_tx: Sender<PathBuf>,
         suppressed: SuppressedPaths,
-    ) -> Self {
-        Self::start_inner(label, outbound_tx, Some(file_tx), Some(suppressed))
-    }
-
-    fn start_inner(
-        label: &'static str,
-        outbound_tx: Sender<ControlMessage>,
-        file_tx: Option<Sender<PathBuf>>,
-        suppressed: Option<SuppressedPaths>,
+        session: Option<Arc<SessionClipboard>>,
     ) -> Self {
         let (remote_tx, remote_rx) = crossbeam_channel::bounded::<String>(REMOTE_CHANNEL_BOUND);
         let stop = Arc::new(AtomicBool::new(false));
 
+        let file_thread = session.is_none().then(|| {
+            let stop_flag = Arc::clone(&stop);
+            thread::spawn(move || run_file_clipboard_loop(file_tx, stop_flag, suppressed))
+        });
         let stop_flag = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            // Clipboard text sync is always active while connected.
-            run_clipboard_loop(label, outbound_tx, remote_rx, stop_flag);
-        });
-
-        let file_thread = file_tx.map(|tx| {
-            let stop_flag = Arc::clone(&stop);
-            let suppressed = suppressed.unwrap_or_else(new_suppressed_paths);
-            thread::spawn(move || {
-                run_file_clipboard_loop(tx, stop_flag, suppressed);
-            })
+            run_clipboard_loop(label, outbound_tx, remote_rx, stop_flag, session);
         });
 
         Self {
@@ -115,8 +167,9 @@ fn run_clipboard_loop(
     outbound_tx: Sender<ControlMessage>,
     remote_rx: Receiver<String>,
     stop: Arc<AtomicBool>,
+    session: Option<Arc<SessionClipboard>>,
 ) {
-    let mut clipboard: Option<arboard::Clipboard> = None;
+    let mut clipboard: Option<Board> = session.map(Board::Session);
     let mut last_log = Instant::now() - CLIPBOARD_ERROR_LOG_INTERVAL;
     let mut pending_remote: Option<String> = None;
     let mut last_synced_text: Option<String> = None;
@@ -129,7 +182,7 @@ fn run_clipboard_loop(
 
         if clipboard.is_none() {
             match arboard::Clipboard::new() {
-                Ok(instance) => clipboard = Some(instance),
+                Ok(instance) => clipboard = Some(Board::Os(instance)),
                 Err(err) => {
                     if last_log.elapsed() >= CLIPBOARD_ERROR_LOG_INTERVAL {
                         eprintln!("[clipboard] {label}: unavailable: {err}");
@@ -197,6 +250,109 @@ fn run_clipboard_loop(
             }
         }
         thread::sleep(CLIPBOARD_POLL_INTERVAL);
+    }
+}
+
+/// The service's [`SessionClipboard`] as seen from the tray agent.
+pub trait SessionClipboardRemote {
+    /// A client is connected (the clipboard is only read while one is).
+    fn active(&self) -> bool;
+    /// Latest known generation (from the polled snapshot; no round trip).
+    fn generation(&self) -> u64;
+    fn get(&self) -> Option<(u64, String)>;
+    fn set(&self, text: String) -> Option<u64>;
+}
+
+/// The user's clipboard as the mirror sees it.
+trait TextBoard {
+    fn get_text(&mut self) -> Result<String, String>;
+    fn set_text(&mut self, text: String) -> Result<(), String>;
+}
+
+impl TextBoard for arboard::Clipboard {
+    fn get_text(&mut self) -> Result<String, String> {
+        arboard::Clipboard::get_text(self).map_err(|e| e.to_string())
+    }
+
+    fn set_text(&mut self, text: String) -> Result<(), String> {
+        arboard::Clipboard::set_text(self, text).map_err(|e| e.to_string())
+    }
+}
+
+/// Tray-side sync state between the user's clipboard and the service's.
+struct Mirror {
+    seen: u64,
+    last: Option<String>,
+}
+
+impl Mirror {
+    /// One poll; `Err` means the local clipboard must be reopened.
+    fn step(
+        &mut self,
+        local: &mut impl TextBoard,
+        remote: &impl SessionClipboardRemote,
+    ) -> Result<(), String> {
+        if remote.generation() != self.seen {
+            if let Some((generation, text)) = remote.get() {
+                self.seen = generation;
+                if !text.is_empty() && self.last.as_deref() != Some(text.as_str()) {
+                    let applied = local.set_text(text.clone());
+                    // Even on failure: a read-back must not send it back.
+                    self.last = Some(text);
+                    // Don't read back this tick: the commit can race the read.
+                    return applied;
+                }
+            }
+        }
+        if let Ok(text) = local.get_text() {
+            let text = clamp_clipboard_text(&text);
+            if self.last.as_deref() != Some(text.as_str()) {
+                if let Some(generation) = remote.set(text.clone()) {
+                    self.seen = generation;
+                    self.last = Some(text);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Tray agent side of system mode's clipboard: push the user's clipboard to
+/// the service and apply text a client sent, while a client is connected.
+/// Never returns.
+pub fn mirror_session_clipboard(remote: impl SessionClipboardRemote) {
+    let mut board: Option<arboard::Clipboard> = None;
+    let mut mirror = Mirror {
+        seen: remote.generation(),
+        last: None,
+    };
+    let mut last_log = Instant::now() - CLIPBOARD_ERROR_LOG_INTERVAL;
+    loop {
+        thread::sleep(CLIPBOARD_POLL_INTERVAL);
+        if !remote.active() {
+            board = None;
+            mirror = Mirror {
+                seen: remote.generation(),
+                last: None,
+            };
+            continue;
+        }
+        let local = match board.as_mut() {
+            Some(board) => board,
+            None => match arboard::Clipboard::new() {
+                Ok(new) => board.insert(new),
+                Err(err) => {
+                    if last_log.elapsed() >= CLIPBOARD_ERROR_LOG_INTERVAL {
+                        eprintln!("[clipboard] session: unavailable: {err}");
+                        last_log = Instant::now();
+                    }
+                    continue;
+                }
+            },
+        };
+        if mirror.step(local, &remote).is_err() {
+            board = None;
+        }
     }
 }
 
@@ -373,5 +529,112 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn next_text(rx: &Receiver<ControlMessage>) -> Option<String> {
+        match rx.recv_timeout(Duration::from_millis(900)) {
+            Ok(ControlMessage::ClipboardText(text)) => Some(text),
+            _ => None,
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeBoard(Option<String>);
+
+    impl TextBoard for FakeBoard {
+        fn get_text(&mut self) -> Result<String, String> {
+            self.0.clone().ok_or_else(|| "empty".into())
+        }
+
+        fn set_text(&mut self, text: String) -> Result<(), String> {
+            self.0 = Some(text);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRemote {
+        session: SessionClipboard,
+        pushes: std::cell::Cell<u32>,
+    }
+
+    impl SessionClipboardRemote for &FakeRemote {
+        fn active(&self) -> bool {
+            true
+        }
+
+        fn generation(&self) -> u64 {
+            self.session.generation()
+        }
+
+        fn get(&self) -> Option<(u64, String)> {
+            Some(self.session.get())
+        }
+
+        fn set(&self, text: String) -> Option<u64> {
+            self.pushes.set(self.pushes.get() + 1);
+            Some(self.session.set(text))
+        }
+    }
+
+    #[test]
+    fn tray_mirror_pushes_copies_and_applies_client_text_without_echo() {
+        let remote = FakeRemote::default();
+        let mut local = FakeBoard::default();
+        let mut mirror = Mirror {
+            seen: 0,
+            last: None,
+        };
+        let mut step = |local: &mut FakeBoard| mirror.step(local, &&remote).unwrap();
+        // The user copies: pushed once.
+        local.0 = Some("host".into());
+        step(&mut local);
+        step(&mut local);
+        assert_eq!(remote.session.get().1, "host");
+        assert_eq!(remote.pushes.get(), 1);
+        // A client's text lands locally and is not pushed back.
+        remote.session.set("client".into());
+        step(&mut local);
+        step(&mut local);
+        assert_eq!(local.0.as_deref(), Some("client"));
+        assert_eq!(remote.pushes.get(), 1);
+        // The last client leaving clears the service copy, not the user's.
+        remote.session.clear();
+        step(&mut local);
+        assert_eq!(local.0.as_deref(), Some("client"));
+        assert_eq!(remote.pushes.get(), 1);
+        // A new copy is pushed again.
+        local.0 = Some("again".into());
+        step(&mut local);
+        assert_eq!(remote.session.get().1, "again");
+    }
+
+    #[test]
+    fn session_clipboard_relays_both_ways_without_echo() {
+        let session = Arc::new(SessionClipboard::default());
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let (file_tx, _file_rx) = crossbeam_channel::bounded(1);
+        let sync = ClipboardSync::start_with_file_detection(
+            "test",
+            tx,
+            file_tx,
+            new_suppressed_paths(),
+            Some(Arc::clone(&session)),
+        );
+        // Nothing copied yet: nothing sent.
+        assert_eq!(next_text(&rx), None);
+        // The tray agent pushes the user's copy: the client gets it once.
+        session.set("from host".into());
+        assert_eq!(next_text(&rx).as_deref(), Some("from host"));
+        // The client copies: it lands in the session, not echoed back.
+        sync.set_remote_text("from client".into());
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(session.get().1, "from client");
+        assert_eq!(next_text(&rx), None);
     }
 }

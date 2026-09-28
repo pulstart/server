@@ -4280,6 +4280,9 @@ async fn handle_client(
         clipboard_control_tx,
         file_detect_tx,
         Arc::clone(&suppressed_paths),
+        std::env::var_os("ST_SYSTEM_MODE")
+            .is_some()
+            .then(|| Arc::clone(state.control.session_clipboard())),
     );
     let mut ft_manager = file_transfer::FileTransferManager::start_auto_accept(
         st_protocol::file_transfer::TransportMode::Direct,
@@ -5366,6 +5369,9 @@ fn handle_punched_client(
         clipboard_control_tx,
         file_detect_tx,
         Arc::clone(&suppressed_paths),
+        std::env::var_os("ST_SYSTEM_MODE")
+            .is_some()
+            .then(|| Arc::clone(state.control.session_clipboard())),
     );
     let mut ft_manager = file_transfer::FileTransferManager::start_auto_accept(
         st_protocol::file_transfer::TransportMode::Punched,

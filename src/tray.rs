@@ -183,6 +183,13 @@ fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
     let mut last_wake_gen = control.wake_generation();
     let wake_in_progress = Arc::new(AtomicBool::new(false));
 
+    // The service has no session: show its notices and mirror the clipboard.
+    let mut last_notice = control.notice().0;
+    if let ControlHandle::Remote(remote) = &control {
+        let remote = Arc::clone(remote);
+        thread::spawn(move || crate::clipboard::mirror_session_clipboard(remote));
+    }
+
     // Session game-mode detector: this agent lives in the user's graphical
     // session, so it can identify the focused game and push that to the service.
     // The service then interprets a missing KMS cursor as relative capture.
@@ -235,6 +242,11 @@ fn run_linux_tray(control: ControlHandle) -> Result<(), String> {
                 }
             }
         }
+        let (notice_gen, notice) = control.notice();
+        if notice_gen != last_notice {
+            last_notice = notice_gen;
+            crate::server_control::show_notification(notice);
+        }
         let version = control.ui_version();
         let api_connected = control.api_connected();
         if version != last_version || api_connected != last_api_connected {
@@ -286,6 +298,14 @@ impl ControlHandle {
         match self {
             ControlHandle::Local { control, .. } => control.ui_version(),
             ControlHandle::Remote(r) => r.cache().version,
+        }
+    }
+
+    /// The service's latest desktop notice; the per-user server shows its own.
+    fn notice(&self) -> (u64, String) {
+        match self {
+            ControlHandle::Local { .. } => Default::default(),
+            ControlHandle::Remote(r) => r.cache().notice,
         }
     }
 
@@ -540,6 +560,38 @@ impl RemoteControl {
             }
         }
         self.refresh();
+    }
+
+    /// One request whose reply the caller needs; `None` when the socket is down.
+    fn call<T>(&self, f: impl FnOnce(&mut IpcClient) -> std::io::Result<T>) -> Option<T> {
+        if self.client.lock().unwrap().is_none() {
+            self.reconnect();
+        }
+        let mut guard = self.client.lock().unwrap();
+        let result = f(guard.as_mut()?);
+        if result.is_err() {
+            *guard = None;
+        }
+        result.ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl crate::clipboard::SessionClipboardRemote for Arc<RemoteControl> {
+    fn active(&self) -> bool {
+        !self.cache.lock().unwrap().clients.is_empty()
+    }
+
+    fn generation(&self) -> u64 {
+        self.cache.lock().unwrap().clipboard_generation
+    }
+
+    fn get(&self) -> Option<(u64, String)> {
+        self.call(|c| c.session_clipboard())
+    }
+
+    fn set(&self, text: String) -> Option<u64> {
+        self.call(|c| c.set_session_clipboard(text))
     }
 }
 
@@ -2168,6 +2220,8 @@ mod tests {
                 },
                 clients: Vec::new(),
                 wake_generation: 0,
+                clipboard_generation: 0,
+                notice: Default::default(),
             }),
         }))
     }

@@ -244,6 +244,10 @@ pub struct ServerControl {
     /// no input runtime is wired (tests / IPC-only paths) — then it's a no-op.
     #[allow(clippy::type_complexity)]
     game_mode_hook: Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>,
+    /// System mode: the latest desktop notice (generation, text) for the tray
+    /// agent to show in-session; a root service has no session bus.
+    notice: Mutex<(u64, String)>,
+    session_clipboard: Arc<crate::clipboard::SessionClipboard>,
 }
 
 impl ServerControl {
@@ -270,7 +274,18 @@ impl ServerControl {
             wake_generation: AtomicU64::new(0),
             last_wake_request_ms: AtomicU64::new(0),
             game_mode_hook: Mutex::new(None),
+            notice: Mutex::default(),
+            session_clipboard: Arc::default(),
         })
+    }
+
+    pub fn notice(&self) -> (u64, String) {
+        self.notice.lock().unwrap().clone()
+    }
+
+    /// System mode's clipboard, mirrored by the in-session tray agent.
+    pub fn session_clipboard(&self) -> &Arc<crate::clipboard::SessionClipboard> {
+        &self.session_clipboard
     }
 
     /// Current screen-wake request generation. The tray agent compares this
@@ -467,7 +482,13 @@ impl ServerControl {
         };
         self.clients.lock().unwrap().insert(id, entry);
         self.bump_version();
-        notify_client_connection(&snapshot);
+        let body = format!("Client connected: {addr}");
+        if std::env::var_os("ST_SYSTEM_MODE").is_some() {
+            let mut notice = self.notice.lock().unwrap();
+            *notice = (notice.0 + 1, body);
+        } else {
+            show_notification(body);
+        }
         RegisteredClient {
             snapshot,
             disconnect_requested,
@@ -578,8 +599,12 @@ impl ServerControl {
     }
 
     fn unregister_client(&self, id: usize) {
-        let removed = self.clients.lock().unwrap().remove(&id);
-        if removed.is_some() {
+        let mut clients = self.clients.lock().unwrap();
+        if clients.remove(&id).is_some() {
+            if clients.is_empty() {
+                self.session_clipboard.clear();
+            }
+            drop(clients);
             self.bump_version();
         }
     }
@@ -613,45 +638,31 @@ fn initial_update_state() -> UpdateStateSnapshot {
     }
 }
 
-fn notify_client_connection(snapshot: &ConnectedClientSnapshot) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let age_hint = snapshot
-        .connected_at
-        .elapsed()
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let title = "st-server";
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let body = if age_hint == 0 {
-        format!("Client connected: {}", snapshot.addr)
-    } else {
-        format!("Client connected: {} ({age_hint}s)", snapshot.addr)
-    };
-
+/// Desktop notification, off the caller's thread.
+pub fn show_notification(body: String) {
     #[cfg(target_os = "macos")]
-    {
+    thread::spawn(move || {
         let script = format!(
             "display notification {} with title {}",
             apple_script_string(&body),
-            apple_script_string(title)
+            apple_script_string("st-server")
         );
         let _ = std::process::Command::new("osascript")
             .arg("-e")
             .arg(script)
             .status();
-    }
+    });
 
     #[cfg(target_os = "linux")]
-    {
+    thread::spawn(move || {
         let _ = std::process::Command::new("notify-send")
-            .arg(title)
+            .arg("st-server")
             .arg(&body)
             .status();
-    }
+    });
 
     #[cfg(target_os = "windows")]
-    let _ = snapshot;
+    let _ = body;
 }
 
 #[cfg(target_os = "macos")]

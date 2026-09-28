@@ -80,6 +80,13 @@ pub struct StateSnapshot {
     /// across snapshots and runs the in-session display wake when it increments.
     #[serde(default)]
     pub wake_generation: u64,
+    /// Generation of the service's session clipboard; the agent fetches the
+    /// text when it changes.
+    #[serde(default)]
+    pub clipboard_generation: u64,
+    /// Latest desktop notice (generation, text) for the agent to show.
+    #[serde(default)]
+    pub notice: (u64, String),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -95,6 +102,8 @@ enum Req {
     RequestShutdown,
     RequestDisconnect(usize),
     SetGameMode(bool),
+    GetSessionClipboard,
+    SetSessionClipboard(String),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -102,6 +111,8 @@ enum Resp {
     Snapshot(Box<StateSnapshot>),
     Bool(bool),
     Ack,
+    Clipboard(u64, String),
+    Generation(u64),
     Err(String),
 }
 
@@ -198,6 +209,8 @@ fn build_snapshot(
         update_state: update_state_to_wire(control.update_state()),
         clients,
         wake_generation: control.wake_generation(),
+        clipboard_generation: control.session_clipboard().generation(),
+        notice: control.notice(),
     }
 }
 
@@ -245,6 +258,11 @@ fn handle_request(
             control.set_session_game_mode(on);
             Resp::Ack
         }
+        Req::GetSessionClipboard => {
+            let (generation, text) = control.session_clipboard().get();
+            Resp::Clipboard(generation, text)
+        }
+        Req::SetSessionClipboard(text) => Resp::Generation(control.session_clipboard().set(text)),
     }
 }
 
@@ -382,6 +400,20 @@ impl IpcClient {
         self.expect_ack(Req::SetGameMode(on))
     }
 
+    pub fn session_clipboard(&mut self) -> io::Result<(u64, String)> {
+        match self.call(Req::GetSessionClipboard)? {
+            Resp::Clipboard(generation, text) => Ok((generation, text)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    pub fn set_session_clipboard(&mut self, text: String) -> io::Result<u64> {
+        match self.call(Req::SetSessionClipboard(text))? {
+            Resp::Generation(generation) => Ok(generation),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     pub fn set_forced_codec(&mut self, codec: u8) -> io::Result<()> {
         self.expect_ack(Req::SetForcedCodec(codec))
     }
@@ -497,6 +529,38 @@ mod tests {
     // and `request_wake()` must debounce so a reconnect burst doesn't spam the
     // compositor. If this regresses, a blanked remote never wakes (the original
     // "screen off => can't connect" bug) or wakes on every poll tick.
+    #[test]
+    fn session_clipboard_round_trips_over_socket() {
+        let tmp = std::env::temp_dir().join(format!("st-clip-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        std::env::set_var("XDG_STATE_HOME", &tmp);
+        let control = ServerControl::new();
+        let sock = tmp.join("clip.sock");
+        let server_control = Arc::clone(&control);
+        let server_sock = sock.clone();
+        std::thread::spawn(move || {
+            let _ = serve(server_control, None, &server_sock);
+        });
+        let mut client = (0..200)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                IpcClient::connect(&sock).ok()
+            })
+            .expect("connect to control socket");
+
+        assert_eq!(client.snapshot().unwrap().clipboard_generation, 0);
+        assert_eq!(client.set_session_clipboard("copied".into()).unwrap(), 1);
+        assert_eq!(client.set_session_clipboard("copied".into()).unwrap(), 1);
+        control.session_clipboard().set("from client".into());
+        assert_eq!(client.snapshot().unwrap().clipboard_generation, 2);
+        assert_eq!(
+            client.session_clipboard().unwrap(),
+            (2, "from client".to_string())
+        );
+        control.session_clipboard().clear();
+        assert_eq!(client.session_clipboard().unwrap(), (3, String::new()));
+    }
+
     #[test]
     fn wake_generation_propagates_and_debounces_over_socket() {
         let tmp = std::env::temp_dir().join(format!("st-wake-test-{}", std::process::id()));
