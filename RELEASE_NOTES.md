@@ -1,3 +1,13 @@
+# 0.9.25
+
+Server-only release; no wire format change.
+
+- While the tray reports a focused game, the GPU-side screen read is not
+  retried at all. In the 0.9.24 log those once-a-minute retries against a
+  running game still cost a 37-77 ms capture stall each (down from 194 ms),
+  for a gain that only exists on an idle GPU. Slow GPU-side frames now log
+  where the time went (blit submission vs fence and readback).
+
 # 0.9.24
 
 Server-only release; no wire format change.

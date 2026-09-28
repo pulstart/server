@@ -893,6 +893,8 @@ impl InputRuntime {
             return;
         }
         eprintln!("[input] session game_mode={on}");
+        #[cfg(target_os = "linux")]
+        crate::gpu_clock::set_game_active(on);
         if on {
             // Entry needs no forced state: the next captured frame's
             // `update_cursor` republishes the correct visible/app_grab within

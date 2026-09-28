@@ -694,6 +694,10 @@ pub struct KmsStabilizer {
     vk: Option<VkReadback>,
     vk_tried: bool,
     chooser: ReadbackChooser,
+    /// (blit submission, fence wait + readback) of the last GL frame.
+    gl_phases: (std::time::Duration, std::time::Duration),
+    /// Slow-frame breakdowns logged so far.
+    slow_gl_logs: u32,
     /// Scanout image a timed-out GL frame may still be reading.
     abandoned_image: Option<egl::Image>,
     gpu_load: Option<crate::gpu_clock::GpuLoad>,
@@ -769,6 +773,8 @@ impl KmsStabilizer {
             vk_tried: false,
             chooser: ReadbackChooser::new(std::time::Instant::now()),
             abandoned_image: None,
+            gl_phases: (std::time::Duration::ZERO, std::time::Duration::ZERO),
+            slow_gl_logs: 0,
             gpu_load: None,
             vk_fail_streak: 0,
             vk_unsupported_logged: None,
@@ -882,7 +888,16 @@ impl KmsStabilizer {
             }
         }
         let limit = (gl && self.vk.is_some()).then(|| self.chooser.gl_deadline());
-        match self.gl_readback(src, drm_format, width, height, preferred, limit) {
+        let result = self.gl_readback(src, drm_format, width, height, preferred, limit);
+        if gl && self.slow_gl_logs < 8 && now.elapsed() > std::time::Duration::from_millis(15) {
+            self.slow_gl_logs += 1;
+            let (blit, rest) = self.gl_phases;
+            eprintln!(
+                "[kms] slow 3D-engine frame {:.1?}: blit {blit:.1?}, fence+readback {rest:.1?}",
+                now.elapsed()
+            );
+        }
+        match result {
             Ok(data) => {
                 if gl && self.vk.is_some() {
                     self.chooser
@@ -929,8 +944,11 @@ impl KmsStabilizer {
         }
         .ok_or("RAM stabilizer target missing")?;
         let (fbo, pbo) = (target.framebuffer, target.pbo);
+        let started = std::time::Instant::now();
         let src_image = self.draw_blit(fbo, src, drm_format, width, height, pass)?;
+        let blitted = started.elapsed();
         let result = self.read_back(fbo, pbo, tex_w, tex_h, limit);
+        self.gl_phases = (blitted, started.elapsed() - blitted);
         if matches!(result, Err(GlError::Busy)) {
             // The GPU still reads the image; free it once a later frame runs.
             self.abandoned_image = Some(src_image);

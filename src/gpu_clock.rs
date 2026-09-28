@@ -95,6 +95,14 @@ impl Nvml {
     }
 }
 
+static GAME_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The session reports a focused game: the 3D engine counts as busy even
+/// between utilisation samples, so nothing retries it against the game.
+pub fn set_game_active(active: bool) {
+    GAME_ACTIVE.store(active, Ordering::Relaxed);
+}
+
 /// 3D/compute utilisation of an NVIDIA GPU, resampled at most every 250 ms.
 pub struct GpuLoad {
     nvml: Nvml,
@@ -120,6 +128,9 @@ impl GpuLoad {
     }
 
     pub fn busy(&mut self, now: Instant) -> bool {
+        if GAME_ACTIVE.load(Ordering::Relaxed) {
+            return true;
+        }
         if self
             .sampled_at
             .is_none_or(|at| now.saturating_duration_since(at) >= Self::RESAMPLE)
