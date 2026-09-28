@@ -779,7 +779,7 @@ pub struct ClientRateController {
     probe_failures: u32,
     probe_backoff_until: Instant,
     seen_completed_frame: bool,
-    /// Latest server-side cap→send backlog (µs), EWMA-smoothed by the transport
+    /// Latest server-side encode→send backlog (µs), EWMA-smoothed by the transport
     /// loop. This is the one congestion signal that survives WiFi bufferbloat:
     /// when we overdrive the link the path *buffers* rather than drops, so the
     /// loss/late/owd signals stay clean while our own outbound queue (and the
@@ -814,7 +814,7 @@ impl ClientRateController {
         }
     }
 
-    /// Feed the latest server-side cap→send backlog (µs) before `apply_feedback`.
+    /// Feed the latest server-side encode→send backlog (µs) before `apply_feedback`.
     /// Call once per feedback window from the transport loop's EWMA.
     pub fn note_send_backlog_us(&mut self, us: u32) {
         self.send_backlog_us = us;
@@ -849,7 +849,7 @@ impl ClientRateController {
     /// bottleneck queue as building and refuse to probe the bitrate up — react to
     /// congestion *before* it turns into loss (B1, GCC-style delay gradient).
     const OWD_RISING_US: i32 = 4_000;
-    /// Server-side cap→send backlog (µs) above which we actively *reduce* bitrate
+    /// Server-side encode→send backlog (µs) above which we actively *reduce* bitrate
     /// even with zero packet loss. On WiFi an overdriven link buffers instead of
     /// dropping, so the queue (and end-to-end latency) bloats while loss stays 0;
     /// this is the only signal that catches it. ~60 ms is well clear of a healthy
@@ -940,7 +940,7 @@ impl ClientRateController {
                 self.revert_failed_probe(now);
             }
         } else if self.send_backlog_us >= Self::BACKLOG_REDUCE_US {
-            // Bufferbloat downshift: no packet loss, but our own cap→send queue is
+            // Bufferbloat downshift: no packet loss, but our own encode→send queue is
             // bloated — we are pushing more than the path drains in real time and
             // it is buffering (classic WiFi). Loss-based ABR is blind here, so cut
             // bitrate to drain the queue and settle near real capacity. Mark a
@@ -1351,7 +1351,7 @@ mod tests {
     #[test]
     fn controller_reduces_bitrate_on_send_backlog_without_loss() {
         // WiFi bufferbloat: the link buffers instead of dropping, so loss/owd stay
-        // clean while our own cap→send queue bloats. ABR must still downshift.
+        // clean while our own encode→send queue bloats. ABR must still downshift.
         let start = Instant::now();
         let mut controller = ClientRateController::from_limits_at(5_000, 90_000, 80_000, start);
         let clean_but_bloated = TransportFeedback {
@@ -1363,7 +1363,7 @@ mod tests {
             ..Default::default()
         };
 
-        // 800 ms of cap→send backlog → must cut bitrate.
+        // 800 ms of encode→send backlog → must cut bitrate.
         controller.note_send_backlog_us(800_000);
         let next =
             controller.apply_feedback_at(clean_but_bloated, start + Duration::from_millis(500));

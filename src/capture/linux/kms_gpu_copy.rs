@@ -719,6 +719,21 @@ impl KmsStabilizer {
         })
     }
 
+    /// Open the copy-engine readback now rather than inside the first frame's
+    /// capture, which would then leave ~200 ms stale.
+    pub fn prepare_copy_engine(&mut self) {
+        if std::mem::replace(&mut self.vk_tried, true) || !super::kms_vk_copy::enabled() {
+            return;
+        }
+        match VkReadback::open(&self.render_node) {
+            Ok(vk) => {
+                println!("[kms] scanout readback on the Vulkan copy engine");
+                self.vk = Some(vk);
+            }
+            Err(e) => eprintln!("[kms] copy-engine readback unavailable ({e}); using GL"),
+        }
+    }
+
     /// Copy-engine readback; `None` sends this frame through GL instead.
     fn vk_readback(
         &mut self,
@@ -729,18 +744,7 @@ impl KmsStabilizer {
         dst: DstFormat,
     ) -> Option<FrameData> {
         const FAIL_LIMIT: u32 = 3;
-        if !self.vk_tried {
-            self.vk_tried = true;
-            if super::kms_vk_copy::enabled() {
-                match VkReadback::open(&self.render_node) {
-                    Ok(vk) => {
-                        println!("[kms] scanout readback on the Vulkan copy engine");
-                        self.vk = Some(vk);
-                    }
-                    Err(e) => eprintln!("[kms] copy-engine readback unavailable ({e}); using GL"),
-                }
-            }
-        }
+        self.prepare_copy_engine();
         match self
             .vk
             .as_mut()?

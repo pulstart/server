@@ -536,6 +536,9 @@ fn configure_direct_udp_socket(socket: &UdpSocket, client_addr: SocketAddr) {
 pub struct EncodedVideoFrame {
     pub data: Vec<u8>,
     pub capture_micros: u64,
+    /// When the encoder handed it over: the send backlog counts from here, so
+    /// encoder setup and rebuild stalls don't read as a congested link.
+    pub encoded_micros: u64,
     pub source_seq: u64,
     pub is_recovery: bool,
     /// Internal-only encoder/config epoch. It is not serialized on the wire;

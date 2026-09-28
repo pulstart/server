@@ -910,7 +910,11 @@ mod tests {
                 .unwrap_or(8333),
         );
         let mut next = Instant::now();
-        for i in 0..600 {
+        let count: usize = std::env::var("ST_TEST_PACED_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+        for i in 0..count {
             unsafe {
                 enc.borrow_nv12(&frames[i % frames.len()]).unwrap();
                 let mut hw = ffi::av_frame_alloc();
@@ -953,7 +957,7 @@ mod tests {
             p(&mut encode, 50),
             p(&mut encode, 95),
             p(&mut encode, 99),
-            bytes as f64 * 8.0 / (540.0 * interval.as_secs_f64()) / 1e6
+            bytes as f64 * 8.0 / ((count - 60) as f64 * interval.as_secs_f64()) / 1e6
         );
     }
 

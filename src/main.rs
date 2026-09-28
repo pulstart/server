@@ -31,6 +31,8 @@ mod encode_win;
 mod file_transfer;
 #[cfg(target_os = "linux")]
 mod game_mode;
+#[cfg(target_os = "linux")]
+mod gpu_clock;
 mod input;
 #[cfg(target_os = "linux")]
 mod linux_uring;
@@ -1891,6 +1893,8 @@ fn run_shared_pipeline(
             capture::linux::probe_display_gpu_render_node()
         });
     #[cfg(target_os = "linux")]
+    let _clock_floor = gpu_clock::ClockFloor::engage(capture_render_hint.as_deref());
+    #[cfg(target_os = "linux")]
     let (config, mut encoder) = match select_linux_encoder(
         first_frame.width,
         first_frame.height,
@@ -2906,6 +2910,7 @@ fn encode_and_broadcast(
         broadcaster.broadcast(EncodedVideoFrame {
             data: nal.data,
             capture_micros: captured_micros,
+            encoded_micros: unix_time_micros(),
             source_seq: next_encoded_video_unit_seq(),
             is_recovery: nal.is_recovery,
             video_epoch,
@@ -3039,6 +3044,7 @@ fn encode_and_broadcast(
                 broadcaster.broadcast(EncodedVideoFrame {
                     data: nal.data,
                     capture_micros: captured_micros,
+                    encoded_micros: unix_time_micros(),
                     source_seq: next_encoded_video_unit_seq(),
                     is_recovery: nal.is_recovery,
                     video_epoch,
@@ -3091,7 +3097,7 @@ fn flush_pending_audio(
 
 /// Per-client unified transport: sends both video and audio on a single UDP socket.
 #[allow(clippy::too_many_arguments)]
-/// Hard cap→send latency ceiling (µs). When a queued video unit has been waiting
+/// Hard encode→send latency ceiling (µs). When a queued video unit has been waiting
 /// longer than this on the server, the path is bufferbloated faster than the
 /// bitrate controller can drain it; we stop replaying the stale backlog and jump
 /// to a fresh keyframe instead (bounds worst-case latency to one recovery on a
@@ -3111,19 +3117,19 @@ fn max_queue_latency_us() -> Option<u32> {
     }
 }
 
-/// Fold one sent unit's cap→send dwell into the published backlog EWMA and report
+/// Fold one sent unit's encode→send dwell into the published backlog EWMA and report
 /// whether its *instantaneous* dwell breached the hard latency ceiling (caller
 /// then drains to a recovery keyframe). Shared by both transport loops so the
 /// direct and punched paths stay identical.
 fn observe_send_backlog(
-    capture_micros: u64,
+    encoded_micros: u64,
     now_us: u64,
     ewma_us: &mut u32,
     seen: &mut bool,
     published: &AtomicU32,
     hard_ceiling_us: Option<u32>,
 ) -> bool {
-    let dwell = now_us.saturating_sub(capture_micros).min(u32::MAX as u64) as u32;
+    let dwell = now_us.saturating_sub(encoded_micros).min(u32::MAX as u64) as u32;
     *ewma_us = if *seen {
         ((*ewma_us as u64 * 7 + dwell as u64) / 8) as u32
     } else {
@@ -3167,7 +3173,7 @@ fn run_transport(
     audio_depth: Arc<AtomicU8>,
     // Auto-mode duplicate-FrameStart verdict from the DupFirstController.
     dup_first: Arc<AtomicBool>,
-    // Server-side cap→send backlog (µs, EWMA) published for the bitrate controller
+    // Server-side encode→send backlog (µs, EWMA) published for the bitrate controller
     // so it can react to WiFi bufferbloat that never shows up as packet loss.
     send_backlog_us: Arc<AtomicU32>,
     // B3: shared cell holding the client's current UDP media destination. The
@@ -3283,12 +3289,12 @@ fn run_transport(
                         .unwrap_or(0);
                     last_source_seq = Some(frame.source_seq);
 
-                    // Server-side cap→send latency for this unit; publish the EWMA
-                    // for the bitrate controller and trip a recovery drain if a
-                    // single unit has bloated past the hard ceiling (WiFi stall).
+                    // Server-side encode→send latency for this unit; publish the
+                    // EWMA for the bitrate controller and trip a recovery drain if
+                    // a single unit has bloated past the hard ceiling (WiFi stall).
                     let frame_now_us = unix_time_micros();
                     if observe_send_backlog(
-                        frame.capture_micros,
+                        frame.encoded_micros,
                         frame_now_us,
                         &mut backlog_ewma_us,
                         &mut backlog_seen,
@@ -3304,7 +3310,7 @@ fn run_transport(
                         }
                         if trace {
                             eprintln!(
-                                "[trace][server] cap→send backlog {}µs over ceiling for {addr}; draining to recovery keyframe",
+                                "[trace][server] encode→send backlog {}µs over ceiling for {addr}; draining to recovery keyframe",
                                 frame_now_us.saturating_sub(frame.capture_micros)
                             );
                         }
@@ -4228,7 +4234,7 @@ async fn handle_client(
     let mut dup_first_controller = adaptive_bitrate::DupFirstController::new();
     let dup_first_shared = Arc::new(AtomicBool::new(dup_first_controller.enabled()));
     let dup_first_transport = Arc::clone(&dup_first_shared);
-    // Server-side cap→send backlog (µs, EWMA) published by the transport loop and
+    // Server-side encode→send backlog (µs, EWMA) published by the transport loop and
     // read by the bitrate controller to react to WiFi bufferbloat (zero loss).
     let send_backlog_shared = Arc::new(AtomicU32::new(0));
     let send_backlog_transport = Arc::clone(&send_backlog_shared);
@@ -4427,7 +4433,7 @@ async fn handle_client(
                             // Duplicate-FrameStart A/B: keep it only while it helps.
                             let dup_on = dup_first_controller.apply_feedback(&feedback);
                             dup_first_shared.store(dup_on, Ordering::Relaxed);
-                            // Bufferbloat: feed the server-side cap→send backlog so
+                            // Bufferbloat: feed the server-side encode→send backlog so
                             // ABR can downshift on WiFi queue growth (zero loss).
                             let backlog_us = send_backlog_shared.load(Ordering::Relaxed);
                             bitrate_controller.note_send_backlog_us(backlog_us);
@@ -5327,7 +5333,7 @@ fn handle_punched_client(
     let mut dup_first_controller = adaptive_bitrate::DupFirstController::new();
     let dup_first_shared = Arc::new(AtomicBool::new(dup_first_controller.enabled()));
     let dup_first_transport = Arc::clone(&dup_first_shared);
-    // Server-side cap→send backlog (µs, EWMA) for bufferbloat-aware bitrate.
+    // Server-side encode→send backlog (µs, EWMA) for bufferbloat-aware bitrate.
     let send_backlog_shared = Arc::new(AtomicU32::new(0));
     let send_backlog_transport = Arc::clone(&send_backlog_shared);
     // Fixed configured redundancy is default; adaptation is explicit opt-in.
@@ -5481,7 +5487,7 @@ fn handle_punched_client(
                                 let dup_on = dup_first_controller.apply_feedback(&fb);
                                 dup_first_shared.store(dup_on, Ordering::Relaxed);
                             }
-                            // Bufferbloat: feed the server-side cap→send backlog.
+                            // Bufferbloat: feed the server-side encode→send backlog.
                             let backlog_us = send_backlog_shared.load(Ordering::Relaxed);
                             bitrate_controller.note_send_backlog_us(backlog_us);
                             bitrate_controller.note_encoder_kbps(rate_control.encoder_kbps());
@@ -5655,7 +5661,7 @@ fn run_punched_transport(
     audio_depth: Arc<AtomicU8>,
     // Auto-mode duplicate-FrameStart verdict from the DupFirstController.
     dup_first: Arc<AtomicBool>,
-    // Server-side cap→send backlog (µs, EWMA) for the bitrate controller.
+    // Server-side encode→send backlog (µs, EWMA) for the bitrate controller.
     send_backlog_us: Arc<AtomicU32>,
 ) {
     st_protocol::thread_priority::promote_current_thread(
@@ -5727,10 +5733,10 @@ fn run_punched_transport(
                         .unwrap_or(0);
                     last_source_seq = Some(frame.source_seq);
 
-                    // Server-side cap→send latency for this unit (see run_transport).
+                    // Server-side encode→send latency for this unit (see run_transport).
                     let frame_now_us = unix_time_micros();
                     if observe_send_backlog(
-                        frame.capture_micros,
+                        frame.encoded_micros,
                         frame_now_us,
                         &mut backlog_ewma_us,
                         &mut backlog_seen,
@@ -5746,7 +5752,7 @@ fn run_punched_transport(
                         }
                         if trace {
                             eprintln!(
-                                "[trace][server] punched cap→send backlog {}µs over ceiling; draining to recovery keyframe",
+                                "[trace][server] punched encode→send backlog {}µs over ceiling; draining to recovery keyframe",
                                 frame_now_us.saturating_sub(frame.capture_micros)
                             );
                         }
@@ -6105,7 +6111,10 @@ fn main() {
     disable_app_nap();
 
     #[cfg(target_os = "linux")]
-    probe_backends();
+    {
+        gpu_clock::release_stale();
+        probe_backends();
+    }
 
     let listen_port = configured_listen_port();
     let control = ServerControl::new();

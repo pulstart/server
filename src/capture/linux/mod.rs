@@ -219,6 +219,16 @@ impl PlatformCapture {
     }
 }
 
+/// Whether a render node (`/dev/dri/renderD128`) belongs to an NVIDIA GPU.
+pub fn is_nvidia_render_node(render_node: &str) -> bool {
+    std::path::Path::new(render_node)
+        .file_name()
+        .and_then(|name| {
+            std::fs::read_to_string(format!("/sys/class/drm/{}/device/vendor", name.to_str()?)).ok()
+        })
+        .is_some_and(|vendor| vendor.trim() == "0x10de")
+}
+
 /// Probe DRM cards to find the render node of the GPU driving the display.
 ///
 /// This is useful for PipeWire/Wayland capture where we don't directly open

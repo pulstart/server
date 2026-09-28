@@ -1019,8 +1019,12 @@ impl CaptureBackend for KmsCapture {
             let mut stabilizer = if copy_enabled {
                 match copy_render_node.as_deref() {
                     Some(node) => match KmsStabilizer::new(node) {
-                        Ok(s) => {
+                        Ok(mut s) => {
                             println!("[kms] GPU stabilizing copy enabled ({node})");
+                            // NVIDIA reads back through the copy engine.
+                            if super::is_nvidia_render_node(node) {
+                                s.prepare_copy_engine();
+                            }
                             Some(s)
                         }
                         Err(e) => {
