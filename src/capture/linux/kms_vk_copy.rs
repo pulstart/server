@@ -790,6 +790,7 @@ mod tests {
     /// Banded readback of a 1440p FP16 scanout-like buffer, idle and with the
     /// GPU saturated: latency and calling-thread CPU per frame.
     /// `ST_TEST_KMS_COPY=1 cargo test --release copy_engine_latency -- --nocapture`
+    /// (`ST_TEST_COPY_GAP_US=100000`: sparse frames find the GPU idle, ~9.6 ms)
     #[test]
     fn copy_engine_latency() {
         use crate::capture::linux::kms_gpu_copy::tests as kms;
@@ -806,6 +807,12 @@ mod tests {
         let src = kms::scanout_like_source(&stab, w, h, 0x4834_4241).expect("FP16 source");
         let plane = kms::source_plane(&src);
         let mut vk = VkReadback::new(&node).expect("copy engine");
+        let gap = Duration::from_micros(
+            std::env::var("ST_TEST_COPY_GAP_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6000),
+        );
         for loaded in [false, true] {
             let stop = Arc::new(AtomicBool::new(false));
             let load = loaded.then(|| kms::spawn_gpu_load(node.clone(), w, h, Arc::clone(&stop)));
@@ -820,7 +827,7 @@ mod tests {
                     .unwrap();
                 times.push(t.elapsed());
                 drop(frame);
-                std::thread::sleep(Duration::from_millis(6));
+                std::thread::sleep(gap);
             }
             let cpu = (kms::thread_cpu_time() - cpu) / 200;
             stop.store(true, Ordering::Relaxed);

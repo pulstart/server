@@ -458,10 +458,14 @@ pub struct EncodeLoadSample {
     /// delivered rate sags below it regardless of where the bottleneck is
     /// (KMS GPU-copy, capture, or encode).
     pub delivered_fps: f32,
-    /// Average encoder call time over the window (ms). Used only as an upward
-    /// guard — never step up if the encoder itself is already near budget.
+    /// Average encoder call time over the window (ms), for logs.
     pub avg_encode_ms: f32,
-    /// Fraction of frames whose end-to-end time exceeded the frame budget.
+    /// Fraction of the window the encoder was busy; the upward guard scales it
+    /// to the next rung. Per-frame time can't guard: frames sparse enough to
+    /// let the GPU idle encode ~3x slower (6 ms vs 2 ms at 1440p).
+    pub busy_ratio: f32,
+    /// Fraction of frames that overran the budget while a newer frame waited
+    /// behind them. A lone slow frame delays nothing.
     pub overrun_ratio: f32,
 }
 
@@ -489,13 +493,13 @@ impl EncodeRateTracker {
         }
     }
 
-    /// Record one encoded frame: its end-to-end time and the per-frame budget
-    /// (both microseconds). A frame counts as an overrun when it took longer
-    /// than the budget for the current target fps.
-    pub fn record(&mut self, encode_us: u64, budget_us: u64) {
+    /// Record one encoded frame: its time and the per-frame budget (both
+    /// microseconds), and whether a newer frame was already waiting when it
+    /// finished.
+    pub fn record(&mut self, encode_us: u64, budget_us: u64, frame_waiting: bool) {
         self.frames = self.frames.saturating_add(1);
         self.encode_us_sum = self.encode_us_sum.saturating_add(encode_us);
-        if budget_us > 0 && encode_us > budget_us {
+        if frame_waiting && encode_us > budget_us {
             self.overrun_frames = self.overrun_frames.saturating_add(1);
         }
     }
@@ -523,6 +527,7 @@ impl EncodeRateTracker {
             delivered_fps: self.frames.saturating_add(self.unchanged_capture_ticks) as f32
                 / elapsed,
             avg_encode_ms: (self.encode_us_sum as f32 / frames) / 1000.0,
+            busy_ratio: self.encode_us_sum as f32 / 1e6 / elapsed,
             overrun_ratio: self.overrun_frames as f32 / frames,
         };
         *self = Self::new(now);
@@ -576,9 +581,9 @@ impl AdaptiveFrameRate {
     const SEVERE_OVERRUN: f32 = 0.30;
     const SEVERE_DELIVER: f32 = 0.75;
     const BAD_WINDOWS_FOR_DOWN: u32 = 2;
-    /// Upward guard: only probe up with real encoder headroom and a near-full
-    /// delivered cadence at the current level.
-    const UP_ENCODE_HEADROOM: f32 = 0.65;
+    /// Upward guard: only probe up if the encoder would stay under this busy
+    /// fraction at the next rung, with a near-full delivered cadence.
+    const UP_BUSY_HEADROOM: f32 = 0.65;
     const UP_DELIVER_OK: f32 = 0.97;
 
     pub fn from_env(ceiling_fps: u32, now: Instant) -> Self {
@@ -721,22 +726,20 @@ impl AdaptiveFrameRate {
             self.up_failures = self.up_failures.saturating_sub(1);
         }
 
-        let budget_ms = 1000.0 / self.current_fps as f32;
-        let has_headroom = sample.avg_encode_ms < budget_ms * Self::UP_ENCODE_HEADROOM
+        let next = self.step_up()?;
+        let busy_at_next = sample.busy_ratio * next as f32 / self.current_fps as f32;
+        let has_headroom = busy_at_next < Self::UP_BUSY_HEADROOM
             && sample.delivered_fps >= self.current_fps as f32 * Self::UP_DELIVER_OK;
         if has_headroom
-            && self.current_fps < self.ceiling_fps
             && self.clean_windows >= Self::CLEAN_WINDOWS_FOR_UP
             && now >= self.up_backoff_until
             && now.duration_since(self.last_change) >= Self::UP_COOLDOWN
         {
-            if let Some(next) = self.step_up() {
-                self.current_fps = next;
-                self.last_change = now;
-                self.last_change_was_up = true;
-                self.clean_windows = 0;
-                return Some(next);
-            }
+            self.current_fps = next;
+            self.last_change = now;
+            self.last_change_was_up = true;
+            self.clean_windows = 0;
+            return Some(next);
         }
         None
     }
@@ -1741,10 +1744,12 @@ mod tests {
         assert!(d.apply_feedback_at(&frame_fb(60, 5), t));
     }
 
+    /// Continuous frames: the encoder is busy `delivered × encode` of the time.
     fn load(delivered_fps: f32, avg_encode_ms: f32, overrun_ratio: f32) -> EncodeLoadSample {
         EncodeLoadSample {
             delivered_fps,
             avg_encode_ms,
+            busy_ratio: delivered_fps * avg_encode_ms / 1000.0,
             overrun_ratio,
         }
     }
@@ -1913,7 +1918,7 @@ mod tests {
         let budget_us = 1_000_000 / 60;
         let mut tr = EncodeRateTracker::new(start);
         for _ in 0..60 {
-            tr.record(8_000, budget_us); // 8ms, within budget
+            tr.record(8_000, budget_us, true); // 8ms, within budget
         }
         // Window not yet elapsed.
         assert!(tr.take_sample(start + Duration::from_millis(500)).is_none());
@@ -1932,11 +1937,35 @@ mod tests {
         let start = Instant::now();
         let budget_us = 1_000_000 / 60;
         let mut tr = EncodeRateTracker::new(start);
-        for _ in 0..30 {
-            tr.record(25_000, budget_us); // 25ms > 16.6ms budget → overrun
+        for i in 0..30 {
+            // 25ms > 16.6ms budget; only the ones that held a frame back count.
+            tr.record(25_000, budget_us, i % 2 == 0);
         }
         let s = tr.take_sample(start + Duration::from_millis(1100)).unwrap();
-        assert_eq!(s.overrun_ratio, 1.0);
+        assert_eq!(s.overrun_ratio, 0.5);
+        assert!((s.busy_ratio - 0.68).abs() < 0.01);
+    }
+
+    #[test]
+    fn sparse_slow_frames_neither_step_down_nor_block_recovery() {
+        // Desktop repainting ~30 fps with the GPU idling between frames: each
+        // encode takes 9 ms (over the 8.3 ms budget at 120) but nothing waits.
+        let start = Instant::now();
+        let mut tracker = EncodeRateTracker::new(start);
+        let mut controller = AdaptiveFrameRate::with_enabled(true, 120, start);
+        controller.current_fps = 90;
+        let mut changes = Vec::new();
+        for tick in 1..=1200u64 {
+            let fps = controller.current_fps() as u64;
+            tracker.record(9_000, 1_000_000 / fps, false);
+            tracker.record_unchanged_capture_ticks(fps as u32 / 30 - 1);
+            let now = start + Duration::from_micros(tick * 33_333);
+            if let Some(sample) = tracker.take_sample(now) {
+                assert_eq!(sample.overrun_ratio, 0.0);
+                changes.extend(controller.apply_at(&sample, now));
+            }
+        }
+        assert_eq!(changes, [120], "probes back up to the ceiling and stays");
     }
 
     #[test]
@@ -1947,7 +1976,7 @@ mod tests {
         // KMS samples at 120 Hz but forwards just four keepalives per second.
         // Real encodes take 4.2 ms, as in the reported LAN degradation trace.
         for tick in 1..=240 {
-            tracker.record(4_200, 1_000_000 / 120);
+            tracker.record(4_200, 1_000_000 / 120, false);
             tracker.record_unchanged_capture_ticks(29);
             let now = start + Duration::from_millis(tick * 250);
             if let Some(sample) = tracker.take_sample(now) {
@@ -1965,7 +1994,7 @@ mod tests {
         let mut tracker = EncodeRateTracker::new(start);
         let mut controller = AdaptiveFrameRate::with_enabled(true, 120, start);
         for _ in 0..120 {
-            tracker.record(4_200, 1_000_000 / 120);
+            tracker.record(4_200, 1_000_000 / 120, false);
         }
         let now = start + Duration::from_secs(2);
         let sample = tracker.take_sample(now).unwrap();

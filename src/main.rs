@@ -2757,7 +2757,7 @@ fn run_shared_pipeline(
                 let now = Instant::now();
                 let encode_us = now.duration_since(encode_start).as_micros() as u64;
                 let budget_us = (1_000_000u64 / current_config.framerate.max(1) as u64).max(1);
-                frame_rate_tracker.record(encode_us, budget_us);
+                frame_rate_tracker.record(encode_us, budget_us, !frame_rx.is_empty());
                 #[cfg(target_os = "linux")]
                 frame_rate_tracker
                     .record_unchanged_capture_ticks(capture::take_unchanged_capture_ticks());
@@ -2770,12 +2770,13 @@ fn run_shared_pipeline(
                             new_config.framerate = new_fps;
                             let backend = encoder_backend(&encoder);
                             println!(
-                                "[adapt-fps] {} fps {} -> {} (delivered {:.0}, overrun {:.0}%, encode {:.1}ms{stages})",
+                                "[adapt-fps] {} fps {} -> {} (delivered {:.0}, overrun {:.0}%, busy {:.0}%, encode {:.1}ms{stages})",
                                 encoder_backend_name(backend),
                                 current_config.framerate,
                                 new_fps,
                                 sample.delivered_fps,
                                 sample.overrun_ratio * 100.0,
+                                sample.busy_ratio * 100.0,
                                 sample.avg_encode_ms,
                             );
                             // Slow capture immediately to stop overrunning; the

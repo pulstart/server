@@ -879,7 +879,14 @@ mod tests {
             )
         });
         let (mut upload, mut encode, mut bytes) = (Vec::new(), Vec::new(), 0usize);
-        let interval = Duration::from_micros(8333);
+        // Sparse pacing (e.g. 50000 = a desktop repainting at 20 fps) lets an
+        // otherwise idle GPU clock down between frames.
+        let interval = Duration::from_micros(
+            std::env::var("ST_TEST_PACED_INTERVAL_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8333),
+        );
         let mut next = Instant::now();
         for i in 0..600 {
             unsafe {
@@ -901,7 +908,11 @@ mod tests {
                 }
             }
             next += interval;
-            if let Some(wait) = next.checked_duration_since(Instant::now()) {
+            if std::env::var_os("ST_TEST_PACED_SPIN").is_some() {
+                while Instant::now() < next {
+                    std::hint::spin_loop();
+                }
+            } else if let Some(wait) = next.checked_duration_since(Instant::now()) {
                 std::thread::sleep(wait);
             }
         }
@@ -920,7 +931,7 @@ mod tests {
             p(&mut encode, 50),
             p(&mut encode, 95),
             p(&mut encode, 99),
-            bytes as f64 * 8.0 / (540.0 / 120.0) / 1e6
+            bytes as f64 * 8.0 / (540.0 * interval.as_secs_f64()) / 1e6
         );
     }
 

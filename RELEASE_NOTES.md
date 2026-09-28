@@ -11,6 +11,12 @@ Server-only release; no wire format change.
   and growing kernel memory.
 - Fix: a session started while the cursor was hidden (inside a game) never
   showed a remote cursor, even after leaving the game.
+- Fix: adaptive fps stepped a desktop session down to 90/60/48 fps. Frames
+  that arrive sparsely (typing, hovering) find the GPU idle and take ~3x
+  longer (encode 2 -> 6 ms, readback 2.5 -> 9.6 ms), which the controller
+  read as overload even though no frame was waiting. It now counts an
+  overrun only when a newer frame was held back by it, and judges headroom
+  for stepping up from encoder busy time.
 - Frame-rate step-down logs split the encode time into upload and encode.
   Capture overrun logs split cursor/scanout from copy time.
 

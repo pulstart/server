@@ -1426,6 +1426,7 @@ mod tests {
     /// latency and capture-thread CPU, idle and with the GPU saturated, and
     /// both paths must produce the same NV12.
     /// `ST_TEST_VULKAN_KMS=1 sudo -E <test-binary> live_readback_ab --nocapture`
+    /// (`ST_TEST_AB_GAP_US` spaces the frames)
     #[test]
     fn live_readback_ab() {
         use super::super::kms_gpu_copy::tests as kms;
@@ -1477,7 +1478,12 @@ mod tests {
                     let t = Instant::now();
                     drop(stabilize(stab));
                     times.push(t.elapsed());
-                    next += Duration::from_micros(8333);
+                    next += Duration::from_micros(
+                        std::env::var("ST_TEST_AB_GAP_US")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(8333),
+                    );
                     if let Some(wait) = next.checked_duration_since(Instant::now()) {
                         thread::sleep(wait);
                     }
