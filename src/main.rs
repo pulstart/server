@@ -5921,6 +5921,29 @@ fn trigger_screen_wake(control: &crate::server_control::ServerControl) {
 /// per-user agent; state goes to a root-owned dir. Each is only set if the user
 /// hasn't already overridden it, preserving the escape hatches.
 #[cfg(target_os = "linux")]
+/// App Nap throttles the timers and I/O of an app nobody is looking at; a
+/// streaming host must keep its capture/encode cadence regardless.
+#[cfg(target_os = "macos")]
+fn disable_app_nap() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    const USER_INITIATED_ALLOWING_IDLE_SLEEP: u64 = 0x00FF_FFFF & !(1 << 20);
+    const LATENCY_CRITICAL: u64 = 0xFF_0000_0000;
+    unsafe {
+        let reason: *mut AnyObject =
+            msg_send![class!(NSString), stringWithUTF8String: c"st-server streaming".as_ptr()];
+        let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        let activity: Option<Retained<AnyObject>> = msg_send![
+            info,
+            beginActivityWithOptions: USER_INITIATED_ALLOWING_IDLE_SLEEP | LATENCY_CRITICAL,
+            reason: reason
+        ];
+        // Held for the process lifetime; the activity ends when released.
+        std::mem::forget(activity);
+    }
+}
+
 fn apply_system_mode_env() {
     if std::env::var_os("ST_CAPTURE").is_none() {
         std::env::set_var("ST_CAPTURE", "kms");
@@ -5980,6 +6003,8 @@ fn main() {
     }
 
     st_protocol::thread_priority::init_process(true);
+    #[cfg(target_os = "macos")]
+    disable_app_nap();
 
     #[cfg(target_os = "linux")]
     probe_backends();

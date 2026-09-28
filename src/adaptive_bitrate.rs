@@ -627,6 +627,16 @@ impl AdaptiveFrameRate {
             .find(|&f| f < self.current_fps && f >= self.floor_fps)
     }
 
+    /// Largest rung below current that `delivered_fps` sustains; the floor
+    /// when nothing does.
+    fn step_down_to(&self, delivered_fps: f32) -> Option<u32> {
+        self.ladder
+            .iter()
+            .copied()
+            .find(|&f| f < self.current_fps && f as f32 <= delivered_fps)
+            .or_else(|| (self.floor_fps < self.current_fps).then_some(self.floor_fps))
+    }
+
     fn step_up(&self) -> Option<u32> {
         // Smallest ladder entry strictly above current, never past the ceiling.
         self.ladder
@@ -651,7 +661,14 @@ impl AdaptiveFrameRate {
             if now.duration_since(self.last_change) < Self::DOWN_COOLDOWN {
                 return None;
             }
-            let next = self.step_down()?;
+            // Capture-bound (frames arrive slowly, encoder keeps up): go straight
+            // to the rate the source delivers instead of paying an encoder
+            // rebuild and IDR per rung.
+            let next = if sample.overrun_ratio <= Self::OVERRUN_TRIP {
+                self.step_down_to(sample.delivered_fps)
+            } else {
+                self.step_down()
+            }?;
             // If we dropped right after probing up, that up-probe failed — back
             // the next attempt off exponentially so we settle.
             if self.last_change_was_up && now.duration_since(self.last_change) <= Self::PROBE_WINDOW
@@ -1600,10 +1617,20 @@ mod tests {
     fn adaptive_fps_steps_down_on_low_delivered() {
         let start = Instant::now();
         let mut afr = AdaptiveFrameRate::with_enabled(true, 120, start);
-        // 66 fps delivered at a 120 target — far under 0.92·120.
+        // 66 fps delivered at a 120 target — far under 0.92·120, and the
+        // encoder isn't overrunning: capture-bound, so jump to the rung 66
+        // sustains in one rebuild.
         let res = afr.apply_at(&load(66.0, 14.0, 0.0), start + Duration::from_secs(3));
-        assert_eq!(res, Some(90));
-        assert_eq!(afr.current_fps(), 90);
+        assert_eq!(res, Some(60));
+        assert_eq!(afr.current_fps(), 60);
+    }
+
+    #[test]
+    fn adaptive_fps_capture_bound_below_floor_goes_to_floor() {
+        let start = Instant::now();
+        let mut afr = AdaptiveFrameRate::with_enabled(true, 120, start);
+        let res = afr.apply_at(&load(12.0, 3.0, 0.0), start + Duration::from_secs(3));
+        assert_eq!(res, Some(30));
     }
 
     #[test]
@@ -1626,7 +1653,7 @@ mod tests {
             t += Duration::from_secs(3);
             afr.apply_at(&cap, t);
         }
-        // 120 -> 90 -> 60 (66 >= 0.92·60, so 60 sticks); never below.
+        // 120 -> 60 in one step (66 >= 0.92·60, so 60 sticks); never below.
         assert_eq!(afr.current_fps(), 60);
         // Further windows neither drop below 60 nor climb (no headroom).
         for _ in 0..5 {
@@ -1779,7 +1806,7 @@ mod tests {
         let now = start + Duration::from_secs(2);
         let sample = tracker.take_sample(now).unwrap();
         assert_eq!(sample.delivered_fps, 60.0);
-        assert_eq!(controller.apply_at(&sample, now), Some(90));
+        assert_eq!(controller.apply_at(&sample, now), Some(60));
     }
 
     #[test]

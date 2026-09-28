@@ -82,11 +82,15 @@ impl SCStreamOutputTrait for OutputHandler {
 
 pub struct PlatformCapture {
     stream: Option<SCStream>,
+    queue: Option<screencapturekit::dispatch_queue::DispatchQueue>,
 }
 
 impl PlatformCapture {
     pub fn new() -> Self {
-        Self { stream: None }
+        Self {
+            stream: None,
+            queue: None,
+        }
     }
 
     pub fn backend_name(&self) -> &'static str {
@@ -122,19 +126,27 @@ impl CaptureBackend for PlatformCapture {
             &config,
             ErrorHandler::new(|e| eprintln!("capture: stream error: {e:?}")),
         );
-        stream.add_output_handler(
+        // The default callback queue runs at default QoS and loses the CPU to
+        // a busy foreground app.
+        let queue = screencapturekit::dispatch_queue::DispatchQueue::new(
+            "st.capture",
+            screencapturekit::dispatch_queue::DispatchQoS::UserInteractive,
+        );
+        stream.add_output_handler_with_queue(
             OutputHandler {
                 tx,
                 cursor_tracker: Mutex::new(CursorTracker::new(display.frame())),
                 cursor_errors: AtomicUsize::new(0),
             },
             SCStreamOutputType::Screen,
+            Some(&queue),
         );
 
         stream
             .start_capture()
             .map_err(|e| format!("Failed to start capture: {e:?}"))?;
         self.stream = Some(stream);
+        self.queue = Some(queue);
         Ok(())
     }
 
@@ -142,6 +154,7 @@ impl CaptureBackend for PlatformCapture {
         if let Some(stream) = self.stream.take() {
             let _ = stream.stop_capture();
         }
+        self.queue = None;
     }
 }
 
