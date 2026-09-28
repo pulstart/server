@@ -585,6 +585,8 @@ impl AdaptiveFrameRate {
     /// fraction at the next rung, with a near-full delivered cadence.
     const UP_BUSY_HEADROOM: f32 = 0.65;
     const UP_DELIVER_OK: f32 = 0.97;
+    /// Busy fraction a rung chosen from the measured cost should stay under.
+    const DOWN_TARGET_BUSY: f32 = 0.80;
 
     pub fn from_env(ceiling_fps: u32, now: Instant) -> Self {
         Self::with_enabled(adaptive_fps_enabled_from_env(), ceiling_fps, now)
@@ -663,6 +665,27 @@ impl AdaptiveFrameRate {
             .or_else(|| (self.floor_fps < self.current_fps).then_some(self.floor_fps))
     }
 
+    /// Largest rung below current that the measured per-frame cost fits with
+    /// headroom. Stepping one rung when the next one still overruns costs an
+    /// encoder rebuild and IDR per rung (120 -> 90 -> 60 within 2 s live).
+    fn step_down_for(&self, encode_ms: f32) -> Option<u32> {
+        let one = self.step_down()?;
+        if encode_ms <= 0.0 {
+            return Some(one);
+        }
+        let fits = self
+            .ladder
+            .iter()
+            .copied()
+            .find(|&f| {
+                f < self.current_fps
+                    && f >= self.floor_fps
+                    && encode_ms * f as f32 / 1000.0 <= Self::DOWN_TARGET_BUSY
+            })
+            .unwrap_or(self.floor_fps);
+        Some(fits.min(one))
+    }
+
     fn step_up(&self) -> Option<u32> {
         // Smallest ladder entry strictly above current, never past the ceiling.
         self.ladder
@@ -698,7 +721,7 @@ impl AdaptiveFrameRate {
             let next = if sample.overrun_ratio <= Self::OVERRUN_TRIP {
                 self.step_down_to(sample.delivered_fps)
             } else {
-                self.step_down()
+                self.step_down_for(sample.avg_encode_ms)
             }?;
             // If we dropped right after probing up, that up-probe failed — back
             // the next attempt off exponentially so we settle.
@@ -1928,8 +1951,18 @@ mod tests {
     fn adaptive_fps_steps_down_on_overrun_even_if_delivered_ok() {
         let start = Instant::now();
         let mut afr = AdaptiveFrameRate::with_enabled(true, 120, start);
-        // Delivered looks fine, but most frames blew the budget — still drop.
+        // Delivered looks fine, but most frames blew the budget — still drop,
+        // straight to the rung the cost fits: 12 ms would overrun 90 (11.1 ms)
+        // and force a second rebuild.
         let res = afr.apply_at(&load(118.0, 12.0, 0.40), start + Duration::from_secs(3));
+        assert_eq!(res, Some(60));
+    }
+
+    #[test]
+    fn adaptive_fps_steps_one_rung_when_the_next_fits() {
+        let start = Instant::now();
+        let mut afr = AdaptiveFrameRate::with_enabled(true, 120, start);
+        let res = afr.apply_at(&load(100.0, 8.5, 0.40), start + Duration::from_secs(3));
         assert_eq!(res, Some(90));
     }
 

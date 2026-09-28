@@ -2,6 +2,11 @@
 
 Server-only release; no wire format change.
 
+- Fewer frame-rate flips under a game. When the encoder can't keep up, the
+  server now steps straight to the frame rate its measured cost fits instead
+  of one rung at a time: the live log showed 120 -> 90 -> 60 fps two seconds
+  apart, an encoder rebuild and keyframe for each, because 90 fps had the
+  same 10.5 ms per frame that already overran.
 - The bitrate climb is no longer undone by packets the client repaired. A
   probe was reverted (and the climb delayed 16-90 s) as soon as any packet in
   the window counted as lost, but the client counts packets it repaired from
