@@ -1676,6 +1676,9 @@ fn run_shared_pipeline(
     capture_cmd_rx: Receiver<CaptureCommand>,
     input_pipeline_owner: Arc<AtomicU64>,
 ) {
+    st_protocol::thread_priority::promote_current_thread(
+        st_protocol::thread_priority::ThreadRole::Video,
+    );
     let (frame_tx, mut frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
     // Capture-command processing (output switching) is only meaningful on the
     // KMS path (Linux); on other platforms drain-suppress the unused channel.
@@ -2784,10 +2787,10 @@ fn encode_and_broadcast(
         if let Some(cursor) = &frame.cursor {
             match &frame.data {
                 capture::FrameData::Ram(data) => {
-                    let mut composited = data.clone();
+                    let mut composited = data.to_vec();
                     capture::composite_cursor(&mut composited, frame.width, frame.height, cursor);
                     frame_with_cursor = capture::CapturedFrame {
-                        data: capture::FrameData::Ram(composited),
+                        data: capture::FrameData::Ram(composited.into()),
                         width: frame.width,
                         height: frame.height,
                         #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2809,7 +2812,7 @@ fn encode_and_broadcast(
                                 cursor,
                             );
                             frame_with_cursor = capture::CapturedFrame {
-                                data: capture::FrameData::Ram(composited),
+                                data: capture::FrameData::Ram(composited.into()),
                                 width: frame.width,
                                 height: frame.height,
                                 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2997,6 +3000,9 @@ fn run_transport(
     // changes; this loop repoints the send socket to match.
     media_dest: Arc<Mutex<SocketAddr>>,
 ) {
+    st_protocol::thread_priority::promote_current_thread(
+        st_protocol::thread_priority::ThreadRole::Network,
+    );
     let mut sender = match UdpSender::new(addr, crypto) {
         Ok(s) => s,
         Err(e) => {
@@ -5461,6 +5467,9 @@ fn run_punched_transport(
     // Server-side cap→send backlog (µs, EWMA) for the bitrate controller.
     send_backlog_us: Arc<AtomicU32>,
 ) {
+    st_protocol::thread_priority::promote_current_thread(
+        st_protocol::thread_priority::ThreadRole::Network,
+    );
     let peer = punched.peer();
     let mut sender = UdpSender::from_tunnel(punched);
     let trace = trace_enabled();
@@ -5876,6 +5885,8 @@ fn main() {
     if mode == RunMode::System {
         apply_system_mode_env();
     }
+
+    st_protocol::thread_priority::init_process(true);
 
     #[cfg(target_os = "linux")]
     probe_backends();

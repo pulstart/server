@@ -60,9 +60,84 @@ impl Drop for FrameLease {
     }
 }
 
+/// CPU frame bytes. Pooled buffers return to their [`RamPool`] on drop, so a
+/// multi-MB frame is recycled instead of reallocated and page-faulted per frame.
+pub struct RamBuf {
+    data: Vec<u8>,
+    recycle: Option<crossbeam_channel::Sender<Vec<u8>>>,
+}
+
+impl std::ops::Deref for RamBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for RamBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+}
+
+impl From<Vec<u8>> for RamBuf {
+    fn from(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            recycle: None,
+        }
+    }
+}
+
+impl Drop for RamBuf {
+    fn drop(&mut self) {
+        if let Some(recycle) = self.recycle.take() {
+            let _ = recycle.try_send(std::mem::take(&mut self.data));
+        }
+    }
+}
+
+/// Producer-side recycler for [`RamBuf`]s of one frame geometry.
+pub struct RamPool {
+    tx: crossbeam_channel::Sender<Vec<u8>>,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
+}
+
+impl Default for RamPool {
+    fn default() -> Self {
+        // Covers the capture queue plus the frame being encoded; extras drop.
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        Self { tx, rx }
+    }
+}
+
+impl RamPool {
+    /// A buffer of exactly `len` bytes with unspecified contents; the caller
+    /// overwrites all of it.
+    pub fn take(&self, len: usize) -> RamBuf {
+        let data = loop {
+            match self.rx.try_recv() {
+                Ok(data) if data.len() == len => break data,
+                Ok(_) => continue,
+                Err(_) => break vec![0u8; len],
+            }
+        };
+        RamBuf {
+            data,
+            recycle: Some(self.tx.clone()),
+        }
+    }
+
+    pub fn copy_from(&self, src: &[u8]) -> RamBuf {
+        let mut buf = self.take(src.len());
+        buf.copy_from_slice(src);
+        buf
+    }
+}
+
 /// Frame payload: either CPU-accessible bytes or GPU DMA-BUF planes.
 pub enum FrameData {
-    Ram(Vec<u8>),
+    Ram(RamBuf),
     #[cfg(target_os = "linux")]
     DmaBuf {
         planes: Vec<DmaBufPlane>,
@@ -202,7 +277,7 @@ pub fn try_clone_frame_to_ram_bgra(frame: &CapturedFrame) -> Result<Option<Vec<u
     const DRM_FORMAT_ARGB8888: u32 = 0x34325241;
 
     match &frame.data {
-        FrameData::Ram(data) => Ok(Some(data.clone())),
+        FrameData::Ram(data) => Ok(Some(data.to_vec())),
         FrameData::DmaBuf {
             planes, drm_format, ..
         } => {

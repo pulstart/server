@@ -1,5 +1,6 @@
 use super::{
     target_fps, CaptureBackend, CapturedCursor, CapturedFrame, D3D11FrameTexture, FrameData,
+    RamPool,
 };
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::{
@@ -20,9 +21,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetObjectW,
@@ -196,6 +197,9 @@ fn run_dxgi_capture_loop(
     tx: Sender<CapturedFrame>,
     running: Arc<AtomicBool>,
 ) {
+    st_protocol::thread_priority::promote_current_thread(
+        st_protocol::thread_priority::ThreadRole::Capture,
+    );
     let mut last_texture: Option<Weak<D3D11FrameTexture>> = None;
     let mut next_capture_at = Instant::now();
 
@@ -250,6 +254,9 @@ fn run_gdi_capture_loop(
     tx: Sender<CapturedFrame>,
     running: Arc<AtomicBool>,
 ) {
+    st_protocol::thread_priority::promote_current_thread(
+        st_protocol::thread_priority::ThreadRole::Capture,
+    );
     let mut target_interval = frame_interval();
     let mut next_metrics_check = Instant::now();
     let mut next_capture_at = Instant::now();
@@ -649,6 +656,7 @@ struct GdiCaptureSession {
     width: i32,
     height: i32,
     cursor: CursorCapture,
+    pool: RamPool,
 }
 
 unsafe impl Send for GdiCaptureSession {}
@@ -680,6 +688,7 @@ impl GdiCaptureSession {
                 width: 0,
                 height: 0,
                 cursor,
+                pool: RamPool::default(),
             };
             session.recreate_bitmap()?;
             Ok(session)
@@ -720,7 +729,9 @@ impl GdiCaptureSession {
             let len = (self.width as usize)
                 .saturating_mul(self.height as usize)
                 .saturating_mul(4);
-            let pixels = std::slice::from_raw_parts(self.bits as *const u8, len).to_vec();
+            let pixels = self
+                .pool
+                .copy_from(std::slice::from_raw_parts(self.bits as *const u8, len));
             let cursor = self.cursor.capture_cursor();
             Ok(CapturedFrame {
                 data: FrameData::Ram(pixels),
@@ -917,12 +928,72 @@ fn create_device_for_output(
             let _ = multithread.SetMultithreadProtected(true);
         }
     }
+    raise_gpu_priority(&device);
 
     println!(
         "[capture] DXGI device created at feature level 0x{:x}",
         feature_level.0
     );
     Ok((device, context))
+}
+
+/// Capture/convert/encode share this device; a game saturating the GPU must not
+/// starve it. Both calls need admin rights and are best-effort.
+fn raise_gpu_priority(device: &ID3D11Device) {
+    use std::sync::Once;
+    use windows::core::{s, w};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    const D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH: i32 = 4;
+    const D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME: i32 = 5;
+    const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+    type SetProcessSchedulingPriorityClass =
+        unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, i32) -> i32;
+    static PROCESS_CLASS: Once = Once::new();
+
+    if matches!(
+        std::env::var("ST_GPU_PRIO").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    ) {
+        return;
+    }
+    let Ok(dxgi) = device.cast::<IDXGIDevice>() else {
+        return;
+    };
+    PROCESS_CLASS.call_once(|| unsafe {
+        let vendor = dxgi
+            .GetAdapter()
+            .and_then(|adapter| adapter.GetDesc())
+            .map(|desc| desc.VendorId)
+            .unwrap_or(0);
+        // NVIDIA drivers can freeze NVENC under the realtime class (Sunshine/OBS).
+        let class = if vendor == NVIDIA_VENDOR_ID {
+            D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH
+        } else {
+            D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME
+        };
+        let set = LoadLibraryW(w!("gdi32.dll"))
+            .ok()
+            .and_then(|gdi32| GetProcAddress(gdi32, s!("D3DKMTSetProcessSchedulingPriorityClass")));
+        let status = match set {
+            Some(set) => std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                SetProcessSchedulingPriorityClass,
+            >(set)(GetCurrentProcess(), class),
+            None => -1,
+        };
+        if status == 0 {
+            println!("[capture] GPU scheduling class raised ({class})");
+        } else {
+            eprintln!(
+                "[capture] GPU scheduling class unchanged (status {status:#x}); run as administrator for load-resistant streaming"
+            );
+        }
+    });
+    unsafe {
+        let _ = dxgi.SetGPUThreadPriority(7);
+    }
 }
 
 fn rect_contains_point(rect: &RECT, x: i32, y: i32) -> bool {

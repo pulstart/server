@@ -188,8 +188,9 @@ EOF
 }
 
 # Root-only setup, bundled into one sudo block (creds cache after the first
-# prompt): the uinput udev rule, cap_sys_admin on the binary for dialog-free
-# KMS capture, and a path-unit that re-applies the cap after self-updates.
+# prompt): the uinput udev rule, cap_sys_admin + cap_sys_nice on the binary
+# (dialog-free KMS capture; realtime media threads and high GPU priority), and a
+# path-unit that re-applies the caps after self-updates.
 ensure_privileged_setup() {
     local bin="${PREFIX}/st-server"
     local run_user
@@ -236,8 +237,8 @@ EOF
         return
     fi
 
-    log "Granting cap_sys_admin to ${bin} (dialog-free KMS capture; needs sudo)"
-    sudo "$setcap_bin" cap_sys_admin+ep "$bin"
+    log "Granting cap_sys_admin,cap_sys_nice to ${bin} (dialog-free KMS capture, load-resistant scheduling; needs sudo)"
+    sudo "$setcap_bin" cap_sys_admin,cap_sys_nice+ep "$bin"
     log "  $(getcap "$bin" 2>/dev/null || echo 'getcap unavailable')"
 
     # Self-update (updater.rs) replaces the binary in place, which DROPS the
@@ -249,15 +250,15 @@ EOF
     log "Installing ${svc}.path so auto-updates keep the capability"
     sudo install -Dm0644 /dev/stdin "/etc/systemd/system/${svc}.service" <<EOF
 [Unit]
-Description=Re-apply cap_sys_admin to st-server after updates (${run_user})
+Description=Re-apply st-server capabilities after updates (${run_user})
 
 [Service]
 Type=oneshot
-ExecStart=${setcap_bin} cap_sys_admin+ep ${bin}
+ExecStart=${setcap_bin} cap_sys_admin,cap_sys_nice+ep ${bin}
 EOF
     sudo install -Dm0644 /dev/stdin "/etc/systemd/system/${svc}.path" <<EOF
 [Unit]
-Description=Watch st-server and re-apply cap_sys_admin on change (${run_user})
+Description=Watch st-server and re-apply its capabilities on change (${run_user})
 
 [Path]
 PathChanged=${bin}
@@ -479,10 +480,11 @@ ExecStart=${SYSTEM_PREFIX}/st-server --system
 Restart=on-failure
 RestartSec=2
 User=root
-# KMS PRIME-export of a compositor-owned scanout needs CAP_SYS_ADMIN. root
-# already holds it; declaring it documents the requirement and survives a
-# future switch to a non-root User=.
-AmbientCapabilities=CAP_SYS_ADMIN
+# KMS PRIME-export of a compositor-owned scanout needs CAP_SYS_ADMIN; realtime
+# media threads and high-priority GPU contexts need CAP_SYS_NICE. root already
+# holds both; declaring them documents the requirement and survives a future
+# switch to a non-root User=.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
 SupplementaryGroups=video render input
 # Force a specific backend only for debugging, e.g.:
 #   Environment=ST_CAPTURE=kms

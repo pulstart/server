@@ -943,6 +943,9 @@ impl CaptureBackend for KmsCapture {
         let copy_enabled = kms_copy_enabled();
 
         let handle = thread::spawn(move || {
+            st_protocol::thread_priority::promote_current_thread(
+                st_protocol::thread_priority::ThreadRole::Capture,
+            );
             let target_interval = target_frame_interval();
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;

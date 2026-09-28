@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-st-protocol = { path = "protocol", features = ["tunnel"] }
+st-protocol = { path = "protocol", features = ["tunnel", "rtkit"] }
 crossbeam-channel = "0.5"
 dirs = "5"
 sha2 = "0.10"
@@ -23,18 +23,10 @@ ureq = { version = "2", default-features = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
-ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
-ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avcodec", "avformat", "swscale"] }
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
+ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec", "avformat", "swscale"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Pin bitflags: 2.12.0 added a `#[flag_name]` attribute, so the bitflags! macro
-# now scans every flag's attributes. dispatch2 0.3.x's `dispatch_block_flags_t`
-# carries giant per-flag doc comments, and that scan recurses past the default
-# recursion_limit=128, breaking macOS builds (`recursion limit reached while
-# expanding $crate::__bitflags_flag_name!`). 2.11.0 is the last good version and
-# satisfies ffmpeg-next's ^2.11, so it unifies the whole tree. Remove once a fixed
-# bitflags ships or dispatch2 raises its own recursion_limit.
-bitflags = "=2.11.0"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSBitmapImageRep", "NSCursor", "NSImage", "NSImageRep"] }
 screencapturekit = "1.5"

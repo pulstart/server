@@ -388,7 +388,9 @@ pub fn run_encode_thread(
     running: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        crate::audio::set_realtime_priority("encode");
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Audio,
+        );
         let mut encoder = match OpusEncoder::new(&config) {
             Ok(e) => e,
             Err(e) => {

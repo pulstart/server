@@ -218,7 +218,9 @@ mod platform {
             let running = Arc::clone(&self.running);
             let device_clone = device.map(|d| d.to_string());
             let handle = thread::spawn(move || {
-                crate::audio::set_realtime_priority("capture");
+                st_protocol::thread_priority::promote_current_thread(
+                    st_protocol::thread_priority::ThreadRole::AudioCapture,
+                );
                 println!(
                     "[audio] Capture thread started ({channels}ch, {sample_rate}Hz, frame={samples_per_frame} samples)"
                 );
@@ -747,6 +749,9 @@ mod platform {
             let running = Arc::clone(&self.running);
             let (init_tx, init_rx) = std::sync::mpsc::channel();
             let handle = thread::spawn(move || {
+                st_protocol::thread_priority::promote_current_thread(
+                    st_protocol::thread_priority::ThreadRole::AudioCapture,
+                );
                 let mut init_sent = false;
                 while running.load(Ordering::SeqCst) {
                     match WasapiLoopbackSession::new(&config) {

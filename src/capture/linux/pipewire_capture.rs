@@ -1870,6 +1870,9 @@ impl CaptureBackend for PipeWireCapture {
         let (quit_tx, quit_rx) = pw::channel::channel();
 
         let handle = thread::spawn(move || {
+            st_protocol::thread_priority::promote_current_thread(
+                st_protocol::thread_priority::ThreadRole::Capture,
+            );
             let (mut screen_session, pw_fd, node_id, logical_width, logical_height, remote_session) =
                 match session {
                     EitherPortalSession::ScreenCast(mut session) => {
@@ -2258,7 +2261,7 @@ fn run_pipewire_stream(
                             info.height,
                         ) {
                             Ok(bytes) => Some(CapturedFrame {
-                                data: FrameData::Ram(bytes),
+                                data: FrameData::Ram(bytes.into()),
                                 width: info.width,
                                 height: info.height,
                                 cursor,
@@ -2280,7 +2283,7 @@ fn run_pipewire_stream(
                         info.height,
                     ) {
                         Ok(bytes) => Some(CapturedFrame {
-                            data: FrameData::Ram(bytes),
+                            data: FrameData::Ram(bytes.into()),
                             width: info.width,
                             height: info.height,
                             cursor,

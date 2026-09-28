@@ -1076,7 +1076,7 @@ mod tests {
         );
 
         let frame = CapturedFrame {
-            data: FrameData::Ram(vec![0x40u8; 640 * 480 * 4]),
+            data: FrameData::Ram(vec![0x40u8; 640 * 480 * 4].into()),
             width: 640,
             height: 480,
             cursor: None,
@@ -1130,7 +1130,7 @@ mod tests {
         assert!(enc.cuda_active(), "CUDA path should be active");
 
         let frame = CapturedFrame {
-            data: FrameData::Ram(data),
+            data: FrameData::Ram(data.into()),
             width: w,
             height: h,
             cursor: None,

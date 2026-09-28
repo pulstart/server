@@ -6,7 +6,7 @@
 ///
 /// NOTE: Does NOT work on XWayland — the root window doesn't contain Wayland desktop content.
 /// On Wayland, use wlr-screencopy (grim) or PipeWire instead.
-use super::super::{CaptureBackend, CapturedCursor, CapturedFrame, FrameData};
+use super::super::{CaptureBackend, CapturedCursor, CapturedFrame, FrameData, RamPool};
 use super::target_frame_interval;
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::{
@@ -340,7 +340,11 @@ impl CaptureBackend for X11Capture {
         };
 
         let handle = thread::spawn(move || {
+            st_protocol::thread_priority::promote_current_thread(
+                st_protocol::thread_priority::ThreadRole::Capture,
+            );
             let mut state = state;
+            let pool = RamPool::default();
             let target_interval = target_frame_interval();
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;
@@ -375,7 +379,7 @@ impl CaptureBackend for X11Capture {
                     };
 
                     let frame = CapturedFrame {
-                        data: FrameData::Ram(data.to_vec()),
+                        data: FrameData::Ram(pool.copy_from(data)),
                         width: state.width,
                         height: state.height,
                         cursor,

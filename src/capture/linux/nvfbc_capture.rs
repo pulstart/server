@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use super::super::{CaptureBackend, CapturedFrame, FrameData};
+use super::super::{CaptureBackend, CapturedFrame, FrameData, RamPool};
 use super::target_fps;
 use crossbeam_channel::{Sender, TrySendError};
 use libloading::Library;
@@ -589,7 +589,11 @@ impl CaptureBackend for NvfbcCapture {
         let wrapped_capturer = CapturerSendWrapper(capturer);
 
         let handle = thread::spawn(move || {
+            st_protocol::thread_priority::promote_current_thread(
+                st_protocol::thread_priority::ThreadRole::Capture,
+            );
             let mut capturer = wrapped_capturer.0;
+            let pool = RamPool::default();
             let trace = std::env::var_os("ST_TRACE").is_some();
             let skip_dup = nvfbc_skip_dup_enabled();
             let mut dropped_frames = 0usize;
@@ -626,7 +630,7 @@ impl CaptureBackend for NvfbcCapture {
                         }
                         last_forward = Some(Instant::now());
                         let frame = CapturedFrame {
-                            data: FrameData::Ram(frame_info.buffer.to_vec()),
+                            data: FrameData::Ram(pool.copy_from(frame_info.buffer)),
                             width: frame_info.width,
                             height: frame_info.height,
                             cursor: None,

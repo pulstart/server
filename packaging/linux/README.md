@@ -26,9 +26,11 @@ curl -fsSL https://raw.githubusercontent.com/pulstart/server/main/packaging/linu
 ```
 
 Do **not** run this as root. The script calls `sudo` only for the root
-steps: the `/dev/uinput` udev rule, granting `cap_sys_admin` to the binary
-(so Wayland KMS capture works **without the screen-share dialog**), and a
-small path-unit that re-applies that capability after self-updates.
+steps: the `/dev/uinput` udev rule, granting `cap_sys_admin` and
+`cap_sys_nice` to the binary (Wayland KMS capture **without the screen-share
+dialog**; realtime media threads and high GPU priority so host load doesn't
+stall the stream), and a small path-unit that re-applies them after
+self-updates.
 
 Useful env overrides:
 
@@ -50,10 +52,11 @@ sudo udevadm control --reload
 sudo udevadm trigger --subsystem-match=input
 sudo usermod -aG input "$USER"   # log out/in for this to take effect
 
-# 3. cap_sys_admin for dialog-free Wayland KMS capture (needs root).
-#    Without this the server falls back to the PipeWire portal (with its dialog).
+# 3. cap_sys_admin for dialog-free Wayland KMS capture, cap_sys_nice for
+#    load-resistant scheduling (needs root). Without cap_sys_admin the server
+#    falls back to the PipeWire portal (with its dialog).
 BIN=~/.local/share/st-server/st-server
-sudo setcap cap_sys_admin+ep "$BIN"
+sudo setcap cap_sys_admin,cap_sys_nice+ep "$BIN"
 #    Self-update replaces the binary and drops the cap, so re-apply it on
 #    change with a root path-unit (one-time install):
 sudo tee /etc/systemd/system/st-server-setcap-$USER.service >/dev/null <<EOF
@@ -61,7 +64,7 @@ sudo tee /etc/systemd/system/st-server-setcap-$USER.service >/dev/null <<EOF
 Description=Re-apply cap_sys_admin to st-server after updates ($USER)
 [Service]
 Type=oneshot
-ExecStart=$(command -v setcap) cap_sys_admin+ep $BIN
+ExecStart=$(command -v setcap) cap_sys_admin,cap_sys_nice+ep $BIN
 EOF
 sudo tee /etc/systemd/system/st-server-setcap-$USER.path >/dev/null <<EOF
 [Unit]

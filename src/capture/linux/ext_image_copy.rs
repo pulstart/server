@@ -384,6 +384,9 @@ impl CaptureBackend for ExtImageCopyCapture {
         let running = Arc::clone(&self.running);
 
         let handle = thread::spawn(move || {
+            st_protocol::thread_priority::promote_current_thread(
+                st_protocol::thread_priority::ThreadRole::Capture,
+            );
             if let Err(e) = run_capture_loop(tx, running) {
                 eprintln!("[ext-image-copy] Capture error: {e}");
             }
@@ -547,7 +550,7 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
 
         let pixels = buf.read_bgra();
         let captured = CapturedFrame {
-            data: FrameData::Ram(pixels),
+            data: FrameData::Ram(pixels.into()),
             width: buf.width,
             height: buf.height,
             cursor: None, // PAINT_CURSORS=1 embeds cursor into the frame

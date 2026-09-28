@@ -1175,6 +1175,9 @@ impl InputRuntime {
     }
 
     fn listen_loop(self: Arc<Self>, port: u16) {
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Input,
+        );
         let socket = match UdpSocket::bind(("0.0.0.0", port)) {
             Ok(socket) => socket,
             Err(err) => {

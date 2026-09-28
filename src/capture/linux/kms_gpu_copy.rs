@@ -25,7 +25,7 @@
 //! Surfaceless EGL/GLES2 on a gbm device; gbm is loaded dynamically (matching
 //! `gbm_probe`), EGL via `khronos-egl`, GL via `glow`.
 
-use super::super::{DmaBufPlane, FrameData, FrameLease, FrameLeaseOps};
+use super::super::{DmaBufPlane, FrameData, FrameLease, FrameLeaseOps, RamPool};
 use crossbeam_channel::{Receiver, Sender};
 use glow::HasContext as _;
 use khronos_egl as egl;
@@ -214,18 +214,294 @@ struct RingSlot {
 /// aliases. At 4K XRGB8888 each slot is ~33 MB (≈265 MB VRAM for 8).
 const RING_SLOTS: usize = 8;
 
-pub struct KmsStabilizer {
+// --- GPU completion wait ---------------------------------------------------
+
+const EGL_SYNC_NATIVE_FENCE_ANDROID: u32 = 0x3144;
+const EGL_NONE_INT: egl::Int = 0x3038;
+
+type CreateSyncKhr =
+    unsafe extern "system" fn(dpy: *mut c_void, ty: u32, attribs: *const egl::Int) -> *mut c_void;
+type DestroySyncKhr = unsafe extern "system" fn(dpy: *mut c_void, sync: *mut c_void) -> u32;
+type DupNativeFenceFd = unsafe extern "system" fn(dpy: *mut c_void, sync: *mut c_void) -> i32;
+
+/// Waits for submitted GL work by polling a sync_file. `glFinish` spins in
+/// `sched_yield` on NVIDIA, which on the realtime capture thread is a busy
+/// loop that starves whatever else shares the core.
+struct NativeFence {
+    create: CreateSyncKhr,
+    destroy: DestroySyncKhr,
+    dup: DupNativeFenceFd,
+}
+
+impl NativeFence {
+    fn load(egl: &egl::DynamicInstance<egl::EGL1_5>, extensions: &str) -> Option<Self> {
+        if !extensions.contains("EGL_KHR_fence_sync")
+            || !extensions.contains("EGL_ANDROID_native_fence_sync")
+        {
+            return None;
+        }
+        let create = egl.get_proc_address("eglCreateSyncKHR")?;
+        let destroy = egl.get_proc_address("eglDestroySyncKHR")?;
+        let dup = egl.get_proc_address("eglDupNativeFenceFDANDROID")?;
+        unsafe {
+            Some(Self {
+                create: std::mem::transmute::<extern "system" fn(), CreateSyncKhr>(create),
+                destroy: std::mem::transmute::<extern "system" fn(), DestroySyncKhr>(destroy),
+                dup: std::mem::transmute::<extern "system" fn(), DupNativeFenceFd>(dup),
+            })
+        }
+    }
+
+    /// Flush and block until all GL work submitted so far has completed.
+    /// `false` means no fence could be waited on; the caller must `glFinish`.
+    fn wait(&self, display: egl::Display, gl: &glow::Context) -> bool {
+        use std::os::fd::AsRawFd;
+        let dpy = display.as_ptr();
+        let attribs = [EGL_NONE_INT];
+        let sync = unsafe { (self.create)(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, attribs.as_ptr()) };
+        if sync.is_null() {
+            return false;
+        }
+        // The sync_file only materializes once the fence is flushed.
+        unsafe { gl.flush() };
+        let raw = unsafe { (self.dup)(dpy, sync) };
+        unsafe { (self.destroy)(dpy, sync) };
+        if raw < 0 {
+            return false;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            match unsafe { libc::poll(&mut pfd, 1, 1000) } {
+                n if n > 0 => return true,
+                n if n < 0
+                    && std::io::Error::last_os_error().kind()
+                        == std::io::ErrorKind::Interrupted => {}
+                _ => return false,
+            }
+        }
+    }
+}
+
+// --- EGL context -----------------------------------------------------------
+
+const EGL_CONTEXT_PRIORITY_LEVEL_IMG: egl::Int = 0x3100;
+const EGL_CONTEXT_PRIORITY_HIGH_IMG: egl::Int = 0x3101;
+
+/// `ST_GPU_PRIO=0` (`false`/`no`/`off`) keeps the copy context at default GPU
+/// priority.
+fn gpu_priority_enabled() -> bool {
+    !matches!(
+        std::env::var("ST_GPU_PRIO").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    )
+}
+
+/// Surfaceless EGL/GLES context on a gbm render-node device.
+struct Gles {
     gbm: GbmLib,
     gbm_device: *mut c_void,
-    /// fd backing the gbm device. gbm does not take ownership, so we keep it
-    /// open for the device's lifetime and close it in `Drop` *after*
-    /// `gbm_device_destroy`.
+    /// gbm does not own the fd; closed in `Drop` after `gbm_device_destroy`.
     device_fd: libc::c_int,
     egl: egl::DynamicInstance<egl::EGL1_5>,
     display: egl::Display,
     context: egl::Context,
     gl: glow::Context,
     image_target_texture_2d: ImageTargetTexture2DOes,
+    fence: Option<NativeFence>,
+    es3: bool,
+    high_priority: bool,
+}
+
+impl Gles {
+    /// `high_priority` requests `EGL_IMG_context_priority` HIGH so a game
+    /// saturating the GPU cannot queue ahead of the capture copy. amdgpu/i915
+    /// grant it with `CAP_SYS_NICE`; otherwise the driver silently keeps MEDIUM.
+    fn new(render_node: &str, high_priority: bool) -> Result<Self, String> {
+        let gbm = GbmLib::load()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(render_node)
+            .map_err(|e| format!("open {render_node}: {e}"))?;
+        let fd = {
+            use std::os::fd::IntoRawFd;
+            file.into_raw_fd()
+        };
+        let gbm_device = unsafe { (gbm.create_device)(fd) };
+        if gbm_device.is_null() {
+            unsafe { libc::close(fd) };
+            return Err("gbm_create_device failed".into());
+        }
+        match Self::init_egl(gbm_device, high_priority) {
+            Ok((egl, display, context, gl, image_target_texture_2d, fence, es3, high)) => {
+                Ok(Self {
+                    gbm,
+                    gbm_device,
+                    device_fd: fd,
+                    egl,
+                    display,
+                    context,
+                    gl,
+                    image_target_texture_2d,
+                    fence,
+                    es3,
+                    high_priority: high,
+                })
+            }
+            Err(e) => {
+                unsafe { (gbm.device_destroy)(gbm_device) };
+                unsafe { libc::close(fd) };
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn init_egl(
+        gbm_device: *mut c_void,
+        high_priority: bool,
+    ) -> Result<
+        (
+            egl::DynamicInstance<egl::EGL1_5>,
+            egl::Display,
+            egl::Context,
+            glow::Context,
+            ImageTargetTexture2DOes,
+            Option<NativeFence>,
+            bool,
+            bool,
+        ),
+        String,
+    > {
+        let egl = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
+            .map_err(|e| format!("load libEGL: {e:?}"))?;
+        let display = unsafe {
+            egl.get_platform_display(EGL_PLATFORM_GBM_KHR, gbm_device, &[egl::ATTRIB_NONE])
+        }
+        .map_err(|e| format!("eglGetPlatformDisplay(GBM): {e:?}"))?;
+        egl.initialize(display)
+            .map_err(|e| format!("eglInitialize: {e:?}"))?;
+        let extensions = egl
+            .query_string(Some(display), egl::EXTENSIONS)
+            .map_err(|e| format!("eglQueryString(EXTENSIONS): {e:?}"))?
+            .to_string_lossy()
+            .into_owned();
+        for required in [
+            "EGL_EXT_image_dma_buf_import",
+            "EGL_KHR_surfaceless_context",
+        ] {
+            if !extensions.contains(required) {
+                return Err(format!("{required} not available"));
+            }
+        }
+        egl.bind_api(egl::OPENGL_ES_API)
+            .map_err(|e| format!("eglBindAPI: {e:?}"))?;
+
+        let config_for = |renderable: egl::Int| {
+            egl.choose_first_config(
+                display,
+                &[
+                    egl::SURFACE_TYPE,
+                    egl::PBUFFER_BIT,
+                    egl::RENDERABLE_TYPE,
+                    renderable,
+                    egl::NONE,
+                ],
+            )
+            .ok()
+            .flatten()
+        };
+        let want_high = high_priority && extensions.contains("EGL_IMG_context_priority");
+        // ES3 enables PBO readback; ES2 is the floor.
+        let attempts = [(3, true), (3, false), (2, true), (2, false)];
+        let (context, version) = attempts
+            .iter()
+            .filter(|(_, high)| want_high || !high)
+            .find_map(|&(version, high)| {
+                let config = config_for(if version == 3 {
+                    egl::OPENGL_ES3_BIT
+                } else {
+                    egl::OPENGL_ES2_BIT
+                })?;
+                let mut attrs = vec![egl::CONTEXT_CLIENT_VERSION, version];
+                if high {
+                    attrs.extend([
+                        EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                        EGL_CONTEXT_PRIORITY_HIGH_IMG,
+                    ]);
+                }
+                attrs.push(egl::NONE);
+                egl.create_context(display, config, None, &attrs)
+                    .ok()
+                    .map(|context| (context, version))
+            })
+            .ok_or_else(|| "eglCreateContext failed".to_string())?;
+        let high = want_high
+            && egl
+                .query_context(display, context, EGL_CONTEXT_PRIORITY_LEVEL_IMG)
+                .is_ok_and(|level| level == EGL_CONTEXT_PRIORITY_HIGH_IMG);
+
+        egl.make_current(display, None, None, Some(context))
+            .map_err(|e| format!("eglMakeCurrent(surfaceless): {e:?}"))?;
+        let gl = unsafe {
+            glow::Context::from_loader_function(|name| match egl.get_proc_address(name) {
+                Some(ptr) => ptr as *const c_void,
+                None => std::ptr::null(),
+            })
+        };
+        if !gl.supported_extensions().contains("GL_OES_EGL_image") {
+            return Err("GL_OES_EGL_image not available".into());
+        }
+        let image_target_texture_2d: ImageTargetTexture2DOes = unsafe {
+            std::mem::transmute::<extern "system" fn(), ImageTargetTexture2DOes>(
+                egl.get_proc_address("glEGLImageTargetTexture2DOES")
+                    .ok_or_else(|| "glEGLImageTargetTexture2DOES unavailable".to_string())?,
+            )
+        };
+        let es3 = version >= 3 && gl.version().major >= 3;
+        let fence = NativeFence::load(&egl, &extensions);
+        Ok((
+            egl,
+            display,
+            context,
+            gl,
+            image_target_texture_2d,
+            fence,
+            es3,
+            high,
+        ))
+    }
+
+    fn wait_gpu(&self) {
+        if !self
+            .fence
+            .as_ref()
+            .is_some_and(|fence| fence.wait(self.display, &self.gl))
+        {
+            unsafe { self.gl.finish() };
+        }
+    }
+}
+
+impl Drop for Gles {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.egl.make_current(self.display, None, None, None);
+            let _ = self.egl.destroy_context(self.display, self.context);
+            let _ = self.egl.terminate(self.display);
+            (self.gbm.device_destroy)(self.gbm_device);
+            libc::close(self.device_fd);
+        }
+    }
+}
+
+pub struct KmsStabilizer {
+    gles: Gles,
     program: glow::Program,
     vbo: glow::Buffer,
     src_texture: glow::Texture,
@@ -237,6 +513,7 @@ pub struct KmsStabilizer {
     // gbm can't export a CPU/encoder-readable linear DMA-BUF (NVIDIA's gbm
     // rejects `gbm_bo_create` with `GBM_BO_USE_LINEAR` for renderable targets).
     ram_target: Option<RamTarget>,
+    ram_pool: RamPool,
     ram_mode: bool,
     logged_ram_fallback: bool,
     width: u32,
@@ -245,10 +522,13 @@ pub struct KmsStabilizer {
 
 /// glReadPixels fallback render target: a normal RGBA8 GL texture + FBO, not a
 /// gbm/DMA-BUF buffer. The blit renders into it and the result is read back to a
-/// CPU `Vec` (`FrameData::Ram`). Used where DMA-BUF export is unavailable.
+/// CPU buffer (`FrameData::Ram`). Used where DMA-BUF export is unavailable.
 struct RamTarget {
     texture: glow::Texture,
     framebuffer: glow::Framebuffer,
+    /// ES3 pack buffer: readback is queued behind the blit and waited on with
+    /// the same fence instead of stalling inside `glReadPixels`.
+    pbo: Option<glow::Buffer>,
 }
 
 impl KmsStabilizer {
@@ -256,134 +536,35 @@ impl KmsStabilizer {
     /// extensions required for zero-copy import/export. Returns `Err` (and the
     /// caller falls back to the direct path) if anything is unavailable.
     pub fn new(render_node: &str) -> Result<Self, String> {
-        let gbm = GbmLib::load()?;
-
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(render_node)
-            .map_err(|e| format!("open {render_node}: {e}"))?;
-        // gbm takes ownership of the fd for the device's lifetime; leak the
-        // File into a raw fd held alongside the device and closed on Drop.
-        let fd = {
-            use std::os::fd::IntoRawFd;
-            file.into_raw_fd()
-        };
-        let gbm_device = unsafe { (gbm.create_device)(fd) };
-        if gbm_device.is_null() {
-            unsafe { libc::close(fd) };
-            return Err("gbm_create_device failed".into());
-        }
+        let gles = Gles::new(render_node, gpu_priority_enabled())?;
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            println!(
+                "[kms] GPU copy context: priority={} wait={} readback={}",
+                if gles.high_priority {
+                    "high"
+                } else {
+                    "default"
+                },
+                if gles.fence.is_some() {
+                    "sync_file"
+                } else {
+                    "glFinish"
+                },
+                if gles.es3 { "pbo" } else { "direct" },
+            );
+        });
 
         // GL FBO origin is bottom-left while scanout memory is top-down; flip
         // the sampled Y so the copied buffer keeps the source's row order.
         // `ST_KMS_COPY_FLIP=0` disables it if a driver already matches.
         let flip_y = !matches!(std::env::var("ST_KMS_COPY_FLIP").as_deref(), Ok("0"));
-
-        let setup = (|| -> Result<_, String> {
-            let egl = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
-                .map_err(|e| format!("load libEGL: {e:?}"))?;
-
-            let display = unsafe {
-                egl.get_platform_display(EGL_PLATFORM_GBM_KHR, gbm_device, &[egl::ATTRIB_NONE])
-            }
-            .map_err(|e| format!("eglGetPlatformDisplay(GBM): {e:?}"))?;
-
-            egl.initialize(display)
-                .map_err(|e| format!("eglInitialize: {e:?}"))?;
-
-            let extensions = egl
-                .query_string(Some(display), egl::EXTENSIONS)
-                .map_err(|e| format!("eglQueryString(EXTENSIONS): {e:?}"))?
-                .to_string_lossy()
-                .into_owned();
-            for required in [
-                "EGL_EXT_image_dma_buf_import",
-                "EGL_KHR_surfaceless_context",
-            ] {
-                if !extensions.contains(required) {
-                    return Err(format!("{required} not available"));
-                }
-            }
-
-            egl.bind_api(egl::OPENGL_ES_API)
-                .map_err(|e| format!("eglBindAPI: {e:?}"))?;
-
-            let config = egl
-                .choose_first_config(
-                    display,
-                    &[
-                        egl::SURFACE_TYPE,
-                        egl::PBUFFER_BIT,
-                        egl::RENDERABLE_TYPE,
-                        egl::OPENGL_ES2_BIT,
-                        egl::NONE,
-                    ],
-                )
-                .map_err(|e| format!("eglChooseConfig: {e:?}"))?
-                .ok_or_else(|| "no suitable EGL config".to_string())?;
-
-            let context = egl
-                .create_context(
-                    display,
-                    config,
-                    None,
-                    &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE],
-                )
-                .map_err(|e| format!("eglCreateContext: {e:?}"))?;
-
-            egl.make_current(display, None, None, Some(context))
-                .map_err(|e| format!("eglMakeCurrent(surfaceless): {e:?}"))?;
-
-            let gl = unsafe {
-                glow::Context::from_loader_function(|name| match egl.get_proc_address(name) {
-                    Some(ptr) => ptr as *const c_void,
-                    None => std::ptr::null(),
-                })
-            };
-
-            if !gl.supported_extensions().contains("GL_OES_EGL_image") {
-                return Err("GL_OES_EGL_image not available".into());
-            }
-            let image_target_texture_2d: ImageTargetTexture2DOes = unsafe {
-                std::mem::transmute::<extern "system" fn(), ImageTargetTexture2DOes>(
-                    egl.get_proc_address("glEGLImageTargetTexture2DOES")
-                        .ok_or_else(|| "glEGLImageTargetTexture2DOES unavailable".to_string())?,
-                )
-            };
-
-            Ok((egl, display, context, gl, image_target_texture_2d))
-        })();
-
-        let (egl, display, context, gl, image_target_texture_2d) = match setup {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe { (gbm.device_destroy)(gbm_device) };
-                unsafe { libc::close(fd) };
-                return Err(e);
-            }
-        };
-
-        let (program, vbo, src_texture) = match build_gl_program(&gl, flip_y) {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe { (gbm.device_destroy)(gbm_device) };
-                unsafe { libc::close(fd) };
-                return Err(e);
-            }
-        };
-        let swap_rb_uniform = unsafe { gl.get_uniform_location(program, "u_swap_rb") };
-        let flip_y_uniform = unsafe { gl.get_uniform_location(program, "u_flip_y") };
+        let (program, vbo, src_texture) = build_gl_program(&gles.gl, flip_y)?;
+        let swap_rb_uniform = unsafe { gles.gl.get_uniform_location(program, "u_swap_rb") };
+        let flip_y_uniform = unsafe { gles.gl.get_uniform_location(program, "u_flip_y") };
 
         Ok(Self {
-            gbm,
-            gbm_device,
-            device_fd: fd,
-            egl,
-            display,
-            context,
-            gl,
-            image_target_texture_2d,
+            gles,
             program,
             vbo,
             src_texture,
@@ -392,6 +573,7 @@ impl KmsStabilizer {
             pool: SlotPool::new(RING_SLOTS),
             slots: Vec::new(),
             ram_target: None,
+            ram_pool: RamPool::default(),
             ram_mode: false,
             logged_ram_fallback: false,
             width: 0,
@@ -427,11 +609,19 @@ impl KmsStabilizer {
             .ok_or_else(|| "all stabilizer ring slots in-flight".to_string())?;
 
         let fbo = self.slots[idx].framebuffer;
-        let result = self.blit_to_fbo(fbo, &src_planes[0], drm_format, width, height, false);
+        let result = self
+            .draw_blit(fbo, &src_planes[0], drm_format, width, height, false)
+            .map(|src_image| {
+                // Barrier: the copy must be finished on the GPU before we return,
+                // so the caller can let KWin overwrite the source and so the
+                // encoder reads completed pixels.
+                self.gles.wait_gpu();
+                let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
+            });
         match result {
             Ok(()) => {
                 let slot = &self.slots[idx];
-                let raw_fd = unsafe { (self.gbm.bo_get_fd)(slot.bo) };
+                let raw_fd = unsafe { (self.gles.gbm.bo_get_fd)(slot.bo) };
                 if raw_fd < 0 {
                     // Reclaim the slot immediately — nothing left the building.
                     self.pool.in_use[idx] = false;
@@ -458,11 +648,9 @@ impl KmsStabilizer {
         }
     }
 
-    /// glReadPixels fallback: blit the source into the plain GL FBO and read it
-    /// back to a CPU `Vec` as BGRA. Used when gbm can't export a linear DMA-BUF
-    /// (NVIDIA). No ring/lease: the GL target frees the instant readback returns
-    /// (`glReadPixels` after the blit's `glFinish` is synchronous), and the `Vec`
-    /// owns the pixels handed to the encoder.
+    /// Readback fallback: blit the source into the plain GL FBO and read it
+    /// back as BGRA into a pooled buffer. Used when gbm can't export a linear
+    /// DMA-BUF (NVIDIA).
     fn stabilize_ram(
         &mut self,
         src: &DmaBufPlane,
@@ -470,33 +658,76 @@ impl KmsStabilizer {
         width: u32,
         height: u32,
     ) -> Result<FrameData, String> {
-        let fbo = self
+        let target = self
             .ram_target
             .as_ref()
-            .ok_or("RAM stabilizer target missing")?
-            .framebuffer;
-        self.blit_to_fbo(fbo, src, drm_format, width, height, true)?;
+            .ok_or("RAM stabilizer target missing")?;
+        let (fbo, pbo) = (target.framebuffer, target.pbo);
+        let src_image = self.draw_blit(fbo, src, drm_format, width, height, true)?;
 
-        let mut buf = vec![0u8; width as usize * height as usize * 4];
-        let gl = &self.gl;
-        unsafe {
+        let len = width as usize * height as usize * 4;
+        let gl = &self.gles.gl;
+        let result = unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-            gl.read_pixels(
-                0,
-                0,
-                width as i32,
-                height as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut buf)),
-            );
+            let result = match pbo {
+                Some(pbo) => {
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo));
+                    gl.read_pixels(
+                        0,
+                        0,
+                        width as i32,
+                        height as i32,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::BufferOffset(0),
+                    );
+                    self.gles.wait_gpu();
+                    let ptr = gl.map_buffer_range(
+                        glow::PIXEL_PACK_BUFFER,
+                        0,
+                        len as i32,
+                        glow::MAP_READ_BIT,
+                    );
+                    let result = if ptr.is_null() {
+                        Err("map readback buffer failed".to_string())
+                    } else {
+                        let buf = self
+                            .ram_pool
+                            .copy_from(std::slice::from_raw_parts(ptr, len));
+                        gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+                        Ok(buf)
+                    };
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                    result
+                }
+                None => {
+                    // Settle the blit first so glReadPixels only waits on its
+                    // own transfer.
+                    self.gles.wait_gpu();
+                    let mut buf = self.ram_pool.take(len);
+                    gl.read_pixels(
+                        0,
+                        0,
+                        width as i32,
+                        height as i32,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut buf)),
+                    );
+                    Ok(buf)
+                }
+            };
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
-        Ok(FrameData::Ram(buf))
+            result
+        };
+        let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
+        result.map(FrameData::Ram)
     }
 
-    fn blit_to_fbo(
+    /// Queue the source→`fbo` blit. Returns the imported source image, which
+    /// the caller destroys once the GPU has finished with it.
+    fn draw_blit(
         &mut self,
         fbo: glow::Framebuffer,
         src: &DmaBufPlane,
@@ -504,14 +735,14 @@ impl KmsStabilizer {
         width: u32,
         height: u32,
         ram: bool,
-    ) -> Result<(), String> {
+    ) -> Result<egl::Image, String> {
         let src_fd = {
             use std::os::fd::AsRawFd;
             src.fd.as_raw_fd()
         };
         let src_image = create_dmabuf_image(
-            &self.egl,
-            self.display,
+            &self.gles.egl,
+            self.gles.display,
             drm_format,
             width,
             height,
@@ -521,16 +752,19 @@ impl KmsStabilizer {
             src.modifier,
         )?;
 
-        let gl = &self.gl;
+        let gl = &self.gles.gl;
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.src_texture));
-            (self.image_target_texture_2d)(glow::TEXTURE_2D, src_image.as_ptr() as *const c_void);
+            (self.gles.image_target_texture_2d)(
+                glow::TEXTURE_2D,
+                src_image.as_ptr() as *const c_void,
+            );
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.bind_texture(glow::TEXTURE_2D, None);
-                let _ = self.egl.destroy_image(self.display, src_image);
+                let _ = self.gles.egl.destroy_image(self.gles.display, src_image);
                 return Err("stabilizer FBO incomplete".into());
             }
             gl.viewport(0, 0, width as i32, height as i32);
@@ -557,19 +791,12 @@ impl KmsStabilizer {
             gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 16, 8);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
-            // Barrier: the copy must be finished on the GPU before we return,
-            // so the caller can let KWin overwrite the source and so the
-            // encoder reads completed pixels.
-            gl.finish();
-
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
-
-        let _ = self.egl.destroy_image(self.display, src_image);
-        Ok(())
+        Ok(src_image)
     }
 
     fn ensure_targets(&mut self, width: u32, height: u32) -> Result<(), String> {
@@ -636,7 +863,7 @@ impl KmsStabilizer {
     }
 
     fn create_ram_target(&self, width: u32, height: u32) -> Result<RamTarget, String> {
-        let gl = &self.gl;
+        let gl = &self.gles.gl;
         unsafe {
             let texture = gl
                 .create_texture()
@@ -683,17 +910,31 @@ impl KmsStabilizer {
                 gl.delete_texture(texture);
                 return Err(format!("ram FBO incomplete (status {status:#x})"));
             }
+            let pbo = if self.gles.es3 {
+                gl.create_buffer().ok().inspect(|&pbo| {
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo));
+                    gl.buffer_data_size(
+                        glow::PIXEL_PACK_BUFFER,
+                        (width * height * 4) as i32,
+                        glow::STREAM_READ,
+                    );
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                })
+            } else {
+                None
+            };
             Ok(RamTarget {
                 texture,
                 framebuffer,
+                pbo,
             })
         }
     }
 
     fn create_slot(&self, width: u32, height: u32) -> Result<RingSlot, String> {
         let bo = unsafe {
-            (self.gbm.bo_create)(
-                self.gbm_device,
+            (self.gles.gbm.bo_create)(
+                self.gles.gbm_device,
                 width,
                 height,
                 OUTPUT_DRM_FORMAT,
@@ -703,21 +944,21 @@ impl KmsStabilizer {
         if bo.is_null() {
             return Err("gbm_bo_create(linear target) failed".into());
         }
-        let stride = unsafe { (self.gbm.bo_get_stride)(bo) };
-        let offset = unsafe { (self.gbm.bo_get_offset)(bo, 0) };
-        let mut modifier = unsafe { (self.gbm.bo_get_modifier)(bo) };
+        let stride = unsafe { (self.gles.gbm.bo_get_stride)(bo) };
+        let offset = unsafe { (self.gles.gbm.bo_get_offset)(bo, 0) };
+        let mut modifier = unsafe { (self.gles.gbm.bo_get_modifier)(bo) };
         if modifier == DRM_FORMAT_MOD_INVALID {
             modifier = DRM_FORMAT_MOD_LINEAR;
         }
-        let import_fd = unsafe { (self.gbm.bo_get_fd)(bo) };
+        let import_fd = unsafe { (self.gles.gbm.bo_get_fd)(bo) };
         if import_fd < 0 {
-            unsafe { (self.gbm.bo_destroy)(bo) };
+            unsafe { (self.gles.gbm.bo_destroy)(bo) };
             return Err("gbm_bo_get_fd(target) failed".into());
         }
         // EGL dups the fd it imports; close ours once the image is created.
         let image = create_dmabuf_image(
-            &self.egl,
-            self.display,
+            &self.gles.egl,
+            self.gles.display,
             OUTPUT_DRM_FORMAT,
             width,
             height,
@@ -730,12 +971,12 @@ impl KmsStabilizer {
         let image = match image {
             Ok(img) => img,
             Err(e) => {
-                unsafe { (self.gbm.bo_destroy)(bo) };
+                unsafe { (self.gles.gbm.bo_destroy)(bo) };
                 return Err(e);
             }
         };
 
-        let gl = &self.gl;
+        let gl = &self.gles.gl;
         unsafe {
             let texture = gl
                 .create_texture()
@@ -751,7 +992,7 @@ impl KmsStabilizer {
                 glow::TEXTURE_MAG_FILTER,
                 glow::NEAREST as i32,
             );
-            (self.image_target_texture_2d)(glow::TEXTURE_2D, image.as_ptr() as *const c_void);
+            (self.gles.image_target_texture_2d)(glow::TEXTURE_2D, image.as_ptr() as *const c_void);
 
             let framebuffer = gl
                 .create_framebuffer()
@@ -770,8 +1011,8 @@ impl KmsStabilizer {
             if status != glow::FRAMEBUFFER_COMPLETE {
                 gl.delete_framebuffer(framebuffer);
                 gl.delete_texture(texture);
-                let _ = self.egl.destroy_image(self.display, image);
-                (self.gbm.bo_destroy)(bo);
+                let _ = self.gles.egl.destroy_image(self.gles.display, image);
+                (self.gles.gbm.bo_destroy)(bo);
                 return Err(format!("target FBO incomplete (status {status:#x})"));
             }
 
@@ -789,10 +1030,10 @@ impl KmsStabilizer {
 
     fn free_slot(&self, slot: RingSlot) {
         unsafe {
-            self.gl.delete_framebuffer(slot.framebuffer);
-            self.gl.delete_texture(slot.texture);
-            let _ = self.egl.destroy_image(self.display, slot.image);
-            (self.gbm.bo_destroy)(slot.bo);
+            self.gles.gl.delete_framebuffer(slot.framebuffer);
+            self.gles.gl.delete_texture(slot.texture);
+            let _ = self.gles.egl.destroy_image(self.gles.display, slot.image);
+            (self.gles.gbm.bo_destroy)(slot.bo);
         }
     }
 
@@ -803,8 +1044,11 @@ impl KmsStabilizer {
         }
         if let Some(target) = self.ram_target.take() {
             unsafe {
-                self.gl.delete_framebuffer(target.framebuffer);
-                self.gl.delete_texture(target.texture);
+                self.gles.gl.delete_framebuffer(target.framebuffer);
+                self.gles.gl.delete_texture(target.texture);
+                if let Some(pbo) = target.pbo {
+                    self.gles.gl.delete_buffer(pbo);
+                }
             }
         }
     }
@@ -814,15 +1058,9 @@ impl Drop for KmsStabilizer {
     fn drop(&mut self) {
         self.destroy_targets();
         unsafe {
-            self.gl.delete_program(self.program);
-            self.gl.delete_buffer(self.vbo);
-            self.gl.delete_texture(self.src_texture);
-            let _ = self.egl.make_current(self.display, None, None, None);
-            let _ = self.egl.destroy_context(self.display, self.context);
-            let _ = self.egl.terminate(self.display);
-            (self.gbm.device_destroy)(self.gbm_device);
-            // gbm did not own the fd; close it now that the device is gone.
-            libc::close(self.device_fd);
+            self.gles.gl.delete_program(self.program);
+            self.gles.gl.delete_buffer(self.vbo);
+            self.gles.gl.delete_texture(self.src_texture);
         }
     }
 }
@@ -1008,6 +1246,7 @@ fn quad_vertices(flip_y: bool) -> [f32; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn slot_pool_reuses_only_after_lease_drop() {
@@ -1042,6 +1281,217 @@ mod tests {
         }
         reclaimed.sort_unstable();
         assert_eq!(reclaimed, vec![0, 1, 2]);
+    }
+
+    const AR24: u32 = 0x3432_5241;
+
+    /// Scanout stand-in: a renderable gbm BO exported as a DMA-BUF.
+    struct TestSource {
+        bo: *mut c_void,
+        plane: DmaBufPlane,
+    }
+
+    impl TestSource {
+        fn new(gles: &Gles, width: u32, height: u32) -> Self {
+            let bo = unsafe {
+                (gles.gbm.bo_create)(gles.gbm_device, width, height, AR24, GBM_BO_USE_RENDERING)
+            };
+            assert!(!bo.is_null(), "gbm_bo_create(source)");
+            let fd = unsafe { (gles.gbm.bo_get_fd)(bo) };
+            assert!(fd >= 0, "gbm_bo_get_fd(source)");
+            let plane = DmaBufPlane {
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                offset: unsafe { (gles.gbm.bo_get_offset)(bo, 0) },
+                pitch: unsafe { (gles.gbm.bo_get_stride)(bo) },
+                modifier: unsafe { (gles.gbm.bo_get_modifier)(bo) },
+            };
+            Self { bo, plane }
+        }
+    }
+
+    /// A normal-priority context hammering the GPU with long fragment work,
+    /// keeping a few frames queued like a GPU-bound game.
+    fn spawn_gpu_load(
+        node: String,
+        width: u32,
+        height: u32,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<u32> {
+        std::thread::spawn(move || {
+            let gles = Gles::new(&node, false).expect("load context");
+            let gl = &gles.gl;
+            const VERT: &str =
+                "attribute vec2 a_pos;\nvoid main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+            const FRAG: &str = "precision highp float;\nuniform float u_t;\nvoid main() {\n\
+                vec2 p = gl_FragCoord.xy * 0.001 + u_t;\n float a = 0.0;\n\
+                for (int i = 0; i < 3000; i++) { a += sin(p.x * float(i) + a) * cos(p.y + a); }\n\
+                gl_FragColor = vec4(a, a * 0.5, a * 0.25, 1.0);\n}\n";
+            unsafe {
+                let program = gl.create_program().unwrap();
+                for (kind, src) in [(glow::VERTEX_SHADER, VERT), (glow::FRAGMENT_SHADER, FRAG)] {
+                    let shader = gl.create_shader(kind).unwrap();
+                    gl.shader_source(shader, src);
+                    gl.compile_shader(shader);
+                    assert!(
+                        gl.get_shader_compile_status(shader),
+                        "{}",
+                        gl.get_shader_info_log(shader)
+                    );
+                    gl.attach_shader(program, shader);
+                }
+                gl.bind_attrib_location(program, 0, "a_pos");
+                gl.link_program(program);
+                assert!(gl.get_program_link_status(program));
+                let texture = gl.create_texture().unwrap();
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                let fbo = gl.create_framebuffer().unwrap();
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(texture),
+                    0,
+                );
+                let vbo = gl.create_buffer().unwrap();
+                let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    std::slice::from_raw_parts(quad.as_ptr() as *const u8, 32),
+                    glow::STATIC_DRAW,
+                );
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
+                gl.use_program(Some(program));
+                let t = gl.get_uniform_location(program, "u_t");
+                gl.viewport(0, 0, width as i32, height as i32);
+                let mut frames = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for _ in 0..3 {
+                        gl.uniform_1_f32(t.as_ref(), frames as f32);
+                        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                        frames += 1;
+                    }
+                    gl.finish();
+                }
+                frames
+            }
+        })
+    }
+
+    fn thread_cpu() -> Duration {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+        let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+        tv(usage.ru_utime) + tv(usage.ru_stime)
+    }
+
+    fn measure(stab: &mut KmsStabilizer, src: &TestSource, w: u32, h: u32, label: &str) {
+        let mut times = Vec::new();
+        let cpu_start = thread_cpu();
+        for i in 0..220 {
+            let start = Instant::now();
+            let frame = stab
+                .stabilize(std::slice::from_ref(&src.plane), AR24, w, h)
+                .expect("stabilize");
+            if i >= 20 {
+                times.push(start.elapsed());
+            }
+            drop(frame);
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        let cpu = thread_cpu() - cpu_start;
+        times.sort();
+        let pct = |p: usize| times[(times.len() * p / 100).min(times.len() - 1)];
+        eprintln!(
+            "[bench] {label:<28} p50={:>6.2?} p95={:>6.2?} p99={:>6.2?} max={:>6.2?} cpu/frame={:>6.2?}",
+            pct(50),
+            pct(95),
+            pct(99),
+            times[times.len() - 1],
+            cpu / 220,
+        );
+    }
+
+    /// Saturate the GPU for `ST_TEST_GPU_LOAD_SECS` seconds, for measuring other
+    /// GPU consumers (e.g. NVENC) under contention.
+    #[test]
+    fn gpu_load_soak() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let Some(secs) = std::env::var("ST_TEST_GPU_LOAD_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            return;
+        };
+        let node =
+            std::env::var("ST_TEST_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        let stop = Arc::new(AtomicBool::new(false));
+        let load = spawn_gpu_load(node, 2560, 1440, Arc::clone(&stop));
+        std::thread::sleep(Duration::from_secs(secs));
+        stop.store(true, Ordering::Relaxed);
+        eprintln!("[soak] draws: {}", load.join().unwrap());
+    }
+
+    /// Stabilizing-copy latency under GPU contention, legacy vs current path.
+    /// `ST_TEST_KMS_STAB_BENCH=1 cargo test --release kms_stab_bench -- --nocapture`
+    #[test]
+    fn kms_stab_bench() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        if std::env::var_os("ST_TEST_KMS_STAB_BENCH").is_none() {
+            return;
+        }
+        let node =
+            std::env::var("ST_TEST_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        let (w, h) = (2560u32, 1440u32);
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Capture,
+        );
+        // (label, gpu priority, sync_file wait, PBO readback)
+        let configs = [
+            ("legacy", false, false, false),
+            ("fence+direct", true, true, false),
+            ("fence+pbo", true, true, true),
+        ];
+        for (label, priority, fence, pbo) in configs {
+            if priority {
+                std::env::remove_var("ST_GPU_PRIO");
+            } else {
+                std::env::set_var("ST_GPU_PRIO", "0");
+            }
+            let mut stab = KmsStabilizer::new(&node).expect("stabilizer");
+            if !fence {
+                stab.gles.fence = None;
+            }
+            if !pbo {
+                stab.gles.es3 = false;
+            }
+            eprintln!("[bench] {label}: high_priority={}", stab.gles.high_priority);
+            let src = TestSource::new(&stab.gles, w, h);
+            measure(&mut stab, &src, w, h, &format!("{label} idle"));
+            let stop = Arc::new(AtomicBool::new(false));
+            let load = spawn_gpu_load(node.clone(), w, h, Arc::clone(&stop));
+            std::thread::sleep(Duration::from_millis(500));
+            measure(&mut stab, &src, w, h, &format!("{label} gpu-load"));
+            stop.store(true, Ordering::Relaxed);
+            let frames = load.join().unwrap();
+            eprintln!("[bench] {label} load draws: {frames}");
+            unsafe { (stab.gles.gbm.bo_destroy)(src.bo) };
+        }
     }
 
     #[test]
