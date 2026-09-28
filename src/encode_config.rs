@@ -183,28 +183,6 @@ impl EncoderConfig {
         Self::INFINITE_GOP
     }
 
-    /// Build config for the given resolution, reading overrides from env vars.
-    #[cfg(target_os = "linux")]
-    pub fn from_env(width: u32, height: u32) -> Self {
-        Self::from_env_with_framerate_and_codec(
-            width,
-            height,
-            Self::resolve_target_fps(None),
-            Self::preferred_codec_from_env().unwrap_or(Codec::H264),
-        )
-    }
-
-    #[cfg(target_os = "linux")]
-    #[allow(dead_code)]
-    pub fn from_env_with_framerate(width: u32, height: u32, framerate: u32) -> Self {
-        Self::from_env_with_framerate_and_codec(
-            width,
-            height,
-            framerate,
-            Self::preferred_codec_from_env().unwrap_or(Codec::H264),
-        )
-    }
-
     pub fn from_env_with_framerate_and_codec(
         width: u32,
         height: u32,

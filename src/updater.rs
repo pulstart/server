@@ -571,31 +571,37 @@ fn sync_path(source: &Path, destination: &Path) -> Result<(), String> {
                 format!("Failed to create directory '{}': {err}", parent.display())
             })?;
         }
-        if destination.exists() {
-            if destination.is_dir() {
-                fs::remove_dir_all(destination).map_err(|err| {
-                    format!(
-                        "Failed to remove directory blocking file update '{}': {err}",
-                        destination.display()
-                    )
-                })?;
-            } else {
-                fs::remove_file(destination).map_err(|err| {
-                    format!(
-                        "Failed to remove existing file '{}': {err}",
-                        destination.display()
-                    )
-                })?;
-            }
+        if destination.is_dir() {
+            fs::remove_dir_all(destination).map_err(|err| {
+                format!(
+                    "Failed to remove directory blocking file update '{}': {err}",
+                    destination.display()
+                )
+            })?;
         }
-        fs::copy(source, destination).map_err(|err| {
-            format!(
-                "Failed to copy '{}' to '{}': {err}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-        copy_permissions(source, destination)?;
+        // Stage next to the target and rename over it: the old file stays
+        // whole until the new one is complete, so a failure never leaves a
+        // missing or truncated binary/library behind.
+        let mut staged_name = OsString::from(".st-update-");
+        staged_name.push(destination.file_name().unwrap_or_default());
+        let staged = destination.with_file_name(staged_name);
+        let install = fs::copy(source, &staged)
+            .map_err(|err| {
+                format!(
+                    "Failed to copy '{}' to '{}': {err}",
+                    source.display(),
+                    staged.display()
+                )
+            })
+            .and_then(|_| copy_permissions(source, &staged))
+            .and_then(|_| {
+                fs::rename(&staged, destination)
+                    .map_err(|err| format!("Failed to replace '{}': {err}", destination.display()))
+            });
+        if install.is_err() {
+            let _ = fs::remove_file(&staged);
+        }
+        install?;
     }
     Ok(())
 }
@@ -904,7 +910,31 @@ fn format_http_error(error: ureq::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_version;
+    use super::{normalize_version, sync_path};
+
+    #[test]
+    fn sync_replaces_files_without_leaving_staging_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let (new, live) = (root.path().join("new"), root.path().join("live"));
+        std::fs::create_dir_all(new.join("lib")).unwrap();
+        std::fs::create_dir_all(live.join("lib")).unwrap();
+        std::fs::write(new.join("bin"), "v2").unwrap();
+        std::fs::write(new.join("lib/a.so"), "a2").unwrap();
+        std::fs::write(live.join("bin"), "v1").unwrap();
+        std::fs::create_dir_all(live.join("lib/a.so")).unwrap();
+        sync_path(&new, &live).unwrap();
+        assert_eq!(std::fs::read_to_string(live.join("bin")).unwrap(), "v2");
+        assert_eq!(
+            std::fs::read_to_string(live.join("lib/a.so")).unwrap(),
+            "a2"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&live)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["bin", "lib"]);
+    }
 
     #[test]
     fn strips_v_prefix() {

@@ -5,10 +5,23 @@ use st_protocol::control::OutputInfo;
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 static TARGET_FPS: AtomicU32 = AtomicU32::new(60);
+static CAPTURE_KICK: AtomicBool = AtomicBool::new(false);
+
+/// Ask a damage-driven capture loop for a frame now: a keyframe request on a
+/// static screen would otherwise wait out the keepalive.
+pub fn kick_capture() {
+    CAPTURE_KICK.store(true, Ordering::Release);
+}
+
+#[cfg(target_os = "linux")]
+pub fn take_capture_kick() -> bool {
+    CAPTURE_KICK.swap(false, Ordering::AcqRel)
+}
+
 #[cfg(target_os = "linux")]
 static UNCHANGED_CAPTURE_TICKS: AtomicU32 = AtomicU32::new(0);
 

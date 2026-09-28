@@ -1260,7 +1260,7 @@ mod tests {
                 &payload,
                 fid,
                 FrameTimingMeta::default(),
-                frame_type::IDR,
+                frame_type::P,
             );
             (d.to_vec(), p.to_vec())
         };

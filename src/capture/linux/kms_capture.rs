@@ -569,6 +569,7 @@ fn capture_cursor(
     let cursor_w = fb2.size().0;
     let cursor_h = fb2.size().1;
     let pixel_format = fb2.pixel_format() as u32;
+    let gem_buffers = fb2.buffers();
 
     // Only handle ARGB8888 cursors (standard for all known drivers)
     const DRM_FORMAT_ARGB8888: u32 = 0x34325241;
@@ -584,12 +585,13 @@ fn capture_cursor(
             cursor_w,
             cursor_h
         ));
+        close_gem_handles(card, &gem_buffers);
         return None;
     }
 
-    let gem_buffers = fb2.buffers();
     let Some(gem_handle) = gem_buffers[0] else {
         cursor_diag("cursor framebuffer has no GEM handle");
+        close_gem_handles(card, &gem_buffers);
         return None;
     };
     let pitch = fb2.pitches()[0];
@@ -1099,6 +1101,11 @@ impl CaptureBackend for KmsCapture {
                         true
                     }
                 };
+                let kicked = super::super::take_capture_kick();
+                if kicked && !capture_now {
+                    scheduler.force(now);
+                }
+                let capture_now = capture_now || kicked;
                 for _ in 0..scheduler.take_idle_slots() {
                     super::super::record_unchanged_capture_tick();
                 }

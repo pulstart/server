@@ -17,7 +17,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::audio::AudioPipeline;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -26,6 +26,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Spawn the audio-follow watcher if running in system-wide mode and not
 /// disabled. No-op otherwise (a per-user service already sits in the user's
 /// session and needs no following).
+static AUDIO: Mutex<Weak<Mutex<AudioPipeline>>> = Mutex::new(Weak::new());
+static WATCHER: Once = Once::new();
+
 pub fn maybe_spawn(audio: Arc<Mutex<AudioPipeline>>) {
     if std::env::var_os("ST_SYSTEM_MODE").is_none() {
         return;
@@ -34,7 +37,10 @@ pub fn maybe_spawn(audio: Arc<Mutex<AudioPipeline>>) {
         println!("[session-follow] disabled via ST_AUDIO_FOLLOW");
         return;
     }
-    thread::spawn(move || run(audio));
+    *AUDIO.lock().unwrap() = Arc::downgrade(&audio);
+    WATCHER.call_once(|| {
+        thread::spawn(run);
+    });
 }
 
 fn disabled() -> bool {
@@ -131,7 +137,7 @@ fn username_for_uid(uid: u32) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-fn run(audio: Arc<Mutex<AudioPipeline>>) {
+fn run() {
     println!("[session-follow] watching seat0 for the active user");
     let mut current: Option<u32> = None;
     loop {
@@ -145,8 +151,11 @@ fn run(audio: Arc<Mutex<AudioPipeline>>) {
                 None => println!("[session-follow] no active graphical user; audio idle"),
             }
             current = active;
-            if let Ok(mut pipeline) = audio.lock() {
-                pipeline.apply_auto_detect();
+            let audio = AUDIO.lock().unwrap().upgrade();
+            if let Some(audio) = audio {
+                if let Ok(mut pipeline) = audio.lock() {
+                    pipeline.apply_auto_detect();
+                }
             }
         }
         thread::sleep(POLL_INTERVAL);

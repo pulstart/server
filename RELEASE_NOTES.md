@@ -1,3 +1,34 @@
+# 0.9.23
+
+Server-only release; no wire format change.
+
+- A second client joining (or one leaving) no longer rebuilds the encoder.
+  The stream started on H.264 because HEVC costs 10 ms per 1440p frame here,
+  but every change in who is connected re-picked the preferred codec, so the
+  session was rebuilt on HEVC and fell from 120 to 90 fps. The running codec
+  now stays while every client can still decode it. A late join gets its
+  first picture in ~40 ms instead of ~300 ms.
+- A keyframe request (late join, loss recovery) wakes capture immediately.
+  On a static screen it used to wait for the 250 ms keepalive.
+- Keyframes and recovery frames carry at least 10% parity (min 4 packets).
+  One parity packet per unit left a 150-packet keyframe with a 17% chance of
+  being lost at 0.5% random packet loss (59% at 400 packets), and each lost
+  keyframe costs another round trip and another keyframe.
+- Audio is sent as soon as it is ready instead of waiting behind the video
+  poll (0-5 ms of jitter).
+- A stream can no longer freeze forever: if capture or the encoder dies, the
+  sessions end so clients reconnect to a fresh pipeline (they used to keep
+  receiving keepalives from a dead one). An encoder failing 60 frames in a
+  row does the same and drops the cached Vulkan device.
+- Fixes: the audio-follow watcher was started again for every session and
+  kept polling `loginctl` twice every 3 s for the life of the service; a
+  cursor framebuffer in an unexpected format leaked a GEM handle per frame;
+  the updater replaced files in place (a failure halfway left a missing
+  binary) and now stages and renames each file.
+- Quieter logs: the STUN address is logged only when it changes, refused
+  audio sends log once a second, and the startup probe no longer opens
+  NVENC/CUDA (it also reported the wrong resolution and encoder).
+
 # 0.9.22
 
 Server-only release; no wire format change.

@@ -104,6 +104,10 @@ const CAPTURE_QUEUE_CAPACITY: usize = 4;
 /// under sustained overload; the broadcaster's oldest-eviction is the backstop.
 const MAX_VIDEO_SEND_BURST: usize = 16;
 static TRACE_ENCODE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+static ENCODE_FAILURES: AtomicU32 = AtomicU32::new(0);
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const ENCODE_FAILURE_LIMIT: u32 = 60;
 static NEXT_ENCODED_VIDEO_UNIT_SEQ: AtomicU64 = AtomicU64::new(0);
 static NEXT_PIPELINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -486,6 +490,28 @@ fn aggregate_encoder_config(
         },
     };
     Ok(config)
+}
+
+/// A running codec stays while every client can still decode it (in hardware
+/// whenever any codec can): a switch rebuilds the encoder and interrupts every
+/// viewer, and the running codec may be the one initial selection chose because
+/// the preferred one was too slow at this frame rate.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn keep_running_codec(
+    mut capabilities: AggregateVideoCapabilities,
+    running: encode_config::Codec,
+    control: &ServerControl,
+) -> AggregateVideoCapabilities {
+    let running = running.to_stream_codec();
+    if control.forced_codec().is_none()
+        && capabilities.supported_codecs.supports(running)
+        && (capabilities.hardware_codecs.supports(running)
+            || capabilities.hardware_codecs.is_empty())
+    {
+        capabilities.supported_codecs = VideoCodecSupport::empty();
+        capabilities.supported_codecs.insert(running);
+    }
+    capabilities
 }
 
 fn encoder_profiles_equal(left: &EncoderConfig, right: &EncoderConfig) -> bool {
@@ -1800,6 +1826,8 @@ fn run_shared_pipeline(
     capture_cmd_rx: Receiver<CaptureCommand>,
     input_pipeline_owner: Arc<AtomicU64>,
 ) {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    ENCODE_FAILURES.store(0, Ordering::Relaxed);
     st_protocol::thread_priority::promote_current_thread(
         st_protocol::thread_priority::ThreadRole::Video,
     );
@@ -2108,6 +2136,15 @@ fn run_shared_pipeline(
         if shutdown_rx.try_recv().is_ok() {
             break;
         }
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if ENCODE_FAILURES.load(Ordering::Relaxed) >= ENCODE_FAILURE_LIMIT {
+            eprintln!(
+                "[pipeline] encoder failed {ENCODE_FAILURE_LIMIT} frames in a row; ending the pipeline so clients reconnect to a fresh one"
+            );
+            #[cfg(target_os = "linux")]
+            encode_vulkan::forget_device();
+            break;
+        }
 
         // Apply any pending capture/output switch. Rare, user-initiated, and
         // global to the shared stream: stop+restart capture pinned to the new
@@ -2204,13 +2241,18 @@ fn run_shared_pipeline(
                         );
                     }
                 }
-                CaptureCommand::SetVideoCapabilities(request) => {
+                CaptureCommand::SetVideoCapabilities(mut request) => {
                     if !request.is_current() {
                         request.reject("video profile request was cancelled");
                         continue;
                     }
                     #[cfg(any(target_os = "linux", target_os = "windows"))]
                     {
+                        request.capabilities = keep_running_codec(
+                            request.capabilities,
+                            current_config.codec,
+                            &control,
+                        );
                         let desired = match aggregate_encoder_config(
                             &current_config,
                             request.capabilities,
@@ -2813,6 +2855,8 @@ fn run_shared_pipeline(
         }
     }
 
+    video_bc.close();
+
     // Cleanup
     #[cfg(target_os = "macos")]
     encoder.flush();
@@ -3028,6 +3072,7 @@ fn encode_and_broadcast(
     };
     match result {
         Ok(nals) => {
+            ENCODE_FAILURES.store(0, Ordering::Relaxed);
             if trace_enabled() {
                 let log_index = TRACE_ENCODE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                 if log_index < 12 {
@@ -3054,7 +3099,10 @@ fn encode_and_broadcast(
             encoded_bytes
         }
         Err(e) => {
-            eprintln!("encode error: {e}");
+            let failures = ENCODE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if failures == 1 || failures.is_multiple_of(60) {
+                eprintln!("encode error ({failures} in a row): {e}");
+            }
             0
         }
     }
@@ -3076,6 +3124,51 @@ fn audio_interleave_enabled() -> bool {
     )
 }
 
+/// A dead peer refuses every audio packet (5 ms cadence): log once a second.
+fn log_audio_send_error(peer: &dyn std::fmt::Display, error: &dyn std::fmt::Display) {
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    let now_ms = unix_time_micros() / 1000;
+    let last = LAST_LOG_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= 1000
+        && LAST_LOG_MS
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        eprintln!("[transport] audio send error to {peer}: {error}");
+    }
+}
+
+/// Wait for a video unit, waking early for audio: audio no longer sits behind
+/// the video poll (0-5 ms of added jitter). `Timeout` also means "audio is
+/// ready, drain it".
+fn wait_for_media<V, A>(
+    vid_rx: &Receiver<V>,
+    aud_rx: &mut Option<Receiver<A>>,
+    timeout: Duration,
+) -> Result<V, crossbeam_channel::RecvTimeoutError> {
+    use crossbeam_channel::{RecvTimeoutError, TryRecvError};
+    let Some(aud) = aud_rx.as_ref() else {
+        return vid_rx.recv_timeout(timeout);
+    };
+    let mut select = crossbeam_channel::Select::new();
+    let video = select.recv(vid_rx);
+    select.recv(aud);
+    match select.ready_timeout(timeout) {
+        Ok(index) if index == video => match vid_rx.try_recv() {
+            Ok(unit) => Ok(unit),
+            Err(TryRecvError::Empty) => Err(RecvTimeoutError::Timeout),
+            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+        },
+        Ok(_) => {
+            if aud.is_empty() {
+                *aud_rx = None;
+            }
+            Err(RecvTimeoutError::Timeout)
+        }
+        Err(_) => Err(RecvTimeoutError::Timeout),
+    }
+}
+
 /// Drain queued Opus packets and send them immediately. Always drains the queue
 /// (so it can't build up) but only transmits when the client enabled audio.
 fn flush_pending_audio(
@@ -3090,7 +3183,7 @@ fn flush_pending_audio(
     while let Ok(opus) = aud.try_recv() {
         if send {
             if let Err(e) = sender.send_audio(&opus, audio_depth) {
-                eprintln!("[transport] audio send error to {peer}: {e}");
+                log_audio_send_error(&peer, &e);
             }
         }
     }
@@ -3164,7 +3257,7 @@ fn run_transport(
     addr: SocketAddr,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
+    mut aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     crypto: Option<Arc<st_protocol::tunnel::CryptoContext>>,
@@ -3262,7 +3355,7 @@ fn run_transport(
             last_dup_first = Some(dup_on);
         }
         // Video: blocking recv with short timeout
-        match vid_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+        match wait_for_media(&vid_rx, &mut aud_rx, Duration::from_millis(5)) {
             Ok(frame) => {
                 // Send every encoded unit in FIFO order. Drain transient backlog by
                 // SENDING it, never by collapsing to the newest unit: encoded units
@@ -3410,7 +3503,7 @@ fn run_transport(
             while let Ok(opus) = aud.try_recv() {
                 if send_audio {
                     if let Err(e) = sender.send_audio(&opus, &audio_depth) {
-                        eprintln!("[transport] audio send error to {addr}: {e}");
+                        log_audio_send_error(&addr, &e);
                     }
                 }
             }
@@ -4318,6 +4411,10 @@ async fn handle_client(
         if registered_client.disconnect_requested() {
             break;
         }
+        if transport_handle.is_finished() {
+            println!("[client {addr}] media transport ended; closing the session");
+            break;
+        }
         let controller_state = state.input.controller_state_for(client_id);
         if controller_state != last_controller_state {
             if stream
@@ -4731,32 +4828,6 @@ fn probe_backends() {
     };
     println!("[probe] Selected capture: {capture_backend}");
 
-    let (width, height) = get_screen_resolution().unwrap_or((1920, 1080));
-    println!("[probe] Screen resolution: {width}x{height}");
-
-    let config = EncoderConfig::from_env(width, height);
-    println!(
-        "[probe] Config: {:?} {:?} {}kbps {}fps",
-        config.codec, config.dynamic_range, config.bitrate_kbps, config.framerate
-    );
-
-    match encode_vaapi::VaapiEncoder::with_config(&config, None) {
-        Ok(_) => println!("[probe] Encoder: VAAPI"),
-        Err(e) => {
-            println!("[probe] Encoder: VAAPI unavailable ({e})");
-            match encode::NvencEncoder::with_config(&config) {
-                Ok(_) => println!("[probe] Encoder: NVENC"),
-                Err(e) => {
-                    println!("[probe] Encoder: NVENC unavailable ({e})");
-                    match encode_sw::SoftwareEncoder::with_config(&config) {
-                        Ok(_) => println!("[probe] Encoder: Software"),
-                        Err(e) => eprintln!("[probe] Encoder: NONE ({e})"),
-                    }
-                }
-            }
-        }
-    }
-
     let audio_config = encode_config::AudioConfig::from_env();
     let monitor = audio::capture::detect_monitor_source();
     println!(
@@ -4767,27 +4838,6 @@ fn probe_backends() {
     );
 
     println!("--- Probing complete ---\n");
-}
-
-#[cfg(target_os = "linux")]
-fn get_screen_resolution() -> Option<(u32, u32)> {
-    let output = std::process::Command::new("xdpyinfo").output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.starts_with("dimensions:") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let dim: Vec<&str> = parts[1].split('x').collect();
-                if dim.len() == 2 {
-                    let w = dim[0].parse().ok()?;
-                    let h = dim[1].parse().ok()?;
-                    return Some((w, h));
-                }
-            }
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5420,6 +5470,10 @@ fn handle_punched_client(
         {
             break;
         }
+        if transport_handle.is_finished() {
+            println!("[{tag}] media transport ended; closing the session");
+            break;
+        }
         if last_peer_activity.elapsed() > PUNCHED_INACTIVITY_TIMEOUT {
             println!(
                 "[{tag}] No traffic from {peer} for {}s — treating as disconnected",
@@ -5667,7 +5721,7 @@ fn run_punched_transport(
     punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink>,
     vid_rx: Receiver<Arc<EncodedVideoFrame>>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
+    mut aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     // A2: adaptive RS parity percentage from the control loop.
@@ -5723,7 +5777,7 @@ fn run_punched_transport(
             sender.set_dup_first(dup_on);
             last_dup_first = Some(dup_on);
         }
-        match vid_rx.recv_timeout(Duration::from_millis(5)) {
+        match wait_for_media(&vid_rx, &mut aud_rx, Duration::from_millis(5)) {
             Ok(frame) => {
                 // FIFO drain — send every encoded unit in order, never collapse to
                 // newest. See run_client_transport for the rationale: dropping an
@@ -5839,7 +5893,7 @@ fn run_punched_transport(
             while let Ok(opus) = aud.try_recv() {
                 if send_audio {
                     if let Err(e) = sender.send_audio(&opus, &audio_depth) {
-                        eprintln!("[punched-transport] audio send error: {e}");
+                        log_audio_send_error(&"punched peer", &e);
                     }
                 }
             }
@@ -6381,5 +6435,45 @@ mod bitrate_hysteresis_tests {
         assert!(should_schedule_bitrate_reconfigure(
             20_000, 26_000, settled, true
         ));
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod codec_stability_tests {
+    use super::*;
+
+    fn support(codecs: &[VideoCodec]) -> VideoCodecSupport {
+        let mut set = VideoCodecSupport::empty();
+        for codec in codecs {
+            set.insert(*codec);
+        }
+        set
+    }
+
+    fn caps(supported: &[VideoCodec], hardware: &[VideoCodec]) -> AggregateVideoCapabilities {
+        AggregateVideoCapabilities {
+            supported_codecs: support(supported),
+            hardware_codecs: support(hardware),
+            supported_yuv444_codecs: VideoCodecSupport::empty(),
+            hardware_yuv444_codecs: VideoCodecSupport::empty(),
+            hdr_display: false,
+            requested_fps: Some(120),
+        }
+    }
+
+    #[test]
+    fn a_joining_client_does_not_switch_the_running_codec() {
+        let control = ServerControl::new();
+        let both = [VideoCodec::H264, VideoCodec::Hevc];
+        let kept = keep_running_codec(caps(&both, &both), encode_config::Codec::H264, &control);
+        assert_eq!(kept.supported_codecs, support(&[VideoCodec::H264]));
+
+        let only_h264 = caps(&[VideoCodec::H264], &[VideoCodec::H264]);
+        let moved = keep_running_codec(only_h264, encode_config::Codec::Hevc, &control);
+        assert_eq!(moved, only_h264);
+
+        let software_h264 = caps(&both, &[VideoCodec::Hevc]);
+        let moved = keep_running_codec(software_h264, encode_config::Codec::H264, &control);
+        assert_eq!(moved, software_h264);
     }
 }

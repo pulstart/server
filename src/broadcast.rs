@@ -77,6 +77,7 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
             drop_rx: rx.clone(),
         });
         self.keyframe_requested.store(true, Ordering::Release);
+        crate::capture::kick_capture();
         Ok((id, rx))
     }
 
@@ -102,6 +103,7 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
     /// Explicitly request a fresh keyframe for existing subscribers.
     pub fn request_keyframe(&self) {
         self.keyframe_requested.store(true, Ordering::Release);
+        crate::capture::kick_capture();
     }
 
     /// Remove a subscriber by id.
@@ -155,6 +157,12 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
         state.subscribers.len() + state.reservations
     }
 
+    /// Detach every subscriber: their receivers see `Disconnected`, so a
+    /// pipeline that died under its clients ends their sessions.
+    pub fn close(&self) {
+        self.state.lock().unwrap().subscribers.clear();
+    }
+
     /// Drop every item queued before an encoder epoch transition. Subscribers
     /// stay attached and immediately receive the next recovery frame.
     pub fn clear_queued(&self) {
@@ -185,6 +193,7 @@ impl<T: Send + Sync + 'static> SubscriptionReservation<T> {
         self.broadcaster
             .keyframe_requested
             .store(true, Ordering::Release);
+        crate::capture::kick_capture();
         (id, rx)
     }
 }
@@ -227,6 +236,18 @@ mod tests {
 
         assert_eq!(*rx.recv().expect("first queued item"), 2);
         assert_eq!(*rx.recv().expect("second queued item"), 3);
+    }
+
+    #[test]
+    fn close_disconnects_subscribers_after_queued_items() {
+        let broadcaster = Broadcaster::new();
+        let (_id, rx) = broadcaster.subscribe(4).expect("subscribe");
+        broadcaster.broadcast(7u32);
+        broadcaster.close();
+
+        assert_eq!(*rx.recv().expect("queued item survives"), 7);
+        assert!(rx.recv().is_err());
+        assert_eq!(broadcaster.subscriber_count(), 0);
     }
 
     #[test]

@@ -80,6 +80,14 @@ fn device_ref(render_node: Option<&str>) -> Result<*mut ffi::AVBufferRef, String
     Ok(unsafe { ffi::av_buffer_ref(device) })
 }
 
+/// Drop the cached device so the next open creates a fresh one (after a GPU
+/// reset every reopen would otherwise reuse the dead device).
+pub fn forget_device() {
+    if let Some((_, mut old)) = DEVICE.lock().unwrap().take() {
+        unsafe { ffi::av_buffer_unref(&mut old.0) };
+    }
+}
+
 unsafe fn create_device(render_node: Option<&str>) -> Result<*mut ffi::AVBufferRef, String> {
     // Derive from the capture GPU's DRM node so multi-GPU hosts encode on the
     // GPU that captured.
