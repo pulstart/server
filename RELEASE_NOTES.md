@@ -1,3 +1,20 @@
+# 0.9.21
+
+Server-only release; no wire format change.
+
+- Desktop latency: while a client is connected, the NVIDIA GPU's memory clock
+  is held at its P3 level. An idle desktop otherwise parks the GPU in P8 with
+  the PCIe link at gen1, and every sparse update (typing, hovering) paid for
+  it: over a 70 s idle-desktop session, capture to receive went from p50
+  16.3 / p99 40.7 ms (with 5 frame-rate rebuilds) to 6.0 / 7.0 ms (none).
+  Costs ~11 W while streaming; needs the system service (root).
+  `ST_GPU_CLOCK_FLOOR=0` disables it.
+- Fix: the first connect after a server start cut the bitrate from 20 to
+  15 Mbps. The first frame waited behind encoder setup, which the bitrate
+  controller read as a congested send queue. The send backlog is now
+  measured from when a frame is encoded, and the copy engine is opened
+  before the first capture.
+
 # 0.9.20
 
 Server-only release; no wire format change.
