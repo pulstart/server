@@ -5915,12 +5915,6 @@ fn trigger_screen_wake(control: &crate::server_control::ServerControl) {
     }
 }
 
-/// Set the environment defaults for system-wide mode before any subsystem reads
-/// them. KMS is the only capture backend that works at the login screen and
-/// follows the active seat across user switches; the tray lives in a separate
-/// per-user agent; state goes to a root-owned dir. Each is only set if the user
-/// hasn't already overridden it, preserving the escape hatches.
-#[cfg(target_os = "linux")]
 /// App Nap throttles the timers and I/O of an app nobody is looking at; a
 /// streaming host must keep its capture/encode cadence regardless.
 #[cfg(target_os = "macos")]
@@ -5944,6 +5938,12 @@ fn disable_app_nap() {
     }
 }
 
+/// Set the environment defaults for system-wide mode before any subsystem reads
+/// them. KMS is the only capture backend that works at the login screen and
+/// follows the active seat across user switches; the tray lives in a separate
+/// per-user agent; state goes to a root-owned dir. Each is only set if the user
+/// hasn't already overridden it, preserving the escape hatches.
+#[cfg(target_os = "linux")]
 fn apply_system_mode_env() {
     if std::env::var_os("ST_CAPTURE").is_none() {
         std::env::set_var("ST_CAPTURE", "kms");
