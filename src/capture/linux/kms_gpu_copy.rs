@@ -732,7 +732,7 @@ impl KmsStabilizer {
         if !self.vk_tried {
             self.vk_tried = true;
             if super::kms_vk_copy::enabled() {
-                match VkReadback::new(&self.render_node) {
+                match VkReadback::open(&self.render_node) {
                     Ok(vk) => {
                         println!("[kms] scanout readback on the Vulkan copy engine");
                         self.vk = Some(vk);
@@ -1188,6 +1188,9 @@ impl KmsStabilizer {
 
 impl Drop for KmsStabilizer {
     fn drop(&mut self) {
+        if let Some(vk) = self.vk.take() {
+            vk.park();
+        }
         self.destroy_targets();
         unsafe {
             self.gles.gl.delete_program(self.program);

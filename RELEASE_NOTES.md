@@ -17,9 +17,11 @@ Server-only release; no wire format change.
   read as overload even though no frame was waiting. It now counts an
   overrun only when a newer frame was held back by it, and judges headroom
   for stepping up from encoder busy time.
-- Reconnecting is ~0.6 s faster: a codec the encoder self-test found too slow
-  (HEVC at 1440p120 on NVIDIA) is remembered for 10 minutes instead of being
-  opened and tested again on every connect.
+- Reconnecting is ~0.65 s faster (0.9 s to 0.25 s from connect to video on
+  the test box): a codec the encoder self-test found too slow (HEVC at
+  1440p120 on NVIDIA) is remembered for 10 minutes instead of being tested
+  again on every connect, and the copy-engine device is kept between
+  sessions (first frame 196 ms to 10 ms).
 - Fix: clipboard sync never worked with the system-wide service (the
   installer default) and logged an error every 5 s: a root service can't
   reach the user's display. The tray agent, which runs in the user session,

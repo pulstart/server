@@ -99,7 +99,16 @@ pub struct VkReadback {
     converter: Converter,
     ram_pool: RamPool,
     tick: u64,
+    render_node: String,
 }
+
+// SAFETY: used by one thread at a time (the capture thread, or parked); the
+// staging mapping is only dereferenced by its current owner.
+unsafe impl Send for VkReadback {}
+
+/// Kept between sessions: creating the device cost ~80 ms of every connect's
+/// first frame.
+static PARKED: std::sync::Mutex<Option<VkReadback>> = std::sync::Mutex::new(None);
 
 const DEVICE_EXTENSIONS: [&std::ffi::CStr; 5] = [
     ash::khr::external_memory_fd::NAME,
@@ -156,6 +165,7 @@ impl VkReadback {
             converter: Converter::new(Converter::default_threads()),
             ram_pool: RamPool::default(),
             tick: 0,
+            render_node: render_node.to_owned(),
         };
         unsafe {
             this.command_pool = this
@@ -187,6 +197,30 @@ impl VkReadback {
             }
         }
         Ok(this)
+    }
+
+    /// The parked readback for `render_node`, else a new one.
+    pub fn open(render_node: &str) -> Result<Self, String> {
+        let parked = PARKED.lock().unwrap().take();
+        match parked {
+            Some(vk) if vk.render_node == render_node => Ok(vk),
+            _ => Self::new(render_node),
+        }
+    }
+
+    /// Keep the device for the next session, releasing the compositor's
+    /// buffers it imported and the pinned staging memory.
+    pub fn park(mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            for import in std::mem::take(&mut self.imports) {
+                self.destroy_import(import);
+            }
+            if let Some(staging) = self.staging.take() {
+                self.destroy_staging(staging);
+            }
+        }
+        *PARKED.lock().unwrap() = Some(self);
     }
 
     /// Copy the scanout `plane` off the GPU and convert it to `dst`.
