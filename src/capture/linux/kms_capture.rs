@@ -415,14 +415,14 @@ fn find_cursor_plane(
         .ok()?
         .iter()
         .filter_map(|&handle| Some((handle, card.get_plane(handle).ok()?)))
-        .filter(|(_, plane)| {
-            plane.crtc() == Some(crtc)
-                || resources
-                    .filter_crtcs(plane.possible_crtcs())
-                    .contains(&crtc)
+        .filter(|(_, plane)| match plane.crtc() {
+            Some(bound) => bound == crtc,
+            None => resources
+                .filter_crtcs(plane.possible_crtcs())
+                .contains(&crtc),
         })
         .filter(|&(handle, _)| is_cursor_plane(card, handle))
-        .max_by_key(|(_, plane)| plane.crtc() == Some(crtc))
+        .max_by_key(|(_, plane)| plane.crtc().is_some())
         .map(|(handle, _)| handle)
 }
 
