@@ -553,6 +553,7 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
             height: buf.height,
             cursor: None, // PAINT_CURSORS=1 embeds cursor into the frame
             force_keyframe: false,
+            captured_at: std::time::Instant::now(),
         };
 
         match tx.try_send(captured) {

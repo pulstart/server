@@ -326,6 +326,10 @@ fn unix_time_micros() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn captured_unix_micros(frame: &capture::CapturedFrame) -> u64 {
+    unix_time_micros().saturating_sub(frame.captured_at.elapsed().as_micros() as u64)
+}
+
 fn trace_enabled() -> bool {
     std::env::var_os("ST_TRACE").is_some()
 }
@@ -1801,7 +1805,7 @@ fn run_shared_pipeline(
     }
 
     // Get first frame to determine dimensions
-    let (first_frame, first_frame_captured_micros) = loop {
+    let first_frame = loop {
         if startup_cancelled.load(Ordering::Acquire) {
             capture_backend.stop();
             let _ = status_tx.send(PipelineResult::Error("Pipeline startup cancelled".into()));
@@ -1809,7 +1813,7 @@ fn run_shared_pipeline(
         }
         crossbeam_channel::select! {
             recv(frame_rx) -> frame => match frame {
-                Ok(frame) => break (frame, unix_time_micros()),
+                Ok(frame) => break frame,
                 Err(_) => {
                     let msg = "Capture channel closed before first frame".to_string();
                     eprintln!("{msg}");
@@ -1831,7 +1835,10 @@ fn run_shared_pipeline(
         let first_has_cursor = false;
         eprintln!(
             "[trace][server] first captured frame: {}x{} cursor={} capture_ts={}",
-            first_frame.width, first_frame.height, first_has_cursor, first_frame_captured_micros
+            first_frame.width,
+            first_frame.height,
+            first_has_cursor,
+            captured_unix_micros(&first_frame)
         );
     }
     let mut trace_capture_frames = 1usize;
@@ -2037,9 +2044,7 @@ fn run_shared_pipeline(
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut frame_rate_tracker = adaptive_bitrate::EncodeRateTracker::new(Instant::now());
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let mut last_encode_at: Option<Instant> = None;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let mut carried_keyframe = false;
+    let mut encode_credit = capture::FrameCredit::new(Instant::now());
     #[cfg(target_os = "linux")]
     let _ = capture::take_unchanged_capture_ticks();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2060,7 +2065,6 @@ fn run_shared_pipeline(
         &video_bc,
         input.as_ref(),
         &first_frame,
-        first_frame_captured_micros,
         initial_snapshot.video_epoch,
     );
 
@@ -2162,7 +2166,6 @@ fn run_shared_pipeline(
                             &video_bc,
                             input.as_ref(),
                             &switched_frame,
-                            unix_time_micros(),
                             capture_state.active_video_epoch(),
                         );
                     }
@@ -2300,12 +2303,11 @@ fn run_shared_pipeline(
             }
         }
 
-        let (frame, frame_captured_micros) =
-            match frame_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(f) => (f, unix_time_micros()),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-            };
+        let frame = match frame_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(f) => f,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
         if trace && trace_capture_frames < 8 {
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             let frame_has_cursor = frame.cursor.is_some();
@@ -2316,15 +2318,14 @@ fn run_shared_pipeline(
                 frame.width,
                 frame.height,
                 frame_has_cursor,
-                frame_captured_micros
+                captured_unix_micros(&frame)
             );
             trace_capture_frames += 1;
         }
         // Drain stale frames — only encode the newest
         #[allow(unused_mut)]
-        let (mut frame, frame_captured_micros) = {
+        let mut frame = {
             let mut latest = frame;
-            let mut latest_captured_micros = frame_captured_micros;
             // A capture-requested keyframe (e.g. KMS seat/session switch) must
             // survive frame-dropping — OR it across every drained frame.
             let mut force_keyframe = latest.force_keyframe;
@@ -2335,23 +2336,35 @@ fn run_shared_pipeline(
                 }
                 force_keyframe |= newer.force_keyframe;
                 latest = newer;
-                latest_captured_micros = unix_time_micros();
             }
             latest.force_keyframe = force_keyframe;
-            (latest, latest_captured_micros)
+            latest
         };
 
         // PipeWire/NvFBC keep their start rate after adaptive fps lowers the
-        // encoder's; frames beyond it would overspend its per-frame budget.
+        // encoder's; hold a frame that would overspend the encoder's rate (a
+        // newer one replaces it). Never dropped: damage-driven sources may not
+        // send another. The 0.75 level leaves KMS's own pacing untouched.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
-            let min_gap =
-                std::time::Duration::from_secs_f64(0.75 / current_config.framerate.max(1) as f64);
-            if last_encode_at.is_some_and(|at| at.elapsed() < min_gap) {
-                carried_keyframe |= frame.force_keyframe;
-                continue;
+            let interval =
+                std::time::Duration::from_secs_f64(1.0 / current_config.framerate.max(1) as f64);
+            loop {
+                encode_credit.refill(Instant::now(), interval);
+                let wait = encode_credit.until(0.75, interval);
+                if wait.is_zero() {
+                    break;
+                }
+                let newer = match frame_rx.recv_timeout(wait) {
+                    Ok(newer) => newer,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+                let force_keyframe = frame.force_keyframe | newer.force_keyframe;
+                frame = newer;
+                frame.force_keyframe = force_keyframe;
             }
-            frame.force_keyframe |= std::mem::take(&mut carried_keyframe);
+            encode_credit.take();
         }
 
         // Only encode when there are subscribers (save GPU/CPU when idle)
@@ -2701,16 +2714,11 @@ fn run_shared_pipeline(
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             let encode_start = Instant::now();
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            {
-                last_encode_at = Some(encode_start);
-            }
             let _encoded_bytes = encode_and_broadcast(
                 &mut encoder,
                 &video_bc,
                 input.as_ref(),
                 &frame,
-                frame_captured_micros,
                 capture_state.active_video_epoch(),
             );
             #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2820,9 +2828,9 @@ fn encode_and_broadcast(
     broadcaster: &Broadcaster<EncodedVideoFrame>,
     input: &InputRuntime,
     frame: &capture::CapturedFrame,
-    captured_micros: u64,
     video_epoch: u64,
 ) -> usize {
+    let captured_micros = captured_unix_micros(frame);
     input.update_cursor(frame.cursor.as_ref());
 
     if !input.control_active() {
@@ -2880,9 +2888,9 @@ fn encode_and_broadcast(
     broadcaster: &Broadcaster<EncodedVideoFrame>,
     input: &InputRuntime,
     frame: &capture::CapturedFrame,
-    captured_micros: u64,
     video_epoch: u64,
 ) -> usize {
+    let captured_micros = captured_unix_micros(frame);
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     input.update_cursor(frame.cursor.as_ref());
 
@@ -2912,6 +2920,7 @@ fn encode_and_broadcast(
                         #[cfg(any(target_os = "linux", target_os = "windows"))]
                         cursor: None,
                         force_keyframe: frame.force_keyframe,
+                        captured_at: frame.captured_at,
                     };
                     &frame_with_cursor
                 }
@@ -2936,6 +2945,7 @@ fn encode_and_broadcast(
                                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                                 cursor: None,
                                 force_keyframe: frame.force_keyframe,
+                                captured_at: frame.captured_at,
                             };
                             &frame_with_cursor
                         }

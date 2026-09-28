@@ -239,6 +239,7 @@ fn run_dxgi_capture_loop(
                 height: session.height,
                 cursor,
                 force_keyframe: false,
+                captured_at: std::time::Instant::now(),
             };
             match tx.try_send(frame) {
                 Ok(()) => {}
@@ -739,6 +740,7 @@ impl GdiCaptureSession {
                 height: self.height as u32,
                 cursor,
                 force_keyframe: false,
+                captured_at: std::time::Instant::now(),
             })
         }
     }

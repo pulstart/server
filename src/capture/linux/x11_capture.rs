@@ -383,6 +383,7 @@ impl CaptureBackend for X11Capture {
                         height: state.height,
                         cursor,
                         force_keyframe: false,
+                        captured_at: std::time::Instant::now(),
                     };
 
                     match tx.try_send(frame) {

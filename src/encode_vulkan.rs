@@ -504,6 +504,7 @@ mod tests {
             height,
             cursor: None,
             force_keyframe: false,
+            captured_at: std::time::Instant::now(),
         }
     }
 

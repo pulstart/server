@@ -1,3 +1,20 @@
+# 0.9.19
+
+Server-only release; no wire format change.
+
+- KMS capture follows the compositor's flips instead of a fixed 120 Hz tick:
+  the scanout framebuffer is polled every 1 ms and captured as soon as a new
+  frame is committed. Content is 0.4 ms old when sampled on average (0.9 ms
+  p99) instead of 3.2 ms (6.6 ms p99). A 144 Hz desktop streamed at 120 fps
+  drops 1 flip in 6 rather than sampling between flips, and a game rendering
+  below the stream rate sends each of its frames exactly once.
+- Fix: the frame-rate gate added in 0.9.18 could drop a lone screen update
+  that arrived shortly after the previous frame, leaving the client stale until
+  the next change. Early frames are now held until the encoder is ready and
+  replaced by newer ones, never dropped.
+- Latency stats (client overlay) now start when the frame is sampled, so they
+  include the capture readback.
+
 # 0.9.18
 
 Server-only release; no wire format change.

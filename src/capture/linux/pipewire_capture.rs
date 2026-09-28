@@ -2234,6 +2234,7 @@ fn run_pipewire_stream(
                                 height: info.height,
                                 cursor,
                                 force_keyframe: false,
+                                captured_at: std::time::Instant::now(),
                             })
                         }
                         Err(err) => {
@@ -2266,6 +2267,7 @@ fn run_pipewire_stream(
                                 height: info.height,
                                 cursor,
                                 force_keyframe: false,
+                                captured_at: std::time::Instant::now(),
                             }),
                             Err(err) => {
                                 eprintln!("[capture] PipeWire dmabuf RAM fallback failed: {err}");
@@ -2288,6 +2290,7 @@ fn run_pipewire_stream(
                             height: info.height,
                             cursor,
                             force_keyframe: false,
+                            captured_at: std::time::Instant::now(),
                         }),
                         Err(err) => {
                             eprintln!("[capture] PipeWire shared-memory copy failed: {err}");

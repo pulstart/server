@@ -232,6 +232,8 @@ pub struct CapturedFrame {
     /// change wouldn't otherwise trigger a rebuild+IDR). The encode loop ORs
     /// this across drained frames so the request survives frame-dropping.
     pub force_keyframe: bool,
+    /// When the content was sampled; latency accounting starts here.
+    pub captured_at: std::time::Instant,
 }
 
 // SAFETY: The CVPixelBufferRef is retained and owned by this struct.
@@ -448,6 +450,53 @@ pub fn target_fps() -> u32 {
     TARGET_FPS.load(Ordering::Relaxed).max(1)
 }
 
+/// Token bucket pacing frames to a target interval: one credit per interval,
+/// banked up to [`FrameCredit::CAP`] so an irregular source (compositor commit
+/// jitter) keeps its average rate without being forced onto a fixed grid.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub struct FrameCredit {
+    credit: f64,
+    refilled_at: std::time::Instant,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl FrameCredit {
+    pub const CAP: f64 = 2.0;
+
+    pub fn new(now: std::time::Instant) -> Self {
+        Self {
+            credit: Self::CAP,
+            refilled_at: now,
+        }
+    }
+
+    /// Adds the credit earned since the last refill; returns what the cap
+    /// discarded (frame slots that went unused).
+    pub fn refill(&mut self, now: std::time::Instant, interval: std::time::Duration) -> f64 {
+        self.credit += now
+            .saturating_duration_since(self.refilled_at)
+            .as_secs_f64()
+            / interval.as_secs_f64();
+        self.refilled_at = now;
+        let overflow = (self.credit - Self::CAP).max(0.0);
+        self.credit -= overflow;
+        overflow
+    }
+
+    pub fn available(&self) -> f64 {
+        self.credit
+    }
+
+    /// Time until the balance reaches `level`, as of the last refill.
+    pub fn until(&self, level: f64, interval: std::time::Duration) -> std::time::Duration {
+        interval.mul_f64((level - self.credit).max(0.0))
+    }
+
+    pub fn take(&mut self) {
+        self.credit = (self.credit - 1.0).max(-1.0);
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -462,3 +511,30 @@ pub use linux::PlatformCapture;
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::PlatformCapture;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod tests {
+    use super::FrameCredit;
+    use std::time::{Duration, Instant};
+
+    /// The encode gate's use: a 120 fps source into a 60 fps encoder passes
+    /// every other frame on time and never loses the latest one.
+    #[test]
+    fn frame_credit_halves_a_double_rate_source() {
+        let base = Instant::now();
+        let interval = Duration::from_secs_f64(1.0 / 60.0);
+        let mut credit = FrameCredit::new(base);
+        let mut passed = 0;
+        for i in 0..1200 {
+            let now = base + Duration::from_secs_f64(i as f64 / 120.0);
+            credit.refill(now, interval);
+            if credit.until(0.75, interval).is_zero() {
+                credit.take();
+                passed += 1;
+            }
+        }
+        assert!((600..=602).contains(&passed), "{passed}");
+        credit.refill(base + Duration::from_secs(20), interval);
+        assert_eq!(credit.available(), FrameCredit::CAP);
+    }
+}

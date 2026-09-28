@@ -71,6 +71,7 @@ impl SCStreamOutputTrait for OutputHandler {
             height,
             cursor,
             force_keyframe: false,
+            captured_at: std::time::Instant::now(),
         }) {
             Ok(()) => {}
             Err(TrySendError::Full(frame)) | Err(TrySendError::Disconnected(frame)) => unsafe {

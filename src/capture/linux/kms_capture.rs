@@ -1,10 +1,11 @@
-use super::super::{CaptureBackend, CapturedCursor, CapturedFrame, DmaBufPlane, FrameData};
+use super::super::{
+    CaptureBackend, CapturedCursor, CapturedFrame, DmaBufPlane, FrameCredit, FrameData,
+};
 use super::kms_gpu_copy::KmsStabilizer;
 use super::target_frame_interval;
 use crossbeam_channel::{Sender, TrySendError};
 use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -432,18 +433,15 @@ fn find_cursor_plane(
 fn read_cursor_position(
     card: &Card,
     cursor_handle: control::plane::Handle,
-    cached_props: &mut Option<(control::property::Handle, control::property::Handle)>,
+    cached_props: &mut CrtcPosProps,
 ) -> (i32, i32) {
+    if matches!(cached_props, Some(None)) {
+        return (0, 0);
+    }
     let Ok(props) = card.get_properties(cursor_handle) else {
         return (0, 0);
     };
-
-    // Resolve CRTC_X / CRTC_Y property handles once. Property IDs are stable for
-    // a given object on a device, so after the first frame we skip the per-prop
-    // `get_property` name-resolve ioctls and read the values by handle below.
-    // Drivers exposing no CRTC_X/Y (NVIDIA legacy cursor) leave this `None` and
-    // fall back to the full walk each frame, matching the previous behavior.
-    if cached_props.is_none() {
+    let ids = *cached_props.get_or_insert_with(|| {
         let mut x_id = None;
         let mut y_id = None;
         for (prop_id, _value) in props.iter() {
@@ -455,13 +453,9 @@ fn read_cursor_position(
                 }
             }
         }
-        if let (Some(x), Some(y)) = (x_id, y_id) {
-            *cached_props = Some((x, y));
-        }
-    }
-
-    let Some((crtc_x_id, crtc_y_id)) = *cached_props else {
-        // No CRTC_X/Y on this plane — no position readback (see fn-doc above).
+        x_id.zip(y_id)
+    });
+    let Some((crtc_x_id, crtc_y_id)) = ids else {
         return (0, 0);
     };
 
@@ -500,12 +494,12 @@ struct CursorCache {
     width: u32,
     height: u32,
     serial: u64,
-    /// Resolved CRTC_X / CRTC_Y property handles for this cursor plane. Property
-    /// IDs are stable for an object on a device, so we resolve the names once and
-    /// then read the position by handle, skipping a `get_property` name-resolve
-    /// ioctl per plane property every frame (15-60us/frame on atomic drivers).
-    crtc_pos_props: Option<(control::property::Handle, control::property::Handle)>,
+    crtc_pos_props: CrtcPosProps,
 }
+
+/// CRTC_X / CRTC_Y property handles, resolved once per plane (property IDs are
+/// stable); `Some(None)` = the plane has none (NVIDIA legacy cursor).
+type CrtcPosProps = Option<Option<(control::property::Handle, control::property::Handle)>>;
 
 /// Capture cursor image from its DRM plane by mmap'ing the cursor framebuffer.
 /// With a `cache`, an unchanged framebuffer handle short-circuits the heavy
@@ -702,15 +696,11 @@ fn kms_copy_enabled() -> bool {
 }
 
 /// Damage skip: the compositor page-flips to a different framebuffer whenever
-/// it repaints, so an unchanged primary-plane framebuffer handle between
-/// pacer ticks means the scanout content is byte-identical to the previous
-/// capture. Skipping those ticks (PRIME export + stabilize + encode + send)
-/// turns a static desktop from full-fps traffic into a low keepalive cadence.
-/// Cursor-plane state (fb handle + position) is part of the change signature
-/// so cursor motion still flows to clients at full rate — its position rides
-/// `CapturedFrame`. `ST_KMS_DAMAGE=0` (also `false`/`no`/`off`) is the escape
-/// hatch for a compositor that re-renders into the bound framebuffer in place
-/// (none of KWin/Mutter/wlroots do).
+/// it repaints, so an unchanged primary-plane framebuffer means byte-identical
+/// content and nothing is captured until it (or the cursor plane) changes, bar
+/// a [`DAMAGE_KEEPALIVE`] resend. `ST_KMS_DAMAGE=0` (also `false`/`no`/`off`)
+/// captures every interval, for a compositor that re-renders into the bound
+/// framebuffer in place (none of KWin/Mutter/wlroots do).
 fn kms_damage_skip_enabled() -> bool {
     !matches!(
         std::env::var("ST_KMS_DAMAGE").as_deref(),
@@ -762,6 +752,7 @@ fn stabilize_frame(
         cursor: frame.cursor.clone(),
         // Preserve a keyframe demand set on the source frame by the loop.
         force_keyframe: frame.force_keyframe,
+        captured_at: frame.captured_at,
     })
 }
 
@@ -771,6 +762,7 @@ fn capture_frame(
     cursor_handle: Option<control::plane::Handle>,
     cursor_cache: Option<&mut CursorCache>,
 ) -> Result<CapturedFrame, String> {
+    let captured_at = Instant::now();
     let plane = card
         .get_plane(plane_handle)
         .map_err(|e| format!("get_plane: {e}"))?;
@@ -830,6 +822,7 @@ fn capture_frame(
         height,
         cursor,
         force_keyframe: false,
+        captured_at,
     })
 }
 
@@ -996,24 +989,15 @@ impl CaptureBackend for KmsCapture {
                 None
             };
 
-            // Prefer a kernel timerfd pacer so the capture cadence doesn't drift
-            // under load the way `thread::sleep(remainder)` does. If the kernel
-            // rejects the syscall for some reason, fall back to the legacy
-            // sleep-based loop.
-            let mut pacer = TimerFdPacer::new(target_interval).ok();
-            if pacer.is_none() {
-                eprintln!("[kms] timerfd unavailable; falling back to sleep-based pacer");
-            }
-
             // Damage-skip state (see kms_damage_skip_enabled).
             let damage_skip = kms_damage_skip_enabled();
             if !damage_skip {
                 println!("[kms] ST_KMS_DAMAGE=0: damage skip disabled (full-fps capture)");
             }
+            let mut scheduler = FlipScheduler::new(target_interval, Instant::now());
             let mut last_scanout_fb: Option<control::framebuffer::Handle> = None;
             let mut last_cursor_sig: Option<(Option<control::framebuffer::Handle>, i32, i32)> =
                 None;
-            let mut last_forwarded = Instant::now();
 
             // C4: cache the resolved plane handle. Plane handles are stable; only
             // the framebuffer bound to a plane flips. So we reuse the validated
@@ -1022,70 +1006,48 @@ impl CaptureBackend for KmsCapture {
             let mut current_plane = plane_handle;
             // C5: per-thread cursor dirty-tracking cache.
             let mut cursor_cache = CursorCache::default();
-            // C9: throttle for capture-overrun (coalesced timerfd expiration) logs.
-            let mut last_overshoot_log: Option<Instant> = None;
+            let mut last_overrun_log: Option<Instant> = None;
 
             while running.load(Ordering::SeqCst) {
-                let frame_start = Instant::now();
                 // Adaptive fps retargets a running capture.
                 let wanted = target_frame_interval();
                 if wanted != target_interval {
                     target_interval = wanted;
-                    if let Some(p) = pacer.as_mut() {
-                        if let Err(e) = p.set_interval(wanted) {
-                            eprintln!("[kms] timerfd re-arm failed ({e}); sleep pacing");
-                            pacer = None;
-                        }
-                    }
+                    scheduler.set_interval(wanted);
                 }
 
-                // Damage-skip probe (see kms_damage_skip_enabled): two cheap
-                // get_plane ioctls decide whether anything changed since the
-                // last forwarded frame. Probe failures and capture-error
-                // streaks always take the full capture path below — it owns
-                // error handling and plane re-acquisition.
-                let skip_unchanged = damage_skip
-                    && capture_err_streak == 0
-                    && match card
-                        .get_plane(current_plane)
-                        .ok()
-                        .and_then(|p| p.framebuffer())
-                    {
-                        Some(fb) => {
-                            let cursor_sig = cursor_handle.map(|h| {
-                                let cursor_fb =
-                                    card.get_plane(h).ok().and_then(|p| p.framebuffer());
-                                let (x, y) = read_cursor_position(
-                                    &card,
-                                    h,
-                                    &mut cursor_cache.crtc_pos_props,
-                                );
-                                (cursor_fb, x, y)
-                            });
-                            let unchanged =
-                                last_scanout_fb == Some(fb) && last_cursor_sig == cursor_sig;
-                            last_scanout_fb = Some(fb);
-                            last_cursor_sig = cursor_sig;
-                            unchanged && last_forwarded.elapsed() < DAMAGE_KEEPALIVE
-                        }
-                        None => {
-                            last_scanout_fb = None;
-                            false
-                        }
-                    };
-                if skip_unchanged {
-                    super::super::record_unchanged_capture_tick();
-                    match pacer.as_mut() {
-                        Some(p) => {
-                            let _ = p.wait();
-                        }
-                        None => {
-                            let elapsed = frame_start.elapsed();
-                            if elapsed < target_interval {
-                                thread::sleep(target_interval - elapsed);
-                            }
-                        }
+                // Probe failures and capture-error streaks always take the full
+                // capture path below — it owns error handling and plane
+                // re-acquisition.
+                let probe = (capture_err_streak == 0)
+                    .then(|| card.get_plane(current_plane).ok()?.framebuffer())
+                    .flatten();
+                let now = Instant::now();
+                let capture_now = match probe {
+                    Some(fb) => {
+                        let cursor_sig = cursor_handle.map(|h| {
+                            let cursor_fb = card.get_plane(h).ok().and_then(|p| p.framebuffer());
+                            let (x, y) =
+                                read_cursor_position(&card, h, &mut cursor_cache.crtc_pos_props);
+                            (cursor_fb, x, y)
+                        });
+                        let flipped = !damage_skip || last_scanout_fb != Some(fb);
+                        let cursor_moved = last_cursor_sig != cursor_sig;
+                        last_scanout_fb = Some(fb);
+                        last_cursor_sig = cursor_sig;
+                        scheduler.tick(now, flipped, cursor_moved)
                     }
+                    None => {
+                        last_scanout_fb = None;
+                        scheduler.force(now);
+                        true
+                    }
+                };
+                for _ in 0..scheduler.take_idle_slots() {
+                    super::super::record_unchanged_capture_tick();
+                }
+                if !capture_now {
+                    thread::sleep(FLIP_POLL);
                     continue;
                 }
 
@@ -1173,8 +1135,10 @@ impl CaptureBackend for KmsCapture {
                             Some(frame)
                         };
 
+                        if to_send.is_none() {
+                            scheduler.missed();
+                        }
                         if let Some(frame) = to_send {
-                            last_forwarded = Instant::now();
                             match tx.try_send(frame) {
                                 Ok(()) => {}
                                 Err(TrySendError::Full(_)) => {
@@ -1216,36 +1180,12 @@ impl CaptureBackend for KmsCapture {
                     }
                 }
 
-                match pacer.as_mut() {
-                    Some(p) => {
-                        // Block on the timerfd; coalesced expirations (capture was
-                        // slower than the target interval) mean we skip ahead.
-                        match p.wait() {
-                            // C9: >1 expiration = capture overran the frame
-                            // interval and the kernel coalesced the missed ticks.
-                            Ok(expirations) if expirations > 1 => {
-                                let now = Instant::now();
-                                if last_overshoot_log
-                                    .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2))
-                                {
-                                    eprintln!(
-                                        "[kms] capture overran frame interval by {} tick(s) \
-                                         (encode/copy too slow for {:?} cadence)",
-                                        expirations - 1,
-                                        target_interval
-                                    );
-                                    last_overshoot_log = Some(now);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    None => {
-                        let elapsed = frame_start.elapsed();
-                        if elapsed < target_interval {
-                            thread::sleep(target_interval - elapsed);
-                        }
-                    }
+                let took = now.elapsed();
+                if took > target_interval
+                    && last_overrun_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
+                {
+                    eprintln!("[kms] capture took {took:.2?} (> {target_interval:.2?} interval)");
+                    last_overrun_log = Some(Instant::now());
                 }
             }
 
@@ -1292,68 +1232,88 @@ impl CaptureBackend for KmsCapture {
     }
 }
 
-/// Periodic kernel timer wrapping `timerfd_create` / `timerfd_settime`. Provides
-/// a drift-free pacing source for the capture loop — `read()` blocks until the
-/// next expiration and returns the number of missed ticks if capture overran
-/// the target interval.
-struct TimerFdPacer {
-    fd: OwnedFd,
+/// Flip-driven pacing: the primary plane's framebuffer changes when the
+/// compositor commits a frame (already rendered — KWin/NVIDIA waits before
+/// committing), so polling it and capturing on change reads each frame within
+/// [`FLIP_POLL`] of its commit instead of up to a full interval later on a
+/// fixed tick. A [`FrameCredit`] caps the rate; a flip arriving without credit
+/// is skipped for the next one (e.g. 144 Hz → 120 fps drops 1 in 6) unless
+/// none follows within [`HOLD_INTERVALS`].
+struct FlipScheduler {
+    interval: Duration,
+    credit: FrameCredit,
+    captured_at: Instant,
+    dirty: bool,
+    hold_until: Option<Instant>,
+    idle_slots: f64,
 }
 
-impl TimerFdPacer {
-    fn new(interval: Duration) -> io::Result<Self> {
-        let raw = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
+const FLIP_POLL: Duration = Duration::from_millis(1);
+const HOLD_INTERVALS: f64 = 1.5;
+
+impl FlipScheduler {
+    fn new(interval: Duration, now: Instant) -> Self {
+        Self {
+            interval,
+            credit: FrameCredit::new(now),
+            captured_at: now.checked_sub(DAMAGE_KEEPALIVE).unwrap_or(now),
+            dirty: true,
+            hold_until: None,
+            idle_slots: 0.0,
         }
-        let mut pacer = Self {
-            fd: unsafe { OwnedFd::from_raw_fd(raw) },
-        };
-        pacer.set_interval(interval)?;
-        Ok(pacer)
     }
 
-    fn set_interval(&mut self, interval: Duration) -> io::Result<()> {
-        let spec = libc::itimerspec {
-            it_interval: duration_to_timespec(interval),
-            it_value: duration_to_timespec(interval),
-        };
-        let rc =
-            unsafe { libc::timerfd_settime(self.fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+    fn set_interval(&mut self, interval: Duration) {
+        self.interval = interval;
     }
 
-    /// Block until the next expiration. Returns the number of expirations that
-    /// occurred since the last read (>= 1). EINTR is transparently retried.
-    fn wait(&mut self) -> io::Result<u64> {
-        let mut expirations: u64 = 0;
-        loop {
-            let n = unsafe {
-                libc::read(
-                    self.fd.as_raw_fd(),
-                    &mut expirations as *mut u64 as *mut libc::c_void,
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(err);
+    /// `flipped`: new primary framebuffer; `changed`: anything else visible
+    /// (cursor). Returns whether to capture now.
+    fn tick(&mut self, now: Instant, flipped: bool, changed: bool) -> bool {
+        let unused = self.credit.refill(now, self.interval);
+        if !self.dirty {
+            self.idle_slots += unused;
+        }
+        self.dirty |= flipped || changed;
+        let capture = if !self.dirty {
+            now.saturating_duration_since(self.captured_at) >= DAMAGE_KEEPALIVE
+        } else if self.credit.available() >= 1.0 {
+            flipped || self.hold_until.is_none_or(|h| now >= h)
+        } else {
+            if flipped {
+                self.hold_until = Some(now + self.interval.mul_f64(HOLD_INTERVALS));
             }
-            return Ok(expirations);
+            false
+        };
+        if capture {
+            self.consume(now);
         }
+        capture
     }
-}
 
-fn duration_to_timespec(d: Duration) -> libc::timespec {
-    libc::timespec {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_nsec: d.subsec_nanos() as libc::c_long,
+    fn force(&mut self, now: Instant) {
+        self.credit.refill(now, self.interval);
+        self.consume(now);
+    }
+
+    /// The capture produced no frame; its content is still owed.
+    fn missed(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Frame slots that passed with nothing to send, so adaptive fps counts a
+    /// static or slow-updating screen as delivered.
+    fn take_idle_slots(&mut self) -> u32 {
+        let whole = self.idle_slots.floor();
+        self.idle_slots -= whole;
+        whole as u32
+    }
+
+    fn consume(&mut self, now: Instant) {
+        self.credit.take();
+        self.captured_at = now;
+        self.dirty = false;
+        self.hold_until = None;
     }
 }
 
@@ -1479,6 +1439,262 @@ mod tests {
                 load.join().unwrap();
             }
         }
+    }
+
+    struct Sim {
+        captures: Vec<f64>,
+        ages: Vec<f64>,
+        idle_slots: u32,
+    }
+
+    /// Polls a 120 fps scheduler every FLIP_POLL (1 ms) against flips at the
+    /// given ms offsets; `every_tick` marks each poll as changed (damage skip off).
+    fn simulate(flips: &[f64], total_ms: u32, every_tick: bool) -> Sim {
+        let base = Instant::now();
+        let at = |ms: f64| base + Duration::from_secs_f64(ms / 1000.0);
+        let interval = Duration::from_secs_f64(1.0 / 120.0);
+        let mut sched = FlipScheduler::new(interval, base);
+        let mut sim = Sim {
+            captures: Vec::new(),
+            ages: Vec::new(),
+            idle_slots: 0,
+        };
+        let (mut next, mut newest) = (0, 0.0);
+        for t in 0..total_ms {
+            let t = t as f64;
+            let mut flipped = t == 0.0 || every_tick;
+            while next < flips.len() && flips[next] <= t {
+                newest = flips[next];
+                next += 1;
+                flipped = true;
+            }
+            if sched.tick(at(t), flipped, false) {
+                sim.captures.push(t);
+                sim.ages.push(t - newest);
+            }
+            sim.idle_slots += sched.take_idle_slots();
+        }
+        sim
+    }
+
+    fn periodic(period_ms: f64, total_ms: u32) -> Vec<f64> {
+        (1..)
+            .map(|i| i as f64 * period_ms)
+            .take_while(|&t| t < total_ms as f64)
+            .collect()
+    }
+
+    #[test]
+    fn flip_scheduler_decimates_faster_display_on_flip_edges() {
+        let sim = simulate(&periodic(1000.0 / 144.0, 10_000), 10_000, false);
+        assert!(
+            (1190..=1201).contains(&sim.captures.len()),
+            "{}",
+            sim.captures.len()
+        );
+        let worst = sim.ages.iter().cloned().fold(0.0, f64::max);
+        assert!(worst < 1.0, "captured a flip {worst} ms late");
+    }
+
+    #[test]
+    fn flip_scheduler_takes_every_flip_below_target() {
+        let flips = periodic(1000.0 / 60.0, 10_000);
+        let sim = simulate(&flips, 10_000, false);
+        assert_eq!(sim.captures.len(), flips.len() + 1);
+        assert!(sim.ages.iter().all(|&a| a < 1.0));
+        let delivered = sim.captures.len() as u32 + sim.idle_slots;
+        assert!((1190..=1201).contains(&delivered), "{delivered}");
+    }
+
+    #[test]
+    fn flip_scheduler_follows_jittered_commits() {
+        let pattern = [3.9, 7.8, 8.7, 5.1, 9.2, 6.4, 7.6];
+        let mut t = 0.0;
+        let flips: Vec<f64> = (0..)
+            .map(|i| {
+                t += pattern[i % pattern.len()];
+                t
+            })
+            .take_while(|&t| t < 10_000.0)
+            .collect();
+        let sim = simulate(&flips, 10_000, false);
+        assert!(
+            (1190..=1201).contains(&sim.captures.len()),
+            "{}",
+            sim.captures.len()
+        );
+        let mean = sim.ages.iter().sum::<f64>() / sim.ages.len() as f64;
+        assert!(mean < 1.5, "mean flip age {mean} ms");
+    }
+
+    #[test]
+    fn flip_scheduler_never_strands_the_last_update() {
+        let sim = simulate(&[1.0, 2.0, 3.0], 100, false);
+        let last = *sim.captures.last().unwrap();
+        assert!(
+            (3.0..=3.0 + 1.5 * 1000.0 / 120.0 + 1.0).contains(&last),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn flip_scheduler_static_screen_sends_keepalives_and_counts_idle_slots() {
+        let sim = simulate(&[], 1_000, false);
+        assert_eq!(sim.captures, vec![0.0, 250.0, 500.0, 750.0]);
+        let delivered = sim.captures.len() as u32 + sim.idle_slots;
+        assert!((118..=121).contains(&delivered), "{delivered}");
+    }
+
+    #[test]
+    fn flip_scheduler_without_damage_skip_holds_target_rate() {
+        let sim = simulate(&[], 10_000, true);
+        assert!(
+            (1190..=1201).contains(&sim.captures.len()),
+            "{}",
+            sim.captures.len()
+        );
+    }
+
+    /// Age of each delivered frame's content (time since the scanout flip it
+    /// shows, seen by an independent 200 µs poller) on the real capture loop.
+    /// `ST_TEST_FLIP_AGE=1 sudo -E <test-binary> live_capture_flip_age --nocapture`
+    #[test]
+    fn live_capture_flip_age() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
+        if std::env::var_os("ST_TEST_FLIP_AGE").is_none() {
+            return;
+        }
+        super::super::super::set_target_fps(120);
+        let _claim = super::super::super::Nv12Claim::new();
+        let (card, _) = Card::open(false).unwrap();
+        card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
+            .unwrap();
+        let plane = find_active_plane(&card).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flips = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let observer = {
+            let (stop, flips) = (Arc::clone(&stop), Arc::clone(&flips));
+            thread::spawn(move || {
+                st_protocol::thread_priority::promote_current_thread(
+                    st_protocol::thread_priority::ThreadRole::Capture,
+                );
+                let mut last = None;
+                while !stop.load(Ordering::Relaxed) {
+                    let fb = card.get_plane(plane).ok().and_then(|p| p.framebuffer());
+                    if fb != last {
+                        last = fb;
+                        flips.lock().unwrap().push(Instant::now());
+                    }
+                    thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let mut capture = KmsCapture::new();
+        capture.start(tx).unwrap();
+        thread::sleep(Duration::from_secs(1));
+        while rx.try_recv().is_ok() {}
+        let begin = Instant::now();
+        let mut received = Vec::new();
+        while begin.elapsed() < Duration::from_secs(10) {
+            if let Ok(frame) = rx.recv_timeout(Duration::from_millis(100)) {
+                received.push((frame.captured_at, Instant::now()));
+            }
+        }
+        capture.stop();
+        stop.store(true, Ordering::Relaxed);
+        observer.join().unwrap();
+        let flips = flips.lock().unwrap();
+        let flip_rate = flips.iter().filter(|&&f| f >= begin).count() as f64 / 10.0;
+        let stats = |mut v: Vec<Duration>| {
+            v.sort();
+            let n = v.len();
+            format!(
+                "mean={:.2?} p50={:.2?} p90={:.2?} p99={:.2?}",
+                v.iter().sum::<Duration>() / n as u32,
+                v[n / 2],
+                v[n * 9 / 10],
+                v[n * 99 / 100]
+            )
+        };
+        let ages: Vec<Duration> = received
+            .iter()
+            .filter_map(|&(c, _)| {
+                // The observer can see a flip up to one poll after the capture.
+                let i = flips.partition_point(|&f| f <= c + Duration::from_micros(200));
+                (i > 0).then(|| c.saturating_duration_since(flips[i - 1]))
+            })
+            .collect();
+        let durations = received.iter().map(|&(c, r)| r - c).collect();
+        eprintln!(
+            "[flip-age] flips {flip_rate:.0}/s delivered {:.0} fps | flip->sample {} | sample->frame {}",
+            received.len() as f64 / 10.0,
+            stats(ages),
+            stats(durations)
+        );
+    }
+
+    /// Flip-driven pacing reads a framebuffer the moment it is committed, so
+    /// its content must already be final: a readback right at the flip must
+    /// equal one taken just after, with the GPU saturated (where a late render
+    /// would show). Needs an animating window (e.g. `vkcube --wsi wayland`).
+    /// `ST_TEST_FLIP_FINAL=1 sudo -E <test-binary> live_flip_content_is_final --nocapture`
+    #[test]
+    fn live_flip_content_is_final() {
+        use super::super::kms_gpu_copy::tests as kms;
+        use std::sync::atomic::AtomicBool;
+        if std::env::var_os("ST_TEST_FLIP_FINAL").is_none() {
+            return;
+        }
+        st_protocol::thread_priority::promote_current_thread(
+            st_protocol::thread_priority::ThreadRole::Capture,
+        );
+        let (card, node) = Card::open(false).unwrap();
+        let node = node.unwrap();
+        card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
+            .unwrap();
+        let plane = find_active_plane(&card).unwrap();
+        let mut vk = kms::nv12_stabilizer(&node, true);
+        let stop = Arc::new(AtomicBool::new(false));
+        let load = kms::spawn_gpu_load(node.clone(), 2560, 1440, Arc::clone(&stop));
+        let fb = || card.get_plane(plane).ok().and_then(|p| p.framebuffer());
+        let mut last = fb();
+        let (mut flips, mut compared, mut mismatched) = (0, 0, 0);
+        let end = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < end {
+            thread::sleep(Duration::from_micros(250));
+            let now = fb();
+            if now == last {
+                continue;
+            }
+            last = now;
+            flips += 1;
+            let Ok(frame) = capture_frame(&card, plane, None, None) else {
+                continue;
+            };
+            let (Ok(a), Ok(b)) = (
+                stabilize_frame(&mut vk, &frame),
+                stabilize_frame(&mut vk, &frame),
+            ) else {
+                continue;
+            };
+            if fb() != now {
+                continue;
+            }
+            let (FrameData::RamNv12(a), FrameData::RamNv12(b)) = (&a.data, &b.data) else {
+                panic!("expected NV12");
+            };
+            compared += 1;
+            if a[..] != b[..] {
+                mismatched += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        load.join().unwrap();
+        eprintln!("[flip-final] flips={flips} compared={compared} mismatched={mismatched}");
+        assert!(compared >= 20, "too few flips to judge; animate the screen");
+        assert_eq!(mismatched, 0, "scanout changed after its flip was seen");
     }
 
     #[test]

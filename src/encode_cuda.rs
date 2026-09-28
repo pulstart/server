@@ -1081,6 +1081,7 @@ mod tests {
             height: 480,
             cursor: None,
             force_keyframe: false,
+            captured_at: std::time::Instant::now(),
         };
         enc.reset_for_keyframe();
         let mut nals = enc.encode(&frame).expect("encode frame 0");
@@ -1135,6 +1136,7 @@ mod tests {
             height: h,
             cursor: None,
             force_keyframe: true,
+            captured_at: std::time::Instant::now(),
         };
         enc.reset_for_keyframe();
         // Feed a few frames so the decoder has a clean IDR to lock onto.

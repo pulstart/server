@@ -635,6 +635,7 @@ impl CaptureBackend for NvfbcCapture {
                             height: frame_info.height,
                             cursor: None,
                             force_keyframe: false,
+                            captured_at: std::time::Instant::now(),
                         };
                         match tx.try_send(frame) {
                             Ok(()) => {}
