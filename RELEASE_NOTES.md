@@ -1,3 +1,22 @@
+# 0.10.1
+
+Server-only release; no wire format change.
+
+- An installed host knew nothing about the monitor arrangement. The KDE
+  tool that reports it (kscreen-doctor) inherited the release bundle's
+  library path, could not load the bundle's older libstdc++ and exited; the
+  host carried on without a primary monitor, rotation or positions and
+  logged nothing. On a host with several monitors that meant: the wrong
+  monitor offered as the default, a rotated monitor shown sideways, and the
+  pointer landing somewhere else than the client's cursor. Host tools are
+  now started without the bundle's libraries, and a missing arrangement is
+  logged with its reason. Development builds have no bundle, which is how
+  0.10.0 passed its tests.
+- Stopping or restarting the service (every update does) now unregisters
+  from the signaling server. A host stopped by systemd used to leave its
+  registration behind, and the restarted host was refused for up to two
+  minutes: it could not be reached over the internet meanwhile.
+
 # 0.10.0
 
 Wire format changed: update hosts and clients together (client 0.13.0).
