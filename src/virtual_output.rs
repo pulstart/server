@@ -450,7 +450,7 @@ fn set_refresh_rate(output: &str, width: u32, height: u32, refresh_millihz: u32)
     }
     let hz = (refresh_millihz + 500) / 1000;
     let run = |arg: String| {
-        let mut command = std::process::Command::new("kscreen-doctor");
+        let mut command = crate::host_tools::host_command("kscreen-doctor");
         command
             .arg(&arg)
             .stdin(std::process::Stdio::null())

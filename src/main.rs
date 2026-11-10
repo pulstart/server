@@ -33,6 +33,7 @@ mod file_transfer;
 mod game_mode;
 #[cfg(target_os = "linux")]
 mod gpu_clock;
+mod host_tools;
 mod input;
 #[cfg(target_os = "linux")]
 mod linux_uring;
@@ -5152,7 +5153,7 @@ fn probe_backends() {
     } else {
         None
     };
-    let pipewire_ok = std::process::Command::new("dbus-send")
+    let pipewire_ok = crate::host_tools::host_command("dbus-send")
         .args([
             "--session",
             "--dest=org.freedesktop.portal.Desktop",
@@ -6411,6 +6412,23 @@ async fn run_server(state: Arc<ServerState>) -> Result<(), String> {
         let _ctrl_c_task = tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             println!("\n[server] Shutting down...");
+            ctrl.request_shutdown();
+        });
+    }
+    // systemd stops a service with SIGTERM. Dying on it left the API lease
+    // behind, and the restarted host was refused (409) until that expired:
+    // every restart or update made the host unreachable for two minutes.
+    #[cfg(unix)]
+    {
+        let ctrl = Arc::clone(&state.control);
+        let _terminate_task = tokio::spawn(async move {
+            let Ok(mut terminate) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            else {
+                return;
+            };
+            terminate.recv().await;
+            println!("[server] Terminated; shutting down...");
             ctrl.request_shutdown();
         });
     }

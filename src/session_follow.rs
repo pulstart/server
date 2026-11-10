@@ -106,7 +106,7 @@ fn start_user_tray(uid: u32) {
         return;
     };
     let machine = format!("{name}@.host");
-    let status = std::process::Command::new("systemctl")
+    let status = crate::host_tools::host_command("systemctl")
         .args([
             "--machine",
             &machine,
@@ -123,7 +123,7 @@ fn start_user_tray(uid: u32) {
 }
 
 fn username_for_uid(uid: u32) -> Option<String> {
-    let output = std::process::Command::new("getent")
+    let output = crate::host_tools::host_command("getent")
         .args(["passwd", &uid.to_string()])
         .output()
         .ok()?;
@@ -218,7 +218,7 @@ fn active_uid_from_loginctl() -> Option<u32> {
 }
 
 fn loginctl_value(args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("loginctl")
+    let output = crate::host_tools::host_command("loginctl")
         .args(args)
         .output()
         .ok()?;

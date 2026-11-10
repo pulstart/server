@@ -285,7 +285,7 @@ mod platform {
 
     /// Detect the PulseAudio monitor source for the default sink.
     pub fn detect_monitor_source() -> Option<String> {
-        let output = std::process::Command::new("pactl")
+        let output = crate::host_tools::host_command("pactl")
             .arg("info")
             .output()
             .ok()?;

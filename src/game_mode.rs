@@ -216,7 +216,10 @@ fn spawn_wlroots_poll(
 }
 
 fn run_cli(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    let out = crate::host_tools::host_command(cmd)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

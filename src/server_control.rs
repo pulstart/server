@@ -664,7 +664,7 @@ pub fn show_notification(body: String) {
 
     #[cfg(target_os = "linux")]
     thread::spawn(move || {
-        let _ = std::process::Command::new("notify-send")
+        let _ = crate::host_tools::host_command("notify-send")
             .arg("st-server")
             .arg(&body)
             .status();

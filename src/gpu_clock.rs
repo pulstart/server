@@ -296,7 +296,7 @@ mod tests {
         std::env::set_var("ST_STATE_DIR", tmp.path());
         let node = "/dev/dri/renderD128";
         let pstate = || {
-            let out = std::process::Command::new("nvidia-smi")
+            let out = crate::host_tools::host_command("nvidia-smi")
                 .args(["--query-gpu=pstate,clocks.mem", "--format=csv,noheader"])
                 .output()
                 .unwrap();

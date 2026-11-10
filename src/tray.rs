@@ -1647,7 +1647,7 @@ fn copy_to_clipboard(text: &str) {
 
 #[cfg(target_os = "linux")]
 fn try_kdialog(current: &str) -> Result<Option<String>, String> {
-    match std::process::Command::new("kdialog")
+    match crate::host_tools::host_command("kdialog")
         .args([
             "--inputbox",
             "Enter new authentication token:",
@@ -1673,7 +1673,7 @@ fn try_kdialog(current: &str) -> Result<Option<String>, String> {
 
 #[cfg(target_os = "linux")]
 fn try_zenity(current: &str) -> Result<Option<String>, String> {
-    match std::process::Command::new("zenity")
+    match crate::host_tools::host_command("zenity")
         .args([
             "--entry",
             "--title=Set Server Token",

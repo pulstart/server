@@ -295,31 +295,77 @@ pub fn parse_kscreen(json: &str) -> Option<Vec<LayoutOutput>> {
 /// elsewhere the arrangement stays unknown and absolute input passes through.
 #[cfg(target_os = "linux")]
 pub fn query_layout() -> Option<Vec<LayoutOutput>> {
-    let mut command = std::process::Command::new("kscreen-doctor");
+    let layout = run_kscreen_doctor().and_then(|json| {
+        parse_kscreen(&json).ok_or_else(|| "kscreen-doctor listed no enabled output".to_string())
+    });
+    report_layout(layout.as_ref().err());
+    layout.ok()
+}
+
+#[cfg(target_os = "linux")]
+fn run_kscreen_doctor() -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut command = crate::host_tools::host_command("kscreen-doctor");
     command
         .arg("-j")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if std::env::var_os("ST_SYSTEM_MODE").is_some() {
-        crate::session_follow::run_as_active_user(&mut command)?;
+        crate::session_follow::run_as_active_user(&mut command)
+            .ok_or_else(|| "no active user session".to_string())?;
     }
-    let mut child = command.spawn().ok()?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("kscreen-doctor: {error}"))?;
     // Read while it runs: a desktop with many monitors prints more than a
     // pipe holds, and the tool would block on a pipe nobody drains.
-    let mut stdout = child.stdout.take()?;
-    let (json_tx, json_rx) = crossbeam_channel::bounded(1);
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let (output_tx, output_rx) = crossbeam_channel::bounded(1);
     std::thread::spawn(move || {
-        let mut json = String::new();
-        let read = std::io::Read::read_to_string(&mut stdout, &mut json);
-        let _ = json_tx.send(read.map(|_| json));
+        let (mut json, mut errors) = (String::new(), String::new());
+        if let Some(mut stdout) = stdout {
+            let _ = stdout.read_to_string(&mut json);
+        }
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut errors);
+        }
+        let _ = output_tx.send((json, errors));
     });
-    let json = json_rx.recv_timeout(Duration::from_secs(3));
-    if json.is_err() {
+    let output = output_rx.recv_timeout(Duration::from_secs(3));
+    if output.is_err() {
         let _ = child.kill();
     }
     let _ = child.wait();
-    parse_kscreen(&json.ok()?.ok()?)
+    let (json, errors) = output.map_err(|_| "kscreen-doctor did not answer".to_string())?;
+    if json.trim().is_empty() {
+        return Err(errors
+            .lines()
+            .next()
+            .unwrap_or("kscreen-doctor printed nothing")
+            .to_string());
+    }
+    Ok(json)
+}
+
+/// Says once why the arrangement is unknown, and once when it is back: the
+/// installed service ran without one for a release and logged nothing.
+#[cfg(target_os = "linux")]
+fn report_layout(failure: Option<&String>) {
+    static REPORTED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut reported = REPORTED.lock().unwrap();
+    if reported.as_ref() == failure {
+        return;
+    }
+    match failure {
+        Some(reason) => eprintln!(
+            "[outputs] monitor arrangement unknown ({reason}): no primary, rotation or \
+             positions; absolute pointer input spans the whole desktop"
+        ),
+        None => println!("[outputs] monitor arrangement known"),
+    }
+    *reported = failure.cloned();
 }
 
 #[cfg(not(target_os = "linux"))]

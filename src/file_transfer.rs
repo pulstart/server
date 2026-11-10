@@ -908,7 +908,7 @@ pub fn set_clipboard_file(path: &Path) {
     let uri = format!("file://{}", path.display());
     // Try Wayland first, then X11.
     if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        let _ = std::process::Command::new("wl-copy")
+        let _ = crate::host_tools::host_command("wl-copy")
             .arg("--type")
             .arg("text/uri-list")
             .stdin(std::process::Stdio::piped())
@@ -921,7 +921,7 @@ pub fn set_clipboard_file(path: &Path) {
                 child.wait()
             });
     } else {
-        let _ = std::process::Command::new("xclip")
+        let _ = crate::host_tools::host_command("xclip")
             .args(["-selection", "clipboard", "-target", "text/uri-list", "-i"])
             .stdin(std::process::Stdio::piped())
             .spawn()

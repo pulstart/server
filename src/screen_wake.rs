@@ -137,7 +137,7 @@ mod linux {
     }
 
     fn build_dbus_cmd(bin: &str) -> Option<Command> {
-        let mut c = Command::new(bin);
+        let mut c = crate::host_tools::host_command(bin);
         match bin {
             "dbus-send" => {
                 c.args([
@@ -194,7 +194,7 @@ mod linux {
         let mut errs = Vec::new();
         for (label, argv) in attempts {
             let (program, rest) = argv.split_first().unwrap();
-            let status = Command::new(program)
+            let status = crate::host_tools::host_command(program)
                 .args(rest)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

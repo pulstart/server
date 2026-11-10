@@ -392,12 +392,12 @@ fn run_file_clipboard_loop(
 fn detect_clipboard_files() -> Vec<PathBuf> {
     // Try Wayland first, then X11.
     let output = if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        std::process::Command::new("wl-paste")
+        crate::host_tools::host_command("wl-paste")
             .args(["--type", "text/uri-list", "--no-newline"])
             .output()
             .ok()
     } else {
-        std::process::Command::new("xclip")
+        crate::host_tools::host_command("xclip")
             .args(["-selection", "clipboard", "-target", "text/uri-list", "-o"])
             .output()
             .ok()
