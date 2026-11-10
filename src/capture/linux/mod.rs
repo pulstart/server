@@ -10,10 +10,10 @@
 //!
 //! Override with env var: `ST_CAPTURE=kms|nvfbc|pipewire|wayland|x11`
 
-use super::{CaptureBackend, CapturedFrame};
+use super::{CaptureBackend, CaptureControl, CaptureOutput, CapturedFrame};
 use crossbeam_channel::Sender;
-use st_protocol::control::OutputInfo;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 mod csc;
 pub mod ext_image_copy;
@@ -23,6 +23,7 @@ pub mod kms_gpu_copy;
 mod kms_vk_copy;
 mod nvfbc_capture;
 mod pipewire_capture;
+mod synthetic_capture;
 pub mod wl_capture;
 pub mod x11_capture;
 
@@ -34,14 +35,6 @@ enum DisplayServer {
     X11,
     Wayland,
     Unknown,
-}
-
-pub fn target_fps() -> u32 {
-    super::target_fps()
-}
-
-pub fn target_frame_interval() -> Duration {
-    Duration::from_secs_f64(1.0 / target_fps() as f64)
 }
 
 fn detect_display_server() -> DisplayServer {
@@ -74,14 +67,32 @@ enum Backend {
     Kms(kms_capture::KmsCapture),
     X11(x11_capture::X11Capture),
     PipeWire(pipewire_capture::PipeWireCapture),
+    Synthetic(synthetic_capture::SyntheticCapture),
 }
 
 pub struct PlatformCapture {
     backend: Backend,
     display_server: DisplayServer,
+    exact_output: bool,
 }
 
 impl PlatformCapture {
+    /// Pin the capture to `id` with no cross-backend fallback: for any output
+    /// but the default one, a fallback would stream the wrong monitor.
+    pub fn select_exact_output(&mut self, id: u32) {
+        self.select_output(id);
+        self.exact_output = true;
+    }
+
+    /// Capture a virtual output, which exists only as a PipeWire node.
+    pub fn for_pipewire_node(node: crate::virtual_output::PipeWireNode) -> Self {
+        Self {
+            backend: Backend::PipeWire(pipewire_capture::PipeWireCapture::for_node(node)),
+            display_server: detect_display_server(),
+            exact_output: true,
+        }
+    }
+
     pub fn new() -> Self {
         // Check for explicit override
         if let Ok(override_val) = std::env::var("ST_CAPTURE") {
@@ -112,6 +123,7 @@ impl PlatformCapture {
                     println!("[capture] ST_CAPTURE=pipewire override: using PipeWire capture");
                     Backend::PipeWire(pipewire_capture::PipeWireCapture::new())
                 }
+                "synthetic" => Backend::Synthetic(synthetic_capture::SyntheticCapture::new()),
                 other => {
                     eprintln!("[capture] Unknown ST_CAPTURE value '{other}', ignoring");
                     return Self::auto_select();
@@ -120,6 +132,7 @@ impl PlatformCapture {
             return Self {
                 backend,
                 display_server: detect_display_server(),
+                exact_output: false,
             };
         }
 
@@ -190,6 +203,7 @@ impl PlatformCapture {
         Self {
             backend,
             display_server,
+            exact_output: false,
         }
     }
 
@@ -201,6 +215,7 @@ impl PlatformCapture {
             Backend::Kms(_) => "kms",
             Backend::X11(_) => "x11",
             Backend::PipeWire(_) => "pipewire",
+            Backend::Synthetic(_) => "synthetic",
         }
     }
 
@@ -289,17 +304,102 @@ pub fn probe_display_gpu_render_node() -> Option<String> {
     None
 }
 
+const KMS_UNKNOWN: u8 = 0;
+const KMS_YES: u8 = 1;
+const KMS_NO: u8 = 2;
+/// Whether pipelines capture with KMS, the only backend that can pin an
+/// output: probed once, then corrected by what each pipeline started on.
+static KMS_BACKEND: AtomicU8 = AtomicU8::new(KMS_UNKNOWN);
+
+/// Outputs a new pipeline could be pinned to; empty when the backend new
+/// pipelines use cannot pin one.
+pub fn enumerate_outputs() -> Vec<CaptureOutput> {
+    if synthetic_capture::enabled() {
+        return synthetic_capture::list_outputs();
+    }
+    if KMS_BACKEND.load(Ordering::Acquire) == KMS_UNKNOWN {
+        let kms = matches!(PlatformCapture::new().backend, Backend::Kms(_));
+        KMS_BACKEND.store(if kms { KMS_YES } else { KMS_NO }, Ordering::Release);
+    }
+    if KMS_BACKEND.load(Ordering::Acquire) == KMS_YES {
+        kms_capture::list_outputs()
+    } else {
+        Vec::new()
+    }
+}
+
 impl CaptureBackend for PlatformCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
+        let result = self.start_chain(tx, control);
+        // A pinned capture says nothing about what an unpinned one starts on.
+        let probes_default = !self.exact_output && !matches!(self.backend, Backend::Synthetic(_));
+        if result.is_ok() && probes_default {
+            let kms = matches!(self.backend, Backend::Kms(_));
+            KMS_BACKEND.store(if kms { KMS_YES } else { KMS_NO }, Ordering::Release);
+        }
+        result
+    }
+
+    fn stop(&mut self) {
         match &mut self.backend {
+            Backend::NvFbc(b) => b.stop(),
+            Backend::ExtImageCopy(b) => b.stop(),
+            Backend::Wayland(b) => b.stop(),
+            Backend::Kms(b) => b.stop(),
+            Backend::X11(b) => b.stop(),
+            Backend::PipeWire(b) => b.stop(),
+            Backend::Synthetic(b) => b.stop(),
+        }
+    }
+
+    fn list_outputs(&self) -> Vec<CaptureOutput> {
+        match &self.backend {
+            Backend::Kms(b) => b.list_outputs(),
+            Backend::Synthetic(b) => b.list_outputs(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn select_output(&mut self, id: u32) {
+        match &mut self.backend {
+            Backend::Kms(b) => b.select_output(id),
+            Backend::Synthetic(b) => b.select_output(id),
+            _ => {}
+        }
+    }
+}
+
+impl PlatformCapture {
+    fn start_chain(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
+        if self.exact_output {
+            // Another backend would capture whatever it defaults to and show
+            // the client a different monitor than the one it asked for.
+            return match &mut self.backend {
+                Backend::Kms(b) => b.start(tx, control),
+                Backend::PipeWire(b) if b.captures_node() => b.start(tx, control),
+                Backend::Synthetic(b) => b.start(tx, control),
+                _ => Err("this capture backend cannot pin an output".into()),
+            };
+        }
+        match &mut self.backend {
+            Backend::Synthetic(b) => b.start(tx, control),
+
             // === NvFBC path (X11) ===
             // Fallback: NvFBC → KMS → X11 → PipeWire
-            Backend::NvFbc(b) => match b.start(tx.clone()) {
+            Backend::NvFbc(b) => match b.start(tx.clone(), control) {
                 Ok(()) => Ok(()),
                 Err(nvfbc_err) => {
                     eprintln!("[capture] NvFBC failed ({nvfbc_err}), trying KMS...");
                     let mut kms = kms_capture::KmsCapture::new();
-                    match kms.start(tx.clone()) {
+                    match kms.start(tx.clone(), control) {
                         Ok(()) => {
                             self.backend = Backend::Kms(kms);
                             Ok(())
@@ -307,7 +407,7 @@ impl CaptureBackend for PlatformCapture {
                         Err(kms_err) => {
                             eprintln!("[capture] KMS failed ({kms_err}), trying X11 XShm...");
                             let mut x11 = x11_capture::X11Capture::new();
-                            match x11.start(tx.clone()) {
+                            match x11.start(tx.clone(), control) {
                                 Ok(()) => {
                                     self.backend = Backend::X11(x11);
                                     Ok(())
@@ -317,7 +417,7 @@ impl CaptureBackend for PlatformCapture {
                                         "[capture] X11 failed ({x11_err}), trying PipeWire..."
                                     );
                                     let mut pw = pipewire_capture::PipeWireCapture::new();
-                                    let result = pw.start(tx);
+                                    let result = pw.start(tx, control);
                                     if result.is_ok() {
                                         self.backend = Backend::PipeWire(pw);
                                     }
@@ -337,12 +437,12 @@ impl CaptureBackend for PlatformCapture {
             // Fallback: Wayland screencopy → KMS → PipeWire
             // Note: X11 (XWayland) is NOT in this chain — XWayland root window
             // doesn't contain Wayland desktop content.
-            Backend::Wayland(b) => match b.start(tx.clone()) {
+            Backend::Wayland(b) => match b.start(tx.clone(), control) {
                 Ok(()) => Ok(()),
                 Err(wl_err) => {
                     eprintln!("[capture] Wayland screencopy failed ({wl_err}), trying KMS...");
                     let mut kms = kms_capture::KmsCapture::new();
-                    match kms.start(tx.clone()) {
+                    match kms.start(tx.clone(), control) {
                         Ok(()) => {
                             self.backend = Backend::Kms(kms);
                             Ok(())
@@ -350,7 +450,7 @@ impl CaptureBackend for PlatformCapture {
                         Err(kms_err) => {
                             eprintln!("[capture] KMS failed ({kms_err}), trying PipeWire...");
                             let mut pw = pipewire_capture::PipeWireCapture::new();
-                            let result = pw.start(tx);
+                            let result = pw.start(tx, control);
                             if result.is_ok() {
                                 self.backend = Backend::PipeWire(pw);
                             }
@@ -367,13 +467,13 @@ impl CaptureBackend for PlatformCapture {
             // === KMS path ===
             // Fallback: KMS → X11 → PipeWire (on native X11)
             //           KMS → PipeWire (on Wayland — X11/XWayland can't capture desktop)
-            Backend::Kms(b) => match b.start(tx.clone()) {
+            Backend::Kms(b) => match b.start(tx.clone(), control) {
                 Ok(()) => Ok(()),
                 Err(kms_err) => {
                     if self.display_server != DisplayServer::Wayland {
                         eprintln!("[capture] KMS failed ({kms_err}), trying X11...");
                         let mut x11 = x11_capture::X11Capture::new();
-                        match x11.start(tx.clone()) {
+                        match x11.start(tx.clone(), control) {
                             Ok(()) => {
                                 self.backend = Backend::X11(x11);
                                 return Ok(());
@@ -386,7 +486,7 @@ impl CaptureBackend for PlatformCapture {
                         eprintln!("[capture] KMS failed ({kms_err}), trying PipeWire...");
                     }
                     let mut pw = pipewire_capture::PipeWireCapture::new();
-                    let result = pw.start(tx);
+                    let result = pw.start(tx, control);
                     if result.is_ok() {
                         self.backend = Backend::PipeWire(pw);
                     }
@@ -400,12 +500,12 @@ impl CaptureBackend for PlatformCapture {
 
             // === X11 path ===
             // Fallback: X11 → PipeWire
-            Backend::X11(b) => match b.start(tx.clone()) {
+            Backend::X11(b) => match b.start(tx.clone(), control) {
                 Ok(()) => Ok(()),
                 Err(x11_err) => {
                     eprintln!("[capture] X11 failed ({x11_err}), trying PipeWire...");
                     let mut pw = pipewire_capture::PipeWireCapture::new();
-                    let result = pw.start(tx);
+                    let result = pw.start(tx, control);
                     if result.is_ok() {
                         self.backend = Backend::PipeWire(pw);
                     }
@@ -419,14 +519,14 @@ impl CaptureBackend for PlatformCapture {
 
             // === PipeWire path ===
             // Fallback: PipeWire → ext-image-copy → Wayland screencopy → KMS
-            Backend::PipeWire(b) => match b.start(tx.clone()) {
+            Backend::PipeWire(b) => match b.start(tx.clone(), control) {
                 Ok(()) => Ok(()),
                 Err(pw_err) => {
                     if self.display_server == DisplayServer::Wayland {
                         if ext_image_copy::verify_ext_image_copy() {
                             eprintln!("[capture] PipeWire failed ({pw_err}), trying ext-image-copy-capture-v1...");
                             let mut ec = ext_image_copy::ExtImageCopyCapture::new();
-                            match ec.start(tx.clone()) {
+                            match ec.start(tx.clone(), control) {
                                 Ok(()) => {
                                     self.backend = Backend::ExtImageCopy(ec);
                                     return Ok(());
@@ -441,7 +541,7 @@ impl CaptureBackend for PlatformCapture {
                         if wl_capture::verify_wayland() {
                             eprintln!("[capture] Trying Wayland wlr-screencopy...");
                             let mut wl = wl_capture::WaylandCapture::new();
-                            match wl.start(tx.clone()) {
+                            match wl.start(tx.clone(), control) {
                                 Ok(()) => {
                                     self.backend = Backend::Wayland(wl);
                                     return Ok(());
@@ -452,7 +552,7 @@ impl CaptureBackend for PlatformCapture {
                             }
                         }
                         let mut kms = kms_capture::KmsCapture::new();
-                        let result = kms.start(tx);
+                        let result = kms.start(tx, control);
                         if result.is_ok() {
                             self.backend = Backend::Kms(kms);
                         }
@@ -469,14 +569,14 @@ impl CaptureBackend for PlatformCapture {
 
             // === ext-image-copy path ===
             // Fallback: ext-image-copy → Wayland screencopy → KMS → PipeWire
-            Backend::ExtImageCopy(b) => match b.start(tx.clone()) {
+            Backend::ExtImageCopy(b) => match b.start(tx.clone(), control) {
                 Ok(()) => Ok(()),
                 Err(ec_err) => {
                     eprintln!(
                         "[capture] ext-image-copy failed ({ec_err}), trying Wayland screencopy..."
                     );
                     let mut wl = wl_capture::WaylandCapture::new();
-                    match wl.start(tx.clone()) {
+                    match wl.start(tx.clone(), control) {
                         Ok(()) => {
                             self.backend = Backend::Wayland(wl);
                             Ok(())
@@ -486,7 +586,7 @@ impl CaptureBackend for PlatformCapture {
                                 "[capture] Wayland screencopy failed ({wl_err}), trying KMS..."
                             );
                             let mut kms = kms_capture::KmsCapture::new();
-                            match kms.start(tx.clone()) {
+                            match kms.start(tx.clone(), control) {
                                 Ok(()) => {
                                     self.backend = Backend::Kms(kms);
                                     Ok(())
@@ -496,7 +596,7 @@ impl CaptureBackend for PlatformCapture {
                                         "[capture] KMS failed ({kms_err}), trying PipeWire..."
                                     );
                                     let mut pw = pipewire_capture::PipeWireCapture::new();
-                                    let result = pw.start(tx);
+                                    let result = pw.start(tx, control);
                                     if result.is_ok() {
                                         self.backend = Backend::PipeWire(pw);
                                     }
@@ -511,39 +611,6 @@ impl CaptureBackend for PlatformCapture {
                     }
                 }
             },
-        }
-    }
-
-    fn stop(&mut self) {
-        match &mut self.backend {
-            Backend::NvFbc(b) => b.stop(),
-            Backend::ExtImageCopy(b) => b.stop(),
-            Backend::Wayland(b) => b.stop(),
-            Backend::Kms(b) => b.stop(),
-            Backend::X11(b) => b.stop(),
-            Backend::PipeWire(b) => b.stop(),
-        }
-    }
-
-    fn list_outputs(&self) -> Vec<OutputInfo> {
-        match &self.backend {
-            Backend::NvFbc(b) => b.list_outputs(),
-            Backend::ExtImageCopy(b) => b.list_outputs(),
-            Backend::Wayland(b) => b.list_outputs(),
-            Backend::Kms(b) => b.list_outputs(),
-            Backend::X11(b) => b.list_outputs(),
-            Backend::PipeWire(b) => b.list_outputs(),
-        }
-    }
-
-    fn select_output(&mut self, id: u32) -> bool {
-        match &mut self.backend {
-            Backend::NvFbc(b) => b.select_output(id),
-            Backend::ExtImageCopy(b) => b.select_output(id),
-            Backend::Wayland(b) => b.select_output(id),
-            Backend::Kms(b) => b.select_output(id),
-            Backend::X11(b) => b.select_output(id),
-            Backend::PipeWire(b) => b.select_output(id),
         }
     }
 }

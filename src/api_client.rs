@@ -352,10 +352,15 @@ impl ApiTunnelState {
     }
 }
 
+/// The host is blind to punch requests while it waits, and one failed poll
+/// among four a second is usually a hiccup: come back fast, then back off.
 fn retry_secs(consecutive_failures: u32) -> u64 {
     match consecutive_failures {
-        0 => 10,
-        1 => 30,
+        0 => 1,
+        1 => 2,
+        2 => 5,
+        3 => 10,
+        4 => 30,
         _ => 60,
     }
 }

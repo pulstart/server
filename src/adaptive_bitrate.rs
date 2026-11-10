@@ -957,6 +957,8 @@ impl ClientRateController {
     const BACKLOG_REDUCE_US: u32 = 60_000;
     /// Deeper backlog ⇒ a harder cut so we converge out of bufferbloat faster.
     const BACKLOG_HEAVY_US: u32 = 150_000;
+    const CARRIED_MIN_BUDGET_PCT: u64 = 25;
+    const CARRIED_HEADROOM_PCT: u64 = 85;
 
     fn apply_feedback_at(&mut self, feedback: TransportFeedback, now: Instant) -> u32 {
         if feedback.received_packets == 0
@@ -998,8 +1000,9 @@ impl ClientRateController {
                 self.revert_failed_probe(now);
             } else if startup || self.can_decrease(now) {
                 let factor = if startup { 50 } else { 80 };
-                self.recommended_kbps = ((self.recommended_kbps as u64 * factor) / 100) as u32;
-                self.recommended_kbps = self.recommended_kbps.max(self.min_kbps);
+                let stepped = ((self.recommended_kbps as u64 * factor) / 100) as u32;
+                let carried = self.carried_kbps(&feedback).unwrap_or(stepped);
+                self.recommended_kbps = stepped.min(carried).max(self.min_kbps);
                 self.last_decrease = now;
                 self.stable_kbps = self.recommended_kbps;
                 self.clear_pending_probe();
@@ -1110,6 +1113,21 @@ impl ClientRateController {
 
     fn can_decrease(&self, now: Instant) -> bool {
         now.duration_since(self.last_decrease) >= Self::DOWNGRADE_COOLDOWN
+    }
+
+    /// Under heavy loss, what still arrived is what the path carries — if the
+    /// stream was spending a real share of its budget (a quiet desktop's
+    /// receive rate says nothing about the path). Going straight below it
+    /// settles in one cut: 20% steps left an 8 Mbit/s path overdriven by a
+    /// 20 Mbit/s stream for 8 s, and the client gave up after 6.
+    fn carried_kbps(&self, feedback: &TransportFeedback) -> Option<u32> {
+        let budget = match self.encoder_kbps {
+            0 => self.recommended_kbps,
+            kbps => kbps.min(self.recommended_kbps),
+        };
+        let received = feedback.recv_video_kbps as u64;
+        (received * 100 >= budget as u64 * Self::CARRIED_MIN_BUDGET_PCT)
+            .then(|| (received * Self::CARRIED_HEADROOM_PCT / 100) as u32)
     }
 
     fn probe_failed_recently(&self, now: Instant) -> bool {
@@ -1483,6 +1501,41 @@ mod tests {
         );
         assert!(next < 8_000);
         assert!(next >= 2_000);
+    }
+
+    fn heavy_loss(recv_video_kbps: u32) -> TransportFeedback {
+        TransportFeedback {
+            interval_ms: 200,
+            received_packets: 137,
+            lost_packets: 21,
+            completed_frames: 3,
+            dropped_frames: 2,
+            recv_video_kbps,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_overdriven_path_settles_below_its_capacity_in_one_cut() {
+        // Live: 20 Mbit/s of game content into an 8 Mbit/s uplink.
+        let start = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 100_000, 20_000, start);
+        controller.seen_completed_frame = true;
+        controller.note_encoder_kbps(20_000);
+        let next = controller.apply_feedback_at(heavy_loss(7_586), start + Duration::from_secs(1));
+        assert_eq!(next, 7_586 * 85 / 100);
+    }
+
+    #[test]
+    fn a_quiet_stream_under_burst_loss_keeps_the_stepped_cut() {
+        // A static desktop receiving 334 kbit/s of a 20 Mbit/s budget: the
+        // receive rate is the content's, not the path's.
+        let start = Instant::now();
+        let mut controller = ClientRateController::from_limits_at(5_000, 100_000, 20_000, start);
+        controller.seen_completed_frame = true;
+        controller.note_encoder_kbps(20_000);
+        let next = controller.apply_feedback_at(heavy_loss(334), start + Duration::from_secs(1));
+        assert_eq!(next, 16_000);
     }
 
     fn small_window(received: u32, lost: u32, completed: u32, dropped: u32) -> TransportFeedback {

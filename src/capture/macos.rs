@@ -1,4 +1,4 @@
-use super::{target_fps, CaptureBackend, CapturedCursor, CapturedFrame};
+use super::{CaptureBackend, CaptureControl, CapturedCursor, CapturedFrame};
 use crate::macos_display::{describe_display, select_capture_display};
 use crossbeam_channel::{Sender, TrySendError};
 use objc2_app_kit::{NSBitmapFormat, NSBitmapImageRep, NSCursor};
@@ -100,7 +100,11 @@ impl PlatformCapture {
 }
 
 impl CaptureBackend for PlatformCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &std::sync::Arc<CaptureControl>,
+    ) -> Result<(), String> {
         let display = select_capture_display()?;
         let width = display.width().max(1);
         let height = display.height().max(1);
@@ -120,7 +124,7 @@ impl CaptureBackend for PlatformCapture {
             .with_height(height)
             .with_pixel_format(screencapturekit::prelude::PixelFormat::BGRA)
             .with_shows_cursor(false)
-            .with_minimum_frame_interval(&CMTime::new(1, target_fps() as i32));
+            .with_minimum_frame_interval(&CMTime::new(1, control.target_fps() as i32));
 
         let mut stream = SCStream::new_with_delegate(
             &filter,

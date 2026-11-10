@@ -12,8 +12,7 @@
 //! Current implementation uses SHM buffers. DMA-BUF import (for zero-copy
 //! paths) is left as a follow-up (Phase 2.2 / 2.3).
 
-use super::super::{CaptureBackend, CapturedFrame, FrameData};
-use super::target_frame_interval;
+use super::super::{CaptureBackend, CaptureControl, CapturedFrame, FrameData};
 use crossbeam_channel::{Sender, TrySendError};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{
@@ -350,7 +349,11 @@ impl ExtImageCopyCapture {
 }
 
 impl CaptureBackend for ExtImageCopyCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("ext-image-copy capture already running".into());
         }
@@ -382,12 +385,13 @@ impl CaptureBackend for ExtImageCopyCapture {
         println!("[capture] ext-image-copy-capture-v1 available, starting native capture");
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
+        let control = Arc::clone(control);
 
         let handle = thread::spawn(move || {
             st_protocol::thread_priority::promote_current_thread(
                 st_protocol::thread_priority::ThreadRole::Capture,
             );
-            if let Err(e) = run_capture_loop(tx, running) {
+            if let Err(e) = run_capture_loop(tx, running, control) {
                 eprintln!("[ext-image-copy] Capture error: {e}");
             }
         });
@@ -420,7 +424,11 @@ fn pick_shm_format(formats: &[wl_shm::Format]) -> Option<wl_shm::Format> {
     preference.iter().copied().find(|f| formats.contains(f))
 }
 
-fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Result<(), String> {
+fn run_capture_loop(
+    tx: Sender<CapturedFrame>,
+    running: Arc<AtomicBool>,
+    control: Arc<CaptureControl>,
+) -> Result<(), String> {
     let conn = Connection::connect_to_env().map_err(|e| format!("Wayland connect: {e}"))?;
     let display = conn.display();
     let mut eq = conn.new_event_queue();
@@ -571,7 +579,7 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
 
         // Re-read: adaptive fps retargets a running capture.
 
-        let target_interval = target_frame_interval();
+        let target_interval = control.frame_interval();
 
         let elapsed = frame_start.elapsed();
         if elapsed < target_interval {

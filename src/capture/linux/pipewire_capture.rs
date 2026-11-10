@@ -1,7 +1,8 @@
 use super::super::{
-    CaptureBackend, CapturedCursor, CapturedFrame, DmaBufPlane, FrameData, FrameLease,
-    FrameLeaseOps,
+    CaptureBackend, CaptureControl, CapturedCursor, CapturedFrame, DmaBufPlane, FrameData,
+    FrameLease, FrameLeaseOps,
 };
+use crate::virtual_output::PipeWireNode;
 use crossbeam_channel::{Sender, TrySendError};
 use std::io::Cursor;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -767,6 +768,9 @@ pub struct PipeWireCapture {
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     quit_tx: Option<pw::channel::Sender<()>>,
+    /// A node to capture directly; without one the portal is asked for a
+    /// screen share.
+    node: Option<PipeWireNode>,
 }
 
 impl PipeWireCapture {
@@ -775,8 +779,28 @@ impl PipeWireCapture {
             running: Arc::new(AtomicBool::new(false)),
             handle: None,
             quit_tx: None,
+            node: None,
         }
     }
+
+    pub fn for_node(node: PipeWireNode) -> Self {
+        Self {
+            node: Some(node),
+            ..Self::new()
+        }
+    }
+
+    pub fn captures_node(&self) -> bool {
+        self.node.is_some()
+    }
+}
+
+/// Where a stream's PipeWire daemon is reached.
+enum PipeWireRemote {
+    /// Portal-provided connection, scoped to the shared screen.
+    Fd(OwnedFd),
+    /// A daemon socket by name; `None` is this process's default.
+    Named(Option<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,9 +1856,37 @@ fn extract_first_stream_info(
 // ---------------------------------------------------------------------------
 
 impl CaptureBackend for PipeWireCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        _control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("Capture already running".into());
+        }
+
+        if let Some(node) = self.node.clone() {
+            self.running.store(true, Ordering::SeqCst);
+            let running = Arc::clone(&self.running);
+            let (quit_tx, quit_rx) = pw::channel::channel();
+            self.handle = Some(thread::spawn(move || {
+                st_protocol::thread_priority::promote_current_thread(
+                    st_protocol::thread_priority::ThreadRole::Capture,
+                );
+                if let Err(e) = run_pipewire_stream(
+                    PipeWireRemote::Named(node.remote),
+                    node.node_id,
+                    node.width,
+                    node.height,
+                    tx,
+                    running,
+                    quit_rx,
+                ) {
+                    eprintln!("[capture] PipeWire stream error: {e}");
+                }
+            }));
+            self.quit_tx = Some(quit_tx);
+            return Ok(());
         }
 
         println!("[capture] Requesting screen share via xdg-desktop-portal...");
@@ -1905,7 +1957,7 @@ impl CaptureBackend for PipeWireCapture {
                     ),
                 };
             if let Err(e) = run_pipewire_stream(
-                pw_fd,
+                PipeWireRemote::Fd(pw_fd),
                 node_id,
                 logical_width,
                 logical_height,
@@ -1934,7 +1986,10 @@ impl CaptureBackend for PipeWireCapture {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        *active_remote_desktop_slot().lock().unwrap() = None;
+        // A node capture has no portal session; the slot is another capture's.
+        if self.node.is_none() {
+            *active_remote_desktop_slot().lock().unwrap() = None;
+        }
     }
 }
 
@@ -1943,7 +1998,7 @@ impl CaptureBackend for PipeWireCapture {
 // ---------------------------------------------------------------------------
 
 fn run_pipewire_stream(
-    pw_fd: OwnedFd,
+    remote: PipeWireRemote,
     node_id: u32,
     logical_width: u32,
     logical_height: u32,
@@ -1958,9 +2013,18 @@ fn run_pipewire_stream(
     let context = pw::context::ContextBox::new(mainloop.loop_(), None)
         .map_err(|e| format!("Context: {e}"))?;
 
-    let core = context
-        .connect_fd(pw_fd, None)
-        .map_err(|e| format!("connect_fd: {e}"))?;
+    let core = match remote {
+        PipeWireRemote::Fd(fd) => context
+            .connect_fd(fd, None)
+            .map_err(|e| format!("connect_fd: {e}"))?,
+        PipeWireRemote::Named(name) => context
+            .connect(name.map(|name| {
+                pw::properties::properties! {
+                    *pw::keys::REMOTE_NAME => name,
+                }
+            }))
+            .map_err(|e| format!("connect: {e}"))?,
+    };
 
     let stream = pw::stream::StreamBox::new(
         &core,

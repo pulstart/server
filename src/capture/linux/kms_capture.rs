@@ -1,8 +1,8 @@
 use super::super::{
-    CaptureBackend, CapturedCursor, CapturedFrame, DmaBufPlane, FrameCredit, FrameData,
+    CaptureBackend, CaptureControl, CaptureOutput, CapturedCursor, CapturedFrame, DmaBufPlane,
+    FrameCredit, FrameData,
 };
 use super::kms_gpu_copy::KmsStabilizer;
-use super::target_frame_interval;
 use crossbeam_channel::{Sender, TrySendError};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use drm::control::{self, Device as ControlDevice};
 use drm::Device as BasicDevice;
-use st_protocol::control::OutputInfo;
 
 /// Wrapper around a DRM card file descriptor that implements the drm crate traits.
 struct Card(File);
@@ -174,8 +173,8 @@ pub struct KmsCapture {
     /// Render node for the card we're capturing from (e.g. /dev/dri/renderD128).
     /// Used to hint the encoder to open on the same GPU for zero-copy DMA-BUF.
     render_node: Option<String>,
-    /// Output the client asked to capture (`OutputInfo::id`). `None` means
-    /// "primary / first active plane" — the original single-output behavior.
+    /// Output this capture is pinned to (`CaptureOutput::id`); `None` takes
+    /// the first active plane.
     selected_output: Option<u32>,
 }
 
@@ -197,13 +196,7 @@ impl KmsCapture {
 
 /// A connected display enumerated from DRM, plus the CRTC that scans it out.
 struct KmsOutput {
-    id: u32,
-    name: String,
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    primary: bool,
+    info: CaptureOutput,
     crtc: control::crtc::Handle,
 }
 
@@ -235,32 +228,36 @@ fn interface_name(iface: control::connector::Interface) -> &'static str {
     }
 }
 
-/// FNV-1a hash → stable, nonzero output id derived from the connector name.
-/// Stable across runs because the connector name is stable, so the client's
-/// remembered selection keeps resolving to the same physical monitor.
-fn fnv1a_u32(bytes: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
-    for &b in bytes {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
+/// Refresh rate from the mode timings; `vrefresh` alone rounds 59.94 to 60.
+fn mode_refresh_millihz(mode: &control::Mode) -> u32 {
+    let (_, _, htotal) = mode.hsync();
+    let (_, _, vtotal) = mode.vsync();
+    let pixels = htotal as u64 * vtotal as u64;
+    if pixels == 0 {
+        return mode.vrefresh() * 1000;
     }
-    if hash == 0 {
-        1
-    } else {
-        hash
-    }
+    (mode.clock() as u64 * 1_000_000 / pixels) as u32
 }
 
-/// Decide which enumerated output index to capture for a requested id.
-///
-/// Pure helper (no DRM access) so the "unknown id falls back to primary" /
-/// "known id picks the right monitor" logic is unit-testable — this is the
-/// bug-prone decision behind capturing the wrong screen.
-fn resolve_output_index(ids: &[u32], primary_index: usize, requested: Option<u32>) -> usize {
-    match requested {
-        Some(id) => ids.iter().position(|&x| x == id).unwrap_or(primary_index),
-        None => primary_index,
+/// Whether the plane's `rotation` property turns the buffer on scanout. The
+/// compositor then renders upright into a buffer of the rotated size, and a
+/// captured frame needs no further rotation.
+fn plane_rotates(card: &Card, plane: control::plane::Handle) -> bool {
+    const DRM_MODE_ROTATE_0: u64 = 1;
+    const DRM_MODE_ROTATE_MASK: u64 = 0xf;
+    let Ok(props) = card.get_properties(plane) else {
+        return false;
+    };
+    for (prop, value) in props.iter() {
+        if value & DRM_MODE_ROTATE_MASK != DRM_MODE_ROTATE_0
+            && card
+                .get_property(*prop)
+                .is_ok_and(|info| info.name().to_str() == Ok("rotation"))
+        {
+            return true;
+        }
     }
+    false
 }
 
 /// Enumerate connected outputs and the CRTC scanning each one out.
@@ -293,40 +290,41 @@ fn enumerate_outputs(card: &Card) -> Vec<KmsOutput> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let (width, height) = match crtc.mode() {
-            Some(mode) => {
-                let (w, h) = mode.size();
-                (w as u32, h as u32)
-            }
-            None => continue,
+        let Some(mode) = crtc.mode() else {
+            continue;
         };
-        let (x, y) = crtc.position();
+        let (width, height) = mode.size();
         let name = format!(
             "{}-{}",
             interface_name(conn.interface()),
             conn.interface_id()
         );
-        let id = fnv1a_u32(name.as_bytes());
         outputs.push(KmsOutput {
-            id,
-            name,
-            width,
-            height,
-            x: x as i32,
-            y: y as i32,
-            primary: x == 0 && y == 0,
+            info: CaptureOutput {
+                id: crate::outputs::output_id(&name),
+                name,
+                width: width as u32,
+                height: height as u32,
+                refresh_millihz: mode_refresh_millihz(&mode),
+                plane_rotated: find_plane_for_crtc(card, crtc_handle)
+                    .is_some_and(|plane| plane_rotates(card, plane)),
+            },
             crtc: crtc_handle,
         });
     }
-
-    // Guarantee exactly one primary: if no output sits at (0,0), promote the
-    // first so the client always has a sensible default.
-    if !outputs.iter().any(|o| o.primary) {
-        if let Some(first) = outputs.first_mut() {
-            first.primary = true;
-        }
-    }
     outputs
+}
+
+/// Connected outputs of the display card, without starting a capture.
+pub fn list_outputs() -> Vec<CaptureOutput> {
+    let Ok((card, _)) = Card::open(false) else {
+        return Vec::new();
+    };
+    let _ = card.set_client_capability(drm::ClientCapability::UniversalPlanes, true);
+    enumerate_outputs(&card)
+        .into_iter()
+        .map(|output| output.info)
+        .collect()
 }
 
 /// Find the primary (non-cursor) plane currently bound to a specific CRTC.
@@ -881,7 +879,11 @@ fn capture_frame(
 }
 
 impl CaptureBackend for KmsCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("KMS capture already running".into());
         }
@@ -894,30 +896,19 @@ impl CaptureBackend for KmsCapture {
         card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
             .map_err(|e| format!("set UniversalPlanes capability: {e}"))?;
 
-        // Resolve the requested output (if any) to a fixed CRTC. `None` keeps
-        // the original "first active plane" behavior (primary output).
+        // A pinned output that is gone must fail the start: capturing another
+        // monitor under its id would show a client the wrong screen.
         let target_crtc = match self.selected_output {
             Some(id) => {
-                let outputs = enumerate_outputs(&card);
-                if outputs.is_empty() {
-                    None
-                } else {
-                    let ids: Vec<u32> = outputs.iter().map(|o| o.id).collect();
-                    let primary_index = outputs.iter().position(|o| o.primary).unwrap_or(0);
-                    let idx = resolve_output_index(&ids, primary_index, Some(id));
-                    if outputs[idx].id != id {
-                        eprintln!(
-                            "[kms] requested output {id} not found; capturing '{}'",
-                            outputs[idx].name
-                        );
-                    } else {
-                        println!(
-                            "[kms] Capturing output '{}' ({}x{})",
-                            outputs[idx].name, outputs[idx].width, outputs[idx].height
-                        );
-                    }
-                    Some(outputs[idx].crtc)
-                }
+                let output = enumerate_outputs(&card)
+                    .into_iter()
+                    .find(|output| output.info.id == id)
+                    .ok_or_else(|| format!("output {id:#x} is not connected"))?;
+                println!(
+                    "[kms] Capturing output '{}' ({}x{})",
+                    output.info.name, output.info.width, output.info.height
+                );
+                Some(output.crtc)
             }
             None => None,
         };
@@ -990,12 +981,13 @@ impl CaptureBackend for KmsCapture {
         let running = Arc::clone(&self.running);
         let copy_render_node = self.render_node.clone();
         let copy_enabled = kms_copy_enabled();
+        let control = Arc::clone(control);
 
         let handle = thread::spawn(move || {
             st_protocol::thread_priority::promote_current_thread(
                 st_protocol::thread_priority::ThreadRole::Capture,
             );
-            let mut target_interval = target_frame_interval();
+            let mut target_interval = control.frame_interval();
             let trace = std::env::var_os("ST_TRACE").is_some();
             let mut dropped_frames = 0usize;
             // Active-session switch tracking. On a VT / fast-user switch the
@@ -1068,7 +1060,7 @@ impl CaptureBackend for KmsCapture {
 
             while running.load(Ordering::SeqCst) {
                 // Adaptive fps retargets a running capture.
-                let wanted = target_frame_interval();
+                let wanted = control.frame_interval();
                 if wanted != target_interval {
                     target_interval = wanted;
                     scheduler.set_interval(wanted);
@@ -1101,13 +1093,13 @@ impl CaptureBackend for KmsCapture {
                         true
                     }
                 };
-                let kicked = super::super::take_capture_kick();
+                let kicked = control.take_kick();
                 if kicked && !capture_now {
                     scheduler.force(now);
                 }
                 let capture_now = capture_now || kicked;
                 for _ in 0..scheduler.take_idle_slots() {
-                    super::super::record_unchanged_capture_tick();
+                    control.record_unchanged_tick();
                 }
                 if !capture_now {
                     thread::sleep(FLIP_POLL);
@@ -1173,6 +1165,7 @@ impl CaptureBackend for KmsCapture {
                         // failure streak disables the copy and falls back to the
                         // direct (tearing) scanout.
                         let to_send = if let Some(stab) = stabilizer.as_mut() {
+                            stab.nv12_preferred = control.nv12_ram();
                             match stabilize_frame(stab, &frame) {
                                 Ok(stable) => {
                                     stab_fail_streak = 0;
@@ -1273,32 +1266,12 @@ impl CaptureBackend for KmsCapture {
         }
     }
 
-    fn list_outputs(&self) -> Vec<OutputInfo> {
-        let card = match Card::open(false) {
-            Ok((card, _)) => card,
-            Err(_) => return Vec::new(),
-        };
-        let _ = card.set_client_capability(drm::ClientCapability::UniversalPlanes, true);
-        enumerate_outputs(&card)
-            .into_iter()
-            .map(|o| OutputInfo {
-                id: o.id,
-                name: o.name,
-                width: o.width,
-                height: o.height,
-                x: o.x,
-                y: o.y,
-                is_primary: o.primary,
-            })
-            .collect()
+    fn list_outputs(&self) -> Vec<CaptureOutput> {
+        list_outputs()
     }
 
-    fn select_output(&mut self, id: u32) -> bool {
-        if self.selected_output == Some(id) {
-            return false;
-        }
+    fn select_output(&mut self, id: u32) {
         self.selected_output = Some(id);
-        true
     }
 }
 
@@ -1390,26 +1363,6 @@ impl FlipScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolve_output_known_id_picks_that_output() {
-        let ids = [10u32, 20, 30];
-        // primary is index 1; requesting 30 must pick index 2, not primary.
-        assert_eq!(resolve_output_index(&ids, 1, Some(30)), 2);
-        assert_eq!(resolve_output_index(&ids, 1, Some(10)), 0);
-    }
-
-    #[test]
-    fn resolve_output_unknown_id_falls_back_to_primary() {
-        let ids = [10u32, 20, 30];
-        assert_eq!(resolve_output_index(&ids, 1, Some(999)), 1);
-    }
-
-    #[test]
-    fn resolve_output_none_uses_primary() {
-        let ids = [10u32, 20, 30];
-        assert_eq!(resolve_output_index(&ids, 2, None), 2);
-    }
 
     /// Regression guard for the implicit-DRM-master bug class: opening a
     /// primary node grants master when nobody else holds it, and keeping it
@@ -1641,8 +1594,8 @@ mod tests {
         if std::env::var_os("ST_TEST_FLIP_AGE").is_none() {
             return;
         }
-        super::super::super::set_target_fps(120);
-        let _claim = super::super::super::Nv12Claim::new();
+        let control = CaptureControl::new(120);
+        control.set_nv12_ram(true);
         let (card, _) = Card::open(false).unwrap();
         card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
             .unwrap();
@@ -1668,7 +1621,7 @@ mod tests {
         };
         let (tx, rx) = crossbeam_channel::bounded(2);
         let mut capture = KmsCapture::new();
-        capture.start(tx).unwrap();
+        capture.start(tx, &control).unwrap();
         thread::sleep(Duration::from_secs(1));
         while rx.try_recv().is_ok() {}
         let begin = Instant::now();
@@ -1771,13 +1724,6 @@ mod tests {
         eprintln!("[flip-final] flips={flips} compared={compared} mismatched={mismatched}");
         assert!(compared >= 20, "too few flips to judge; animate the screen");
         assert_eq!(mismatched, 0, "scanout changed after its flip was seen");
-    }
-
-    #[test]
-    fn fnv1a_is_stable_and_nonzero() {
-        assert_eq!(fnv1a_u32(b"HDMI-A-1"), fnv1a_u32(b"HDMI-A-1"));
-        assert_ne!(fnv1a_u32(b"HDMI-A-1"), fnv1a_u32(b"DP-2"));
-        assert_ne!(fnv1a_u32(b""), 0);
     }
 
     #[test]

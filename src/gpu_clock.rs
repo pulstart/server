@@ -225,6 +225,34 @@ impl Drop for ClockFloor {
     }
 }
 
+/// One pipeline's share of the floor. The lock on the GPU is process-wide, so
+/// the first pipeline engages it and the last one to stop releases it.
+pub struct FloorLease(());
+
+static SHARED_FLOOR: std::sync::Mutex<(usize, Option<ClockFloor>)> =
+    std::sync::Mutex::new((0, None));
+
+impl FloorLease {
+    pub fn hold(render_node: Option<&str>) -> Self {
+        let mut shared = SHARED_FLOOR.lock().unwrap();
+        if shared.0 == 0 {
+            shared.1 = ClockFloor::engage(render_node);
+        }
+        shared.0 += 1;
+        Self(())
+    }
+}
+
+impl Drop for FloorLease {
+    fn drop(&mut self) {
+        let mut shared = SHARED_FLOOR.lock().unwrap();
+        shared.0 -= 1;
+        if shared.0 == 0 {
+            shared.1 = None;
+        }
+    }
+}
+
 /// A floor left behind by a killed process: release it.
 pub fn release_stale() {
     let Some(path) = crate::server_control::state_file(MARKER) else {

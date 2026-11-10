@@ -8,7 +8,7 @@
 //! SDR 4:2:0 H.264/HEVC only: FFmpeg's `av1_vulkan` writes an undecodable
 //! sequence header once rate control is set. `ST_VULKAN_ENCODE=0` disables it.
 
-use crate::capture::{CapturedFrame, FrameData, Nv12Claim};
+use crate::capture::{CapturedFrame, FrameData};
 use crate::colorspace::Colorspace;
 use crate::encode::{ffmpeg_err, send_and_collect};
 use crate::encode_config::{Codec, EncoderConfig};
@@ -153,7 +153,6 @@ pub struct VulkanEncoder {
     force_keyframe_next: bool,
     width: u32,
     height: u32,
-    _nv12_claim: Nv12Claim,
     /// `ST_TRACE`: per-frame (upload, encode) times, logged in batches.
     stage_times: Option<Vec<(std::time::Duration, std::time::Duration)>>,
     /// (upload, encode, frames) since the last `take_stage_means`.
@@ -207,7 +206,6 @@ impl VulkanEncoder {
             force_keyframe_next: true,
             width: config.width,
             height: config.height,
-            _nv12_claim: Nv12Claim::new(),
             stage_times: None,
             stage_sum: Default::default(),
         };
@@ -768,13 +766,14 @@ mod tests {
         if std::env::var_os("ST_TEST_VULKAN_KMS").is_none() {
             return;
         }
-        crate::capture::set_target_fps(120);
+        let control = crate::capture::CaptureControl::new(120);
+        control.set_nv12_ram(true);
         // Full-rate capture: damage skip would pace a static desktop at 4 fps.
         std::env::set_var("ST_KMS_DAMAGE", "0");
         let (tx, rx) = crossbeam_channel::bounded(4);
         let mut capture = KmsCapture::new();
         capture
-            .start(tx)
+            .start(tx, &control)
             .expect("KMS capture (needs CAP_SYS_ADMIN)");
         let first = rx
             .recv_timeout(Duration::from_secs(5))

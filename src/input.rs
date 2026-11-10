@@ -236,6 +236,7 @@ pub struct InputRuntime {
     /// and pushed it over the control socket. Allows missing KMS cursor data
     /// to signal mouselook while preserving visible in-game menu cursors.
     game_mode: AtomicBool,
+    outputs: Arc<crate::outputs::OutputDirectory>,
     inner: Mutex<InputRuntimeInner>,
     active_clients: Mutex<HashMap<u32, ActiveInputClient>>,
 }
@@ -474,9 +475,122 @@ struct InputRuntimeInner {
     cursor_state: CursorState,
     cursor_shape_version: u64,
     cursor_state_version: u64,
-    stream_width: u32,
-    stream_height: u32,
+    /// Output `cursor_state` is on. The desktop has one pointer; only the
+    /// pipeline whose output holds it reports a cursor.
+    cursor_output: u32,
+    /// Upright picture size and scanout rotation of every streamed output.
+    geometry: BTreeMap<u32, OutputGeometry>,
+    /// Output each client's session streams: the default pointer target.
+    client_output: BTreeMap<u32, u32>,
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    rotated_cursor: RotatedCursor,
     warp: WarpDetector,
+}
+
+#[derive(Clone, Copy, Default)]
+struct OutputGeometry {
+    width: u32,
+    height: u32,
+    /// Clockwise quarter turns from the scanout to the upright picture.
+    rotation: u8,
+}
+
+/// The compositor draws a rotated output's cursor pre-rotated, like the rest
+/// of its scanout. The image is turned back once per shape, not per frame.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[derive(Default)]
+struct RotatedCursor {
+    source: Option<Arc<[u8]>>,
+    turns: u8,
+    pixels: Option<Arc<[u8]>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+impl RotatedCursor {
+    fn upright(&mut self, cursor: &CapturedCursor, geometry: OutputGeometry) -> CapturedCursor {
+        let turns = geometry.rotation & 3;
+        let (w, h) = (cursor.width as usize, cursor.height as usize);
+        let cached = self.turns == turns
+            && self
+                .source
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, &cursor.pixels));
+        let pixels = match (&self.pixels, cached) {
+            (Some(pixels), true) => Arc::clone(pixels),
+            _ => {
+                let pixels: Arc<[u8]> = rotate_pixels(&cursor.pixels, w, h, turns).into();
+                self.source = Some(Arc::clone(&cursor.pixels));
+                self.turns = turns;
+                self.pixels = Some(Arc::clone(&pixels));
+                pixels
+            }
+        };
+        let (scan_w, scan_h) = if turns & 1 == 1 {
+            (geometry.height as i32, geometry.width as i32)
+        } else {
+            (geometry.width as i32, geometry.height as i32)
+        };
+        let (right, bottom) = (cursor.x + w as i32, cursor.y + h as i32);
+        let (x, y) = match turns {
+            1 => (scan_h - bottom, cursor.x),
+            2 => (scan_w - right, scan_h - bottom),
+            _ => (cursor.y, scan_w - right),
+        };
+        // (0,0) means "unknown" downstream and must stay that.
+        let (hx, hy) = (cursor.hotspot_x, cursor.hotspot_y);
+        let (hotspot_x, hotspot_y) = if hx == 0 && hy == 0 {
+            (0, 0)
+        } else {
+            let (last_x, last_y) = (
+                cursor.width.saturating_sub(1),
+                cursor.height.saturating_sub(1),
+            );
+            match turns {
+                1 => (last_y.saturating_sub(hy), hx),
+                2 => (last_x.saturating_sub(hx), last_y.saturating_sub(hy)),
+                _ => (hy, last_x.saturating_sub(hx)),
+            }
+        };
+        let (width, height) = if turns & 1 == 1 {
+            (cursor.height, cursor.width)
+        } else {
+            (cursor.width, cursor.height)
+        };
+        CapturedCursor {
+            pixels,
+            x,
+            y,
+            hotspot_x,
+            hotspot_y,
+            width,
+            height,
+            shape_serial: cursor.shape_serial,
+            visible: cursor.visible,
+        }
+    }
+}
+
+/// Rotate a `w`×`h` 4-byte-per-pixel image clockwise by `turns` quarter turns.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn rotate_pixels(src: &[u8], w: usize, h: usize, turns: u8) -> Vec<u8> {
+    if src.len() < w * h * 4 {
+        return Vec::new();
+    }
+    let out_w = if turns & 1 == 1 { h } else { w };
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = match turns & 3 {
+                1 => (h - 1 - y, x),
+                2 => (w - 1 - x, h - 1 - y),
+                3 => (y, w - 1 - x),
+                _ => (x, y),
+            };
+            let (from, to) = ((y * w + x) * 4, (dy * out_w + dx) * 4);
+            out[to..to + 4].copy_from_slice(&src[from..from + 4]);
+        }
+    }
+    out
 }
 
 enum InputBackend {
@@ -561,14 +675,18 @@ impl TestInputController {
 pub struct CursorVersionCursor {
     pub shape: u64,
     pub state: u64,
+    /// Last state sent: a session whose output the pointer is not on keeps
+    /// computing the same hidden state while the pointer moves elsewhere.
+    sent: Option<CursorState>,
 }
 
 impl InputRuntime {
-    pub fn new() -> Arc<Self> {
+    pub fn new(outputs: Arc<crate::outputs::OutputDirectory>) -> Arc<Self> {
         Arc::new(Self {
             next_client_id: AtomicU32::new(1),
             active_controller_id: AtomicU32::new(0),
             game_mode: AtomicBool::new(false),
+            outputs,
             inner: Mutex::new(InputRuntimeInner {
                 backend: InputBackend::Unavailable,
                 backend_label: "unavailable".to_string(),
@@ -583,12 +701,24 @@ impl InputRuntime {
                 cursor_state: CursorState::default(),
                 cursor_shape_version: 0,
                 cursor_state_version: 0,
-                stream_width: 0,
-                stream_height: 0,
+                cursor_output: 0,
+                geometry: BTreeMap::new(),
+                client_output: BTreeMap::new(),
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                rotated_cursor: RotatedCursor::default(),
                 warp: WarpDetector::new(),
             }),
             active_clients: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Record which output a client's session streams.
+    pub fn set_client_output(&self, client_id: u32, output: u32) {
+        self.inner
+            .lock()
+            .unwrap()
+            .client_output
+            .insert(client_id, output);
     }
 
     /// Register an authenticated direct client before its startup bundle is sent.
@@ -652,6 +782,7 @@ impl InputRuntime {
         inner.last_input_seq_by_client.remove(&client_id);
         inner.remove_client_keyboard(client_id);
         inner.button_mask_by_client.remove(&client_id);
+        inner.client_output.remove(&client_id);
         if inner.controller_id == Some(client_id) {
             inner.release_buttons();
             inner.controller_id = None;
@@ -741,6 +872,8 @@ impl InputRuntime {
         self.active_controller_id.load(Ordering::Relaxed) != 0
     }
 
+    /// Select the injector for `capture_backend`. Called when the first
+    /// pipeline starts; later pipelines share the same desktop and injector.
     pub fn refresh_backend(&self, capture_backend: &str, _stream_width: u32, _stream_height: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.release_all_inputs();
@@ -755,8 +888,6 @@ impl InputRuntime {
         inner.warp.reset();
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
-        inner.stream_width = _stream_width;
-        inner.stream_height = _stream_height;
         self.set_active_controller(None);
 
         #[cfg(target_os = "linux")]
@@ -841,15 +972,31 @@ impl InputRuntime {
         }
     }
 
-    /// Update stream-space mapping without resetting cooperative ownership or
-    /// releasing any pressed input state.
-    pub fn update_stream_dimensions(&self, width: u32, height: u32) {
+    /// Record an output's upright picture size and scanout rotation, without
+    /// resetting cooperative ownership or releasing any pressed input state.
+    pub fn set_output_geometry(&self, output: u32, width: u32, height: u32, rotation: u8) {
         let mut inner = self.inner.lock().unwrap();
-        inner.stream_width = width;
-        inner.stream_height = height;
+        inner.geometry.insert(
+            output,
+            OutputGeometry {
+                width,
+                height,
+                rotation,
+            },
+        );
         #[cfg(target_os = "linux")]
         if let InputBackend::PortalRemoteDesktop(session) = &inner.backend {
             session.set_logical_size(width, height);
+        }
+    }
+
+    /// The pipeline of `output` stopped.
+    pub fn forget_output(&self, output: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.geometry.remove(&output);
+        if inner.cursor_output == output && inner.cursor_state.visible {
+            inner.cursor_state.visible = false;
+            inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
         }
     }
 
@@ -870,8 +1017,7 @@ impl InputRuntime {
         inner.warp.reset();
         inner.cursor_shape_version = inner.cursor_shape_version.wrapping_add(1);
         inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
-        inner.stream_width = 0;
-        inner.stream_height = 0;
+        inner.geometry.clear();
         self.set_active_controller(None);
     }
 
@@ -914,8 +1060,10 @@ impl InputRuntime {
         }
     }
 
+    /// Cursor sample from the pipeline of `output`, in that output's scanout
+    /// space. Published state is in the upright picture's space.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    pub fn update_cursor(&self, cursor: Option<&CapturedCursor>) {
+    pub fn update_cursor(&self, output: u32, cursor: Option<&CapturedCursor>) {
         let Ok(mut inner) = self.inner.try_lock() else {
             // Input injection can block on portal/X11/uinput calls. Dropping one
             // cursor metadata update is preferable to stalling capture/encode.
@@ -930,6 +1078,26 @@ impl InputRuntime {
             }
             return;
         }
+
+        // The pointer is on one output at a time: an output without it reports
+        // no cursor, which must not hide the one another output is showing.
+        if output != inner.cursor_output {
+            if !cursor.is_some_and(|cursor| cursor.visible) {
+                return;
+            }
+            inner.cursor_output = output;
+            inner.warp.reset();
+            inner.cursor_state_version = inner.cursor_state_version.wrapping_add(1);
+        }
+        let geometry = inner.geometry.get(&output).copied().unwrap_or_default();
+        let upright;
+        let cursor = match cursor {
+            Some(cursor) if geometry.rotation & 3 != 0 => {
+                upright = inner.rotated_cursor.upright(cursor, geometry);
+                Some(&upright)
+            }
+            cursor => cursor,
+        };
 
         let Some(cursor) = cursor else {
             // No HW cursor framebuffer this frame. On the desktop we can't tell
@@ -1114,15 +1282,21 @@ impl InputRuntime {
             .store(controller_id.unwrap_or(0), Ordering::Relaxed);
     }
 
+    /// Cursor updates for a session streaming `output`. The pointer shows
+    /// only in sessions whose output it is on.
     pub fn cursor_messages(
         &self,
-        _client_id: u32,
+        output: u32,
         versions: &mut CursorVersionCursor,
     ) -> Vec<ControlMessage> {
         let inner = self.inner.lock().unwrap();
         if inner.controller_id.is_none() {
             return Vec::new();
         }
+        let state = CursorState {
+            visible: inner.cursor_state.visible && inner.cursor_output == output,
+            ..inner.cursor_state
+        };
 
         let mut messages = Vec::new();
         if inner.cursor_shape_version > versions.shape {
@@ -1154,23 +1328,21 @@ impl InputRuntime {
         }
         if inner.cursor_state_version > versions.state {
             versions.state = inner.cursor_state_version;
-            if !(inner.cursor_state.serial == 0
-                && !inner.cursor_state.visible
-                && inner.cursor_shape.is_none())
-            {
+            let unset = state.serial == 0 && !state.visible && inner.cursor_shape.is_none();
+            let hidden_elsewhere =
+                inner.cursor_output != output && versions.sent.is_some_and(|sent| !sent.visible);
+            if !unset && !hidden_elsewhere && versions.sent != Some(state) {
                 if trace_enabled() {
                     let log_idx = TRACE_CURSOR_SEND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                     if log_idx < 12 {
                         eprintln!(
                             "[trace][cursor] sending CursorState serial={} pos=({}, {}) visible={}",
-                            inner.cursor_state.serial,
-                            inner.cursor_state.x,
-                            inner.cursor_state.y,
-                            inner.cursor_state.visible
+                            state.serial, state.x, state.y, state.visible
                         );
                     }
                 }
-                messages.push(ControlMessage::CursorState(inner.cursor_state));
+                versions.sent = Some(state);
+                messages.push(ControlMessage::CursorState(state));
             }
         }
         messages
@@ -1291,7 +1463,7 @@ impl InputRuntime {
                 inner.set_client_keyboard(client_id, packet.pressed);
             }
             mouse_packet => {
-                inner.handle_mouse_packet(client_id, mouse_packet);
+                inner.handle_mouse_packet(client_id, mouse_packet, &self.outputs);
                 self.set_active_controller(inner.controller_id);
             }
         }
@@ -1350,7 +1522,12 @@ impl InputRuntimeInner {
         self.warp.reset();
     }
 
-    fn handle_mouse_packet(&mut self, client_id: u32, packet: InputPacket) {
+    fn handle_mouse_packet(
+        &mut self,
+        client_id: u32,
+        packet: InputPacket,
+        outputs: &crate::outputs::OutputDirectory,
+    ) {
         let Some((buttons, meaningful)) = self.update_client_mouse_state(client_id, &packet) else {
             return;
         };
@@ -1364,15 +1541,24 @@ impl InputRuntimeInner {
         self.sync_buttons(buttons);
         match packet {
             InputPacket::MouseAbsolute(packet) => {
-                self.move_absolute(packet.x, packet.y);
+                let output = match packet.output_id {
+                    0 => self.client_output.get(&client_id).copied().unwrap_or(0),
+                    output => output,
+                };
+                // An absolute device spans the whole desktop, not one output.
+                let (x, y) = outputs
+                    .map_absolute(output, packet.x, packet.y)
+                    .unwrap_or((packet.x, packet.y));
+                self.move_absolute(x, y);
                 // Cursor position is no longer predicted from injected input.
                 // `CursorState` is sourced solely from the capture backend's
                 // real cursor metadata (PipeWire SPA_META_Cursor / XFixes), so
                 // there is a single source of truth and no feedback loop with
                 // the client's locally-drawn cursor.
+                let size = self.geometry.get(&output).copied().unwrap_or_default();
                 let (sx, sy) = (
-                    i64::from(normalized_to_stream_coord(packet.x, self.stream_width)),
-                    i64::from(normalized_to_stream_coord(packet.y, self.stream_height)),
+                    i64::from(normalized_to_stream_coord(packet.x, size.width)),
+                    i64::from(normalized_to_stream_coord(packet.y, size.height)),
                 );
                 self.warp.observe_command_absolute(sx, sy);
             }
@@ -1459,8 +1645,9 @@ impl InputRuntimeInner {
         }
 
         let (hotspot_x, hotspot_y) = self.cursor_hotspot();
-        let target_x = normalized_to_stream_coord(x, self.stream_width);
-        let target_y = normalized_to_stream_coord(y, self.stream_height);
+        let size = self.cursor_output_size();
+        let target_x = normalized_to_stream_coord(x, size.width);
+        let target_y = normalized_to_stream_coord(y, size.height);
         let next_state = CursorState {
             serial: self.cursor_state.serial,
             x: target_x - hotspot_x,
@@ -1478,13 +1665,14 @@ impl InputRuntimeInner {
         }
 
         let (hotspot_x, hotspot_y) = self.cursor_hotspot();
+        let size = self.cursor_output_size();
         let target_x = clamp_stream_coord(
             i64::from(self.cursor_state.x) + i64::from(hotspot_x) + i64::from(dx),
-            self.stream_width,
+            size.width,
         );
         let target_y = clamp_stream_coord(
             i64::from(self.cursor_state.y) + i64::from(hotspot_y) + i64::from(dy),
-            self.stream_height,
+            size.height,
         );
         let next_state = CursorState {
             serial: self.cursor_state.serial,
@@ -1497,11 +1685,20 @@ impl InputRuntimeInner {
     }
 
     #[cfg(test)]
+    fn cursor_output_size(&self) -> OutputGeometry {
+        self.geometry
+            .get(&self.cursor_output)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     fn cursor_prediction_active(&self) -> bool {
+        let size = self.cursor_output_size();
         self.capabilities.separate_cursor
             && self.cursor_state.visible
-            && self.stream_width > 0
-            && self.stream_height > 0
+            && size.width > 0
+            && size.height > 0
     }
 
     #[cfg(test)]
@@ -4271,8 +4468,17 @@ mod tests {
             },
             cursor_shape_version: 1,
             cursor_state_version: 1,
-            stream_width: 1920,
-            stream_height: 1080,
+            cursor_output: 0,
+            geometry: BTreeMap::from([(
+                0,
+                OutputGeometry {
+                    width: 1920,
+                    height: 1080,
+                    rotation: 0,
+                },
+            )]),
+            client_output: BTreeMap::new(),
+            rotated_cursor: RotatedCursor::default(),
             warp: WarpDetector::new(),
         }
     }
@@ -4287,7 +4493,7 @@ mod tests {
     }
 
     fn cooperative_runtime() -> (Arc<InputRuntime>, Arc<Mutex<Vec<TestInputEvent>>>) {
-        let runtime = InputRuntime::new();
+        let runtime = InputRuntime::new(Default::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         {
             let mut inner = runtime.inner.lock().unwrap();
@@ -4321,7 +4527,7 @@ mod tests {
             shape_serial: 42,
             visible: true,
         };
-        runtime.update_cursor(Some(&cursor));
+        runtime.update_cursor(0, Some(&cursor));
         {
             let inner = runtime.inner.lock().unwrap();
             assert!(!inner.cursor_state.visible);
@@ -4329,7 +4535,7 @@ mod tests {
         }
         // Reusing the same shape ID must still restore a visible menu cursor.
         cursor.pixels = vec![255, 255, 255, 255].into();
-        runtime.update_cursor(Some(&cursor));
+        runtime.update_cursor(0, Some(&cursor));
         let inner = runtime.inner.lock().unwrap();
         assert!(inner.cursor_state.visible);
         assert!(inner.cursor_shape.is_some());
@@ -4349,24 +4555,24 @@ mod tests {
             shape_serial: 42,
             visible: true,
         };
-        runtime.update_cursor(Some(&cursor));
-        runtime.update_cursor(None);
+        runtime.update_cursor(0, Some(&cursor));
+        runtime.update_cursor(0, None);
         assert!(runtime.inner.lock().unwrap().cursor_state.visible);
 
         runtime.set_game_mode(true);
         assert!(runtime.inner.lock().unwrap().cursor_state.visible);
-        runtime.update_cursor(None);
+        runtime.update_cursor(0, None);
         assert!(!runtime.inner.lock().unwrap().cursor_state.visible);
 
         // Opening a menu restores the pointer even while the game stays focused.
-        runtime.update_cursor(Some(&cursor));
+        runtime.update_cursor(0, Some(&cursor));
         assert!(runtime.inner.lock().unwrap().cursor_state.visible);
-        runtime.update_cursor(None);
+        runtime.update_cursor(0, None);
         assert!(!runtime.inner.lock().unwrap().cursor_state.visible);
 
         // Alt-tab must release capture even if KMS still has no cursor sample.
         runtime.set_game_mode(false);
-        runtime.update_cursor(None);
+        runtime.update_cursor(0, None);
         assert!(runtime.inner.lock().unwrap().cursor_state.visible);
     }
 
@@ -4384,7 +4590,7 @@ mod tests {
             shape_serial: 42,
             visible: true,
         };
-        runtime.update_cursor(Some(&cursor));
+        runtime.update_cursor(0, Some(&cursor));
         assert!(runtime.inner.lock().unwrap().cursor_state.visible);
     }
 
@@ -4408,7 +4614,7 @@ mod tests {
 
     #[test]
     fn neutral_bootstrap_relearns_media_port_without_claiming_control() {
-        let runtime = InputRuntime::new();
+        let runtime = InputRuntime::new(Default::default());
         let initial = SocketAddr::from(([127, 0, 0, 1], 5000));
         let live = SocketAddr::from(([127, 0, 0, 1], 61000));
         let media_dest = Arc::new(Mutex::new(initial));
@@ -4454,7 +4660,7 @@ mod tests {
 
     #[test]
     fn unknown_or_wrong_ip_input_does_not_allocate_sequence_or_relearn_destination() {
-        let runtime = InputRuntime::new();
+        let runtime = InputRuntime::new(Default::default());
         let initial = SocketAddr::from(([127, 0, 0, 1], 5000));
         let media_dest = Arc::new(Mutex::new(initial));
         let _registration =
@@ -4496,7 +4702,7 @@ mod tests {
 
     #[test]
     fn wrong_credential_is_rejected_before_sequence_and_destination_updates() {
-        let runtime = InputRuntime::new();
+        let runtime = InputRuntime::new(Default::default());
         let initial = SocketAddr::from(([127, 0, 0, 1], 5000));
         let forged_source = SocketAddr::from(([127, 0, 0, 1], 61000));
         let media_dest = Arc::new(Mutex::new(initial));
@@ -4716,6 +4922,7 @@ mod tests {
                 x: 10,
                 y: 20,
                 buttons: 0,
+                output_id: 0,
             }),
         );
         assert_eq!(runtime.inner.lock().unwrap().controller_id, Some(1));
@@ -4769,6 +4976,7 @@ mod tests {
                 x: 10,
                 y: 20,
                 buttons: 0,
+                output_id: 0,
             }),
         );
         send_tunnel(
@@ -4922,7 +5130,7 @@ mod tests {
 
     #[test]
     fn text_input_requires_registration_capability_and_nonempty_safe_payload() {
-        let runtime = InputRuntime::new();
+        let runtime = InputRuntime::new(Default::default());
         assert!(!runtime.handle_text_input(1, "text"));
         let _registration = runtime.register_tunnel_client(1, CREDENTIAL);
         assert!(!runtime.handle_text_input(1, ""));
@@ -5066,5 +5274,213 @@ mod tests {
         assert_eq!(inner.cursor_state.x, 10);
         assert_eq!(inner.cursor_state.y, 20);
         assert_eq!(inner.cursor_state_version, 1);
+    }
+
+    fn opaque_cursor(x: i32, y: i32) -> CapturedCursor {
+        CapturedCursor {
+            pixels: vec![1, 2, 3, 255, 4, 5, 6, 255].into(),
+            x,
+            y,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width: 2,
+            height: 1,
+            shape_serial: 9,
+            visible: true,
+        }
+    }
+
+    fn cursor_state_sent(messages: &[ControlMessage]) -> Option<CursorState> {
+        messages.iter().find_map(|message| match message {
+            ControlMessage::CursorState(state) => Some(*state),
+            _ => None,
+        })
+    }
+
+    /// Two pipelines report cursors: the pointer is on one output, and the
+    /// other output's "no cursor" must neither hide it nor reach its viewers.
+    #[test]
+    fn the_cursor_shows_only_in_sessions_of_the_output_it_is_on() {
+        let (runtime, _) = cooperative_runtime();
+        runtime.inner.lock().unwrap().controller_id = Some(1);
+        let (mut first, mut second) = (
+            CursorVersionCursor::default(),
+            CursorVersionCursor::default(),
+        );
+
+        runtime.update_cursor(1, Some(&opaque_cursor(10, 20)));
+        runtime.update_cursor(2, None);
+        let on_first = cursor_state_sent(&runtime.cursor_messages(1, &mut first)).unwrap();
+        let on_second = cursor_state_sent(&runtime.cursor_messages(2, &mut second)).unwrap();
+        assert!(on_first.visible && (on_first.x, on_first.y) == (10, 20));
+        assert!(!on_second.visible);
+
+        // Moving on the first output is no news for the second.
+        runtime.update_cursor(1, Some(&opaque_cursor(40, 50)));
+        runtime.update_cursor(2, None);
+        assert!(
+            cursor_state_sent(&runtime.cursor_messages(1, &mut first))
+                .unwrap()
+                .visible
+        );
+        assert!(cursor_state_sent(&runtime.cursor_messages(2, &mut second)).is_none());
+
+        // The pointer crosses over, whichever pipeline reports first.
+        runtime.update_cursor(1, None);
+        runtime.update_cursor(2, Some(&opaque_cursor(5, 6)));
+        let on_first = cursor_state_sent(&runtime.cursor_messages(1, &mut first)).unwrap();
+        let on_second = cursor_state_sent(&runtime.cursor_messages(2, &mut second)).unwrap();
+        assert!(!on_first.visible);
+        assert!(on_second.visible && (on_second.x, on_second.y) == (5, 6));
+    }
+
+    /// A portrait monitor turned "right": the compositor draws the cursor
+    /// pre-rotated into a 2560x1440 scanout; clients show 1440x2560 upright.
+    #[test]
+    fn a_rotated_outputs_cursor_is_published_upright() {
+        let (runtime, _) = cooperative_runtime();
+        runtime.set_output_geometry(1, 1440, 2560, 3);
+
+        runtime.update_cursor(1, Some(&opaque_cursor(100, 50)));
+
+        let inner = runtime.inner.lock().unwrap();
+        let shape = inner.cursor_shape.as_ref().unwrap();
+        assert_eq!((shape.width, shape.height), (1, 2));
+        // 90° counter-clockwise: the scanout's right pixel ends up on top.
+        assert_eq!(shape.rgba, vec![6, 5, 4, 255, 3, 2, 1, 255]);
+        assert_eq!((inner.cursor_state.x, inner.cursor_state.y), (50, 2458));
+    }
+
+    #[test]
+    fn rotating_pixels_a_full_turn_restores_them() {
+        let src: Vec<u8> = (0..3 * 2 * 4).collect();
+        let quarter = rotate_pixels(&src, 3, 2, 1);
+        assert_eq!(&quarter[..4], &src[12..16], "bottom-left moves to top-left");
+        let half = rotate_pixels(&quarter, 2, 3, 1);
+        assert_eq!(half, rotate_pixels(&src, 3, 2, 2));
+        let three = rotate_pixels(&half, 3, 2, 1);
+        assert_eq!(three, rotate_pixels(&src, 3, 2, 3));
+        assert_eq!(rotate_pixels(&three, 2, 3, 1), src);
+        assert!(rotate_pixels(&src[..8], 3, 2, 1).is_empty());
+    }
+
+    /// A rotated output's cursor: turned once per shape, then reused per frame.
+    /// `cargo test --release rotated_cursor_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn rotated_cursor_cost() {
+        let geometry = OutputGeometry {
+            width: 1440,
+            height: 2560,
+            rotation: 3,
+        };
+        // NVIDIA's cursor plane: 256x256 with the pointer in one corner.
+        let mut pixels = vec![0u8; 256 * 256 * 4];
+        for row in 0..24 {
+            pixels[row * 256 * 4..row * 256 * 4 + 24 * 4].fill(0xff);
+        }
+        let cursor = CapturedCursor {
+            pixels: pixels.into(),
+            x: 100,
+            y: 50,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width: 256,
+            height: 256,
+            shape_serial: 1,
+            visible: true,
+        };
+        let started = std::time::Instant::now();
+        let turned = rotate_pixels(&cursor.pixels, 256, 256, 3);
+        eprintln!("rotate 256x256 shape: {:?}", started.elapsed());
+        assert_eq!(turned.len(), cursor.pixels.len());
+
+        let mut cache = RotatedCursor::default();
+        cache.upright(&cursor, geometry);
+        const FRAMES: u32 = 1_000_000;
+        let started = std::time::Instant::now();
+        let mut sum = 0i64;
+        for _ in 0..FRAMES {
+            let upright = cache.upright(&cursor, geometry);
+            sum += (upright.x + upright.y) as i64;
+        }
+        eprintln!(
+            "cached upright cursor: {:?}/frame (checksum {sum})",
+            started.elapsed() / FRAMES
+        );
+    }
+
+    /// An absolute device spans the whole desktop: a position on the second
+    /// monitor must be scaled into that monitor's part of it.
+    #[test]
+    fn absolute_motion_lands_on_the_output_the_client_names() {
+        let outputs = Arc::new(crate::outputs::OutputDirectory::default());
+        let (left, right) = (
+            crate::outputs::output_id("DP-1"),
+            crate::outputs::output_id("DP-2"),
+        );
+        let capture = |name: &str| crate::capture::CaptureOutput {
+            id: crate::outputs::output_id(name),
+            name: name.to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60_000,
+            plane_rotated: false,
+        };
+        let place = |name: &str, x: i32| crate::outputs::LayoutOutput {
+            name: name.to_string(),
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            rotation: 0,
+            primary: x == 0,
+            refresh_millihz: 60_000,
+        };
+        outputs.update(
+            &[capture("DP-1"), capture("DP-2")],
+            &[],
+            Some(&[place("DP-1", 0), place("DP-2", 1920)]),
+        );
+        let runtime = InputRuntime::new(Arc::clone(&outputs));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut inner = runtime.inner.lock().unwrap();
+            inner.backend = InputBackend::Test(TestInputController {
+                events: Arc::clone(&events),
+            });
+        }
+        let _client = runtime.register_tunnel_client(1, CREDENTIAL);
+        runtime.set_client_output(1, left);
+        let absolute = |seq: u16, output_id: u32| {
+            send_tunnel(
+                &runtime,
+                1,
+                seq,
+                InputPacket::MouseAbsolute(st_protocol::MouseAbsoluteInput {
+                    client_id: 1,
+                    x: 32768,
+                    y: 32768,
+                    buttons: 0,
+                    output_id,
+                }),
+            );
+        };
+
+        absolute(1, 0);
+        absolute(2, right);
+
+        let pixel = |v: u16, size: u64| v as u64 * size / 65536;
+        let moves: Vec<(u64, u64)> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                TestInputEvent::Absolute(x, y) => Some((pixel(*x, 3840), pixel(*y, 1080))),
+                _ => None,
+            })
+            .collect();
+        // The session's own output by default, the named one otherwise.
+        assert_eq!(moves, vec![(960, 540), (2880, 540)]);
     }
 }

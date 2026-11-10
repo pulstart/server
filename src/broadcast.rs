@@ -18,6 +18,8 @@ pub struct Broadcaster<T: Send + Sync + 'static> {
     on_zero: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Set when a new subscriber is added; the producer should emit a keyframe.
     keyframe_requested: AtomicBool,
+    /// Capture loop feeding this broadcaster; a keyframe request wakes it.
+    capture: Option<Arc<crate::capture::CaptureControl>>,
 }
 
 struct BroadcasterState<T: Send + Sync + 'static> {
@@ -40,6 +42,15 @@ struct Subscriber<T: Send + Sync + 'static> {
 
 impl<T: Send + Sync + 'static> Broadcaster<T> {
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// A video broadcaster fed by the capture loop `capture` controls.
+    pub fn for_capture(capture: Arc<crate::capture::CaptureControl>) -> Self {
+        Self::build(Some(capture))
+    }
+
+    fn build(capture: Option<Arc<crate::capture::CaptureControl>>) -> Self {
         Self {
             state: Mutex::new(BroadcasterState {
                 subscribers: Vec::new(),
@@ -48,6 +59,14 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
             next_id: AtomicU64::new(0),
             on_zero: Mutex::new(None),
             keyframe_requested: AtomicBool::new(false),
+            capture,
+        }
+    }
+
+    fn want_keyframe(&self) {
+        self.keyframe_requested.store(true, Ordering::Release);
+        if let Some(capture) = &self.capture {
+            capture.kick();
         }
     }
 
@@ -76,8 +95,7 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
             tx,
             drop_rx: rx.clone(),
         });
-        self.keyframe_requested.store(true, Ordering::Release);
-        crate::capture::kick_capture();
+        self.want_keyframe();
         Ok((id, rx))
     }
 
@@ -102,8 +120,7 @@ impl<T: Send + Sync + 'static> Broadcaster<T> {
 
     /// Explicitly request a fresh keyframe for existing subscribers.
     pub fn request_keyframe(&self) {
-        self.keyframe_requested.store(true, Ordering::Release);
-        crate::capture::kick_capture();
+        self.want_keyframe();
     }
 
     /// Remove a subscriber by id.
@@ -190,10 +207,7 @@ impl<T: Send + Sync + 'static> SubscriptionReservation<T> {
             });
         }
         self.active = false;
-        self.broadcaster
-            .keyframe_requested
-            .store(true, Ordering::Release);
-        crate::capture::kick_capture();
+        self.broadcaster.want_keyframe();
         (id, rx)
     }
 }

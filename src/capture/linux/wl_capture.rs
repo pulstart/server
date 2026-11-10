@@ -15,8 +15,7 @@
 ///
 /// Performance: eliminates process-spawn overhead of `grim` (~15-30ms per frame),
 /// enables steady 60 FPS capture on wlroots compositors (Sway, Hyprland, river, etc.).
-use super::super::{CaptureBackend, CapturedFrame, FrameData};
-use super::target_frame_interval;
+use super::super::{CaptureBackend, CaptureControl, CapturedFrame, FrameData};
 use crossbeam_channel::{Sender, TrySendError};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{
@@ -355,7 +354,11 @@ impl WaylandCapture {
 }
 
 impl CaptureBackend for WaylandCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("Wayland capture already running".into());
         }
@@ -388,12 +391,13 @@ impl CaptureBackend for WaylandCapture {
 
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
+        let control = Arc::clone(control);
 
         let handle = thread::spawn(move || {
             st_protocol::thread_priority::promote_current_thread(
                 st_protocol::thread_priority::ThreadRole::Capture,
             );
-            if let Err(e) = run_capture_loop(tx, running) {
+            if let Err(e) = run_capture_loop(tx, running, control) {
                 eprintln!("[wayland] Capture error: {e}");
             }
         });
@@ -414,7 +418,11 @@ impl CaptureBackend for WaylandCapture {
 // Capture loop
 // ---------------------------------------------------------------------------
 
-fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Result<(), String> {
+fn run_capture_loop(
+    tx: Sender<CapturedFrame>,
+    running: Arc<AtomicBool>,
+    control: Arc<CaptureControl>,
+) -> Result<(), String> {
     // Create a fresh connection for this thread (Wayland connections are not thread-safe)
     let conn = Connection::connect_to_env().map_err(|e| format!("Wayland connect: {e}"))?;
     let display = conn.display();
@@ -554,7 +562,7 @@ fn run_capture_loop(tx: Sender<CapturedFrame>, running: Arc<AtomicBool>) -> Resu
 
         // Throttle to target frame rate
         // Re-read: adaptive fps retargets a running capture.
-        let target_interval = target_frame_interval();
+        let target_interval = control.frame_interval();
         let elapsed = frame_start.elapsed();
         if elapsed < target_interval {
             thread::sleep(target_interval - elapsed);

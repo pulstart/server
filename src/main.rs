@@ -38,6 +38,7 @@ mod input;
 mod linux_uring;
 #[cfg(target_os = "macos")]
 mod macos_display;
+mod outputs;
 mod screen_wake;
 mod server_control;
 #[cfg(target_os = "linux")]
@@ -47,6 +48,8 @@ mod transport;
 mod tray;
 mod updater;
 mod video_profile;
+#[cfg(target_os = "linux")]
+mod virtual_output;
 
 // Real-bitstream RS-FEC loss-injection integration test (encode → slice → drop
 // → reconstruct → decode). Test-only; see recovery_loopback.rs.
@@ -69,10 +72,11 @@ use video_profile::{AggregateVideoCapabilities, ClientVideoCapabilities, VideoCa
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use st_protocol::{
-    control::OutputInfo, ClientDisplayInfo, ClockSyncPong, ControlMessage, InputSession,
+    ClientDisplayInfo, ClockSyncPong, ControlMessage, ControllerState, InputSession,
     SessionDebugInfo, StreamConfig, VideoChromaSampling, VideoCodec, VideoCodecSupport,
+    OUTPUT_VIRTUAL,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -105,19 +109,12 @@ const CAPTURE_QUEUE_CAPACITY: usize = 4;
 const MAX_VIDEO_SEND_BURST: usize = 16;
 static TRACE_ENCODE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-static ENCODE_FAILURES: AtomicU32 = AtomicU32::new(0);
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 const ENCODE_FAILURE_LIMIT: u32 = 60;
-static NEXT_ENCODED_VIDEO_UNIT_SEQ: AtomicU64 = AtomicU64::new(0);
 static NEXT_PIPELINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(target_os = "macos")]
 extern "C" {
     fn CVPixelBufferRelease(buf: *mut std::ffi::c_void);
-}
-
-fn next_encoded_video_unit_seq() -> u64 {
-    NEXT_ENCODED_VIDEO_UNIT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Result of the pipeline — either it started OK or it had an error.
@@ -1072,20 +1069,25 @@ fn build_session_debug(
 }
 
 // ---------------------------------------------------------------------------
-// Shared pipeline: one capture + one encoder + one audio pipeline,
-// broadcasting encoded data to all connected clients.
+// Shared pipelines: one capture + one encoder per streamed output, each
+// broadcasting encoded video to the connections viewing that output. Audio is
+// one pipeline for the whole server (`AudioHub`).
 // ---------------------------------------------------------------------------
 
-/// Commands sent from a per-client control handler into the shared pipeline
-/// thread. Capture is a single shared resource, so these affect every client.
+/// Commands sent from a per-client control handler into a pipeline thread;
+/// they affect every connection viewing that pipeline's output.
 enum CaptureCommand {
-    /// Switch the shared capture to a different monitor/output. Global to every
-    /// client: stops+restarts capture pinned to the new output's CRTC.
-    SelectOutput(u32),
     /// Re-select the shared encoder against every active/tentative client. The
     /// response is sent only after the compatible encoder is active, or after
     /// the old stream has been left untouched on failure.
     SetVideoCapabilities(ProfileRequest),
+}
+
+/// Media epochs are unique across pipelines: a connection that moves to
+/// another output must never see the epoch it just left.
+fn next_video_epoch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 struct ProfileRequest {
@@ -1118,7 +1120,6 @@ struct StreamSnapshot {
     config: StreamConfig,
     generation: u64,
     video_epoch: u64,
-    selection_generation: u64,
 }
 
 #[derive(Clone)]
@@ -1126,16 +1127,12 @@ struct DebugSnapshot {
     info: SessionDebugInfo,
 }
 
-/// State shared between the pipeline thread (producer) and per-client control
-/// handlers (consumers): the enumerated outputs, the current selection, and the
-/// stream-config update an output switch produces.
+/// State shared between one pipeline thread (producer) and the control
+/// handlers of the connections viewing its output (consumers).
 struct SharedCaptureState {
     cmd_tx: Sender<CaptureCommand>,
-    available_outputs: Mutex<Vec<OutputInfo>>,
-    /// Currently captured output id (0 = unknown / primary).
-    selected_output: AtomicU32,
-    requested_output: AtomicU32,
-    requested_output_generation: AtomicU64,
+    /// Output this pipeline streams.
+    output: u32,
     /// Canonical stream configuration. Keeping config and generation under one
     /// lock makes startup snapshots atomic with concurrent profile changes.
     stream: Mutex<Option<StreamSnapshot>>,
@@ -1144,46 +1141,24 @@ struct SharedCaptureState {
 }
 
 impl SharedCaptureState {
-    fn new(cmd_tx: Sender<CaptureCommand>) -> Self {
+    fn new(cmd_tx: Sender<CaptureCommand>, output: u32) -> Self {
         Self {
             cmd_tx,
-            available_outputs: Mutex::new(Vec::new()),
-            selected_output: AtomicU32::new(0),
-            requested_output: AtomicU32::new(0),
-            requested_output_generation: AtomicU64::new(0),
+            output,
             stream: Mutex::new(None),
             active_video_epoch: Arc::new(AtomicU64::new(0)),
             debug: Mutex::new(None),
         }
     }
 
-    fn outputs(&self) -> Vec<OutputInfo> {
-        self.available_outputs.lock().unwrap().clone()
-    }
-
-    fn selected(&self) -> u32 {
-        self.selected_output.load(Ordering::SeqCst)
-    }
-
-    fn request_output(&self, id: u32) {
-        self.requested_output.store(id, Ordering::Release);
-        self.requested_output_generation
-            .fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn pending_output(&self, observed_generation: u64) -> Option<(u64, u32)> {
-        let generation = self.requested_output_generation.load(Ordering::Acquire);
-        (generation != observed_generation)
-            .then(|| (generation, self.requested_output.load(Ordering::Acquire)))
-    }
-
-    fn initialize_config(&self, mut config: StreamConfig) -> StreamSnapshot {
-        config.video_epoch = 1;
+    fn initialize_config(&self, mut config: StreamConfig, rotation: u8) -> StreamSnapshot {
+        config.video_epoch = next_video_epoch();
+        config.output_id = self.output;
+        config.rotation = rotation;
         let snapshot = StreamSnapshot {
             config,
             generation: 1,
-            video_epoch: 1,
-            selection_generation: 1,
+            video_epoch: config.video_epoch,
         };
         *self.stream.lock().unwrap() = Some(snapshot);
         self.active_video_epoch
@@ -1202,8 +1177,10 @@ impl SharedCaptureState {
         let mut stream = self.stream.lock().unwrap();
         let previous = stream.expect("stream config not initialized");
         config.video_epoch = previous.video_epoch;
+        config.output_id = self.output;
+        config.rotation = previous.config.rotation;
         let config_changed = previous.config != config;
-        let video_epoch = previous.video_epoch.wrapping_add(1);
+        let video_epoch = next_video_epoch();
         config.video_epoch = video_epoch;
         let snapshot = StreamSnapshot {
             config,
@@ -1213,7 +1190,6 @@ impl SharedCaptureState {
                 previous.generation
             },
             video_epoch,
-            selection_generation: previous.selection_generation,
         };
         *stream = Some(snapshot);
         self.active_video_epoch
@@ -1221,27 +1197,16 @@ impl SharedCaptureState {
         snapshot
     }
 
-    fn commit_output_selection(&self, mut config: StreamConfig) -> StreamSnapshot {
+    /// The compositor turned the output: same encoder and epoch, the picture
+    /// just has to be shown rotated differently.
+    fn commit_rotation(&self, rotation: u8) {
         let mut stream = self.stream.lock().unwrap();
-        let previous = stream.expect("stream config not initialized");
-        config.video_epoch = previous.video_epoch;
-        let config_changed = previous.config != config;
-        let video_epoch = previous.video_epoch.wrapping_add(1);
-        config.video_epoch = video_epoch;
-        let snapshot = StreamSnapshot {
-            config,
-            generation: if config_changed {
-                previous.generation.wrapping_add(1)
-            } else {
-                previous.generation
-            },
-            video_epoch,
-            selection_generation: previous.selection_generation.wrapping_add(1),
-        };
-        *stream = Some(snapshot);
-        self.active_video_epoch
-            .store(snapshot.video_epoch, Ordering::Release);
-        snapshot
+        if let Some(snapshot) = stream.as_mut() {
+            if snapshot.config.rotation != rotation {
+                snapshot.config.rotation = rotation;
+                snapshot.generation = snapshot.generation.wrapping_add(1);
+            }
+        }
     }
 
     fn active_video_epoch(&self) -> u64 {
@@ -1257,11 +1222,231 @@ impl SharedCaptureState {
     }
 }
 
+/// The server's one audio pipeline. It runs while any video pipeline does, so
+/// a connection keeps its audio subscription when it moves between outputs.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+struct AudioHub {
+    bc: Arc<Broadcaster<EncodedAudioPacket>>,
+    state: Mutex<AudioHubState>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[derive(Default)]
+struct AudioHubState {
+    users: usize,
+    pipeline: Option<Arc<Mutex<audio::AudioPipeline>>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+struct AudioLease(Arc<AudioHub>);
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+impl AudioHub {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bc: Arc::new(Broadcaster::new()),
+            state: Mutex::new(AudioHubState::default()),
+        })
+    }
+
+    /// Encode + relay run while a lease is held; capture attaches on demand
+    /// against whatever PulseAudio / PipeWire daemon this process can see.
+    fn acquire(self: &Arc<Self>) -> AudioLease {
+        let mut state = self.state.lock().unwrap();
+        state.users += 1;
+        if state.pipeline.is_none() {
+            let mut pipeline = audio::AudioPipeline::new();
+            match pipeline.start(encode_config::AudioConfig::from_env(), Arc::clone(&self.bc)) {
+                Ok(()) => println!("[pipeline] Audio pipeline started"),
+                Err(e) => eprintln!("[pipeline] Audio pipeline failed (video-only): {e}"),
+            }
+            pipeline.apply_auto_detect();
+            let pipeline = Arc::new(Mutex::new(pipeline));
+            // System-wide mode: audio follows the active seat's user.
+            #[cfg(target_os = "linux")]
+            session_follow::maybe_spawn(Arc::clone(&pipeline));
+            state.pipeline = Some(pipeline);
+        }
+        AudioLease(Arc::clone(self))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+impl Drop for AudioLease {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.users -= 1;
+        if state.users == 0 {
+            if let Some(pipeline) = state.pipeline.take() {
+                if let Ok(mut pipeline) = pipeline.lock() {
+                    pipeline.stop();
+                }
+            }
+        }
+    }
+}
+
+/// What every pipeline of this server shares.
+struct PipelineEnv {
+    input: Arc<InputRuntime>,
+    control: Arc<ServerControl>,
+    outputs: Arc<outputs::OutputDirectory>,
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    audio: Arc<AudioHub>,
+    /// Running pipelines. The input injector is chosen when the first starts
+    /// and released when the last stops; the ones in between share it.
+    running: Mutex<usize>,
+    /// Serializes directory refreshes: a client opening several sessions at
+    /// once must not enumerate once per session.
+    outputs_refresh: Mutex<()>,
+    #[cfg(target_os = "linux")]
+    virtuals: Arc<virtual_output::VirtualOutputs>,
+}
+
+impl PipelineEnv {
+    /// While something streams the watcher keeps the directory current; a
+    /// connection arriving at an idle server must enumerate first, or it
+    /// would resolve its output against monitors that may be gone.
+    fn ensure_fresh_outputs(&self) {
+        const MAX_AGE: Duration = Duration::from_secs(3);
+        let _guard = self.outputs_refresh.lock().unwrap();
+        if !self.outputs.is_fresh(MAX_AGE) {
+            self.refresh_outputs(None);
+        }
+    }
+
+    /// Re-enumerate what can be streamed. `capture` is what a pipeline's
+    /// backend just listed; without it the backend new pipelines would use is
+    /// asked.
+    fn refresh_outputs(&self, capture: Option<Vec<capture::CaptureOutput>>) {
+        let capture = capture.unwrap_or_else(capture::enumerate_outputs);
+        #[cfg(target_os = "linux")]
+        let virtuals = self.virtuals.names();
+        #[cfg(not(target_os = "linux"))]
+        let virtuals = Vec::new();
+        let layout = (!capture.is_empty() || !virtuals.is_empty())
+            .then(outputs::query_layout)
+            .flatten();
+        self.outputs.update(&capture, &virtuals, layout.as_deref());
+        #[cfg(target_os = "linux")]
+        self.outputs
+            .set_virtual_supported(virtual_output::supported());
+    }
+
+    /// Create (or re-adopt) a virtual output sized for a client's display
+    /// and wait until the compositor has placed it on the desktop.
+    #[cfg(target_os = "linux")]
+    fn acquire_virtual_output(
+        &self,
+        request: OutputRequest,
+    ) -> Result<virtual_output::VirtualLease, String> {
+        // Encoders want even dimensions; an unknown display gets 1080p.
+        let even = |value: u32, fallback: u32| match value {
+            0 => fallback,
+            value => value.clamp(320, 8192) & !1,
+        };
+        let lease = self.virtuals.acquire(
+            even(request.width, 1920),
+            even(request.height, 1080),
+            request.refresh_millihz,
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            {
+                let _guard = self.outputs_refresh.lock().unwrap();
+                self.refresh_outputs(None);
+            }
+            if self.outputs.info(lease.output_id).is_some() {
+                return Ok(lease);
+            }
+            if Instant::now() >= deadline {
+                return Err("the compositor did not place the virtual output".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Keep the directory current while anything streams: hotplug, mode and
+    /// arrangement changes reach clients as `AvailableOutputs` and pipelines
+    /// as rotation changes.
+    fn spawn_output_watcher(self: &Arc<Self>) {
+        const POLL: Duration = Duration::from_millis(250);
+        const CONNECTOR_PERIOD: Duration = Duration::from_secs(2);
+        // The arrangement costs a compositor query; connectors are a few ioctls.
+        const LAYOUT_PERIOD: Duration = Duration::from_secs(5);
+        let env = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            let mut connectors = Vec::new();
+            let mut connectors_at = Instant::now();
+            let mut layout_at = Instant::now();
+            loop {
+                std::thread::sleep(POLL);
+                let Some(env) = env.upgrade() else {
+                    return;
+                };
+                let mut requested = env.outputs.take_refresh_request();
+                #[cfg(target_os = "linux")]
+                {
+                    requested |= env.virtuals.reap();
+                }
+                let streaming = *env.running.lock().unwrap() > 0;
+                let due = streaming && connectors_at.elapsed() >= CONNECTOR_PERIOD;
+                if !requested && !due {
+                    continue;
+                }
+                connectors_at = Instant::now();
+                let next = capture::enumerate_outputs();
+                if requested || next != connectors || layout_at.elapsed() >= LAYOUT_PERIOD {
+                    connectors = next.clone();
+                    layout_at = Instant::now();
+                    let _guard = env.outputs_refresh.lock().unwrap();
+                    env.refresh_outputs(Some(next));
+                }
+            }
+        });
+    }
+}
+
+/// The pipeline of one output and the lifecycle state that guards it. Slots
+/// are independent: connections viewing different outputs never wait on each
+/// other's encoder profile or pipeline start.
+struct PipelineSlot {
+    /// `OutputInfo::id`, or `outputs::SINGLE_OUTPUT`.
+    output: u32,
+    env: Arc<PipelineEnv>,
+    pipeline: Mutex<Option<SharedPipeline>>,
+    pipeline_starting: AtomicBool,
+    pipeline_stop: Arc<PipelineStopCoordinator>,
+    admission: Arc<AdmissionCoordinator>,
+    /// Serializes exact-instance subscribe/unsubscribe/start/stop operations.
+    pipeline_lifecycle: Mutex<()>,
+    /// Registry revision checked by asynchronous encoder workers before commit.
+    profile_revision: Arc<AtomicU64>,
+    /// Makes registry mutations and encoder-profile commits mutually exclusive.
+    profile_commit: Arc<Mutex<()>>,
+    video_capabilities: Mutex<VideoCapabilityRegistry>,
+}
+
+impl PipelineSlot {
+    fn new(output: u32, env: Arc<PipelineEnv>) -> Arc<Self> {
+        Arc::new(Self {
+            output,
+            env,
+            pipeline: Mutex::new(None),
+            pipeline_starting: AtomicBool::new(false),
+            pipeline_stop: Arc::new(PipelineStopCoordinator::default()),
+            admission: Arc::new(AdmissionCoordinator::default()),
+            pipeline_lifecycle: Mutex::new(()),
+            profile_revision: Arc::new(AtomicU64::new(0)),
+            profile_commit: Arc::new(Mutex::new(())),
+            video_capabilities: Mutex::new(VideoCapabilityRegistry::default()),
+        })
+    }
+}
+
 struct SharedPipeline {
     instance_id: u64,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    audio_bc: Arc<Broadcaster<EncodedAudioPacket>>,
     session_debug: SessionDebugInfo,
     rate_control: Arc<AdaptiveBitrateState>,
     capture_state: Arc<SharedCaptureState>,
@@ -1270,62 +1455,48 @@ struct SharedPipeline {
 }
 
 impl SharedPipeline {
-    #[allow(clippy::too_many_arguments)]
     fn start(
         video_capabilities: AggregateVideoCapabilities,
-        input: Arc<InputRuntime>,
-        control: Arc<ServerControl>,
-        state: &Arc<ServerState>,
+        slot: &Arc<PipelineSlot>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<(Self, ClientSubscription), String> {
         let instance_id = NEXT_PIPELINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
-        let video_bc = Arc::new(Broadcaster::new());
-        let zero_state = Arc::downgrade(state);
+        let capture_control = capture::CaptureControl::new(EncoderConfig::resolve_target_fps(
+            video_capabilities.requested_fps,
+        ));
+        let video_bc = Arc::new(Broadcaster::for_capture(Arc::clone(&capture_control)));
+        let zero_slot = Arc::downgrade(slot);
         video_bc.set_on_zero(move || {
-            if let Some(state) = zero_state.upgrade() {
-                stop_pipeline_if_idle(&state, instance_id);
+            if let Some(slot) = zero_slot.upgrade() {
+                stop_pipeline_if_idle(&slot, instance_id);
             }
         });
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        let audio_bc = Arc::new(Broadcaster::new());
         let (vid_sub_id, vid_rx) = video_bc.subscribe(VIDEO_SUBSCRIBER_CAPACITY)?;
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        let (aud_sub_id, aud_rx) = match audio_bc.subscribe(30) {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                video_bc.unsubscribe(vid_sub_id);
-                return Err(error);
-            }
-        };
 
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (status_tx, status_rx) = bounded::<PipelineResult>(1);
         let (capture_cmd_tx, capture_cmd_rx) = bounded::<CaptureCommand>(4);
-        let capture_state = Arc::new(SharedCaptureState::new(capture_cmd_tx));
+        let capture_state = Arc::new(SharedCaptureState::new(capture_cmd_tx, slot.output));
         let startup_cancelled = Arc::clone(&cancelled);
 
         let vbc = Arc::clone(&video_bc);
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        let abc = Arc::clone(&audio_bc);
         let cs = Arc::clone(&capture_state);
-        let input_owner = Arc::clone(&state.input_pipeline_owner);
-        let thread_control = Arc::clone(&control);
+        let env = Arc::clone(&slot.env);
+        let output = slot.output;
+        let control = Arc::clone(&slot.env.control);
 
         let handle = std::thread::spawn(move || {
             run_shared_pipeline(
-                instance_id,
+                output,
                 shutdown_rx,
                 startup_cancelled,
                 status_tx,
                 video_capabilities,
-                input,
-                thread_control,
+                env,
                 vbc,
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                abc,
                 cs,
                 capture_cmd_rx,
-                input_owner,
+                capture_control,
             );
         });
 
@@ -1352,8 +1523,6 @@ impl SharedPipeline {
                 Self {
                     instance_id,
                     video_bc: Arc::clone(&video_bc),
-                    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                    audio_bc: Arc::clone(&audio_bc),
                     session_debug,
                     rate_control,
                     capture_state,
@@ -1361,24 +1530,13 @@ impl SharedPipeline {
                     pipeline_handle: handle,
                 },
                 ClientSubscription {
-                    pipeline_instance_id: instance_id,
                     vid_sub_id,
                     vid_rx: Some(vid_rx),
                     video_bc: Arc::clone(&video_bc),
-                    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                    aud_sub_id,
-                    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                    aud_rx: Some(aud_rx),
                     _cleanup: SubscriptionCleanup {
-                        state: Arc::downgrade(state),
+                        slot: Arc::downgrade(slot),
                         pipeline_instance_id: instance_id,
                         vid_sub_id,
-                        #[cfg(any(
-                            target_os = "linux",
-                            target_os = "windows",
-                            target_os = "macos"
-                        ))]
-                        aud_sub_id,
                     },
                 },
             )),
@@ -1389,7 +1547,7 @@ impl SharedPipeline {
             Err(error) => {
                 cancelled.store(true, Ordering::Release);
                 let _ = shutdown_tx.send(());
-                state.pipeline_stop.register(handle);
+                slot.pipeline_stop.register(handle);
                 Err(error)
             }
         }
@@ -1403,36 +1561,23 @@ impl SharedPipeline {
 
 /// Per-client subscription handles.
 struct SubscriptionCleanup {
-    state: Weak<ServerState>,
+    slot: Weak<PipelineSlot>,
     pipeline_instance_id: u64,
     vid_sub_id: u64,
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    aud_sub_id: u64,
 }
 
 impl Drop for SubscriptionCleanup {
     fn drop(&mut self) {
-        if let Some(state) = self.state.upgrade() {
-            unsubscribe_and_maybe_stop_pipeline(
-                &state,
-                self.pipeline_instance_id,
-                self.vid_sub_id,
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                self.aud_sub_id,
-            );
+        if let Some(slot) = self.slot.upgrade() {
+            unsubscribe_and_maybe_stop_pipeline(&slot, self.pipeline_instance_id, self.vid_sub_id);
         }
     }
 }
 
 struct ClientSubscription {
-    pipeline_instance_id: u64,
     vid_sub_id: u64,
     vid_rx: Option<Receiver<Arc<EncodedVideoFrame>>>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    aud_sub_id: u64,
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
     _cleanup: SubscriptionCleanup,
 }
 
@@ -1440,34 +1585,25 @@ struct ClientPipelineReservation {
     pipeline_instance_id: u64,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
     video: SubscriptionReservation<EncodedVideoFrame>,
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    audio: SubscriptionReservation<EncodedAudioPacket>,
     rate_control: Arc<AdaptiveBitrateState>,
     capture_state: Arc<SharedCaptureState>,
-    state: Weak<ServerState>,
+    slot: Weak<PipelineSlot>,
 }
 
 impl ClientPipelineReservation {
-    fn new(pipeline: &SharedPipeline, state: &Arc<ServerState>) -> Result<Self, String> {
-        let video = pipeline.video_bc.reserve()?;
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        let audio = pipeline.audio_bc.reserve()?;
+    fn new(pipeline: &SharedPipeline, slot: &Arc<PipelineSlot>) -> Result<Self, String> {
         Ok(Self {
             pipeline_instance_id: pipeline.instance_id,
             video_bc: Arc::clone(&pipeline.video_bc),
-            video,
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            audio,
+            video: pipeline.video_bc.reserve()?,
             rate_control: Arc::clone(&pipeline.rate_control),
             capture_state: Arc::clone(&pipeline.capture_state),
-            state: Arc::downgrade(state),
+            slot: Arc::downgrade(slot),
         })
     }
 
     fn commit(self, snapshot: StreamSnapshot) -> PipelineSetup {
         let (vid_sub_id, vid_rx) = self.video.commit(VIDEO_SUBSCRIBER_CAPACITY);
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        let (aud_sub_id, aud_rx) = self.audio.commit(30);
         let session_debug = self
             .capture_state
             .debug_snapshot()
@@ -1475,20 +1611,13 @@ impl ClientPipelineReservation {
             .info;
         (
             ClientSubscription {
-                pipeline_instance_id: self.pipeline_instance_id,
                 vid_sub_id,
                 vid_rx: Some(vid_rx),
                 video_bc: self.video_bc,
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                aud_sub_id,
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                aud_rx: Some(aud_rx),
                 _cleanup: SubscriptionCleanup {
-                    state: self.state,
+                    slot: self.slot,
                     pipeline_instance_id: self.pipeline_instance_id,
                     vid_sub_id,
-                    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                    aud_sub_id,
                 },
             },
             snapshot,
@@ -1501,23 +1630,26 @@ impl ClientPipelineReservation {
 
 /// Global server state shared across all client handlers.
 struct ServerState {
-    pipeline: Mutex<Option<SharedPipeline>>,
-    pipeline_starting: AtomicBool,
-    pipeline_stop: Arc<PipelineStopCoordinator>,
-    admission: Arc<AdmissionCoordinator>,
-    /// Serializes exact-instance subscribe/unsubscribe/start/stop operations.
-    pipeline_lifecycle: Mutex<()>,
-    /// Registry revision checked by asynchronous encoder workers before commit.
-    profile_revision: Arc<AtomicU64>,
-    /// Makes registry mutations and encoder-profile commits mutually exclusive.
-    profile_commit: Arc<Mutex<()>>,
-    input_pipeline_owner: Arc<AtomicU64>,
-    video_capabilities: Mutex<VideoCapabilityRegistry>,
+    env: Arc<PipelineEnv>,
+    /// One slot per output ever streamed; a slot outlives its pipelines.
+    slots: Mutex<HashMap<u32, Arc<PipelineSlot>>>,
     input: Arc<InputRuntime>,
     control: Arc<ServerControl>,
     listen_port: u16,
     /// Tunnel state from the API registration thread (key exchange + partner candidates).
     tunnel_state: Option<Arc<api_client::ApiTunnelState>>,
+}
+
+impl ServerState {
+    fn slot(&self, output: u32) -> Arc<PipelineSlot> {
+        Arc::clone(
+            self.slots
+                .lock()
+                .unwrap()
+                .entry(output)
+                .or_insert_with(|| PipelineSlot::new(output, Arc::clone(&self.env))),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -1653,27 +1785,26 @@ impl Drop for PipelineStartGuard<'_> {
 struct VideoMembership {
     id: u64,
     cancelled: Arc<AtomicBool>,
-    state: Weak<ServerState>,
+    slot: Weak<PipelineSlot>,
 }
 
 impl Drop for VideoMembership {
     fn drop(&mut self) {
-        let Some(state) = self.state.upgrade() else {
+        let Some(slot) = self.slot.upgrade() else {
             return;
         };
         self.cancelled.store(true, Ordering::Release);
         let (removed, has_members) = {
-            let _commit_guard = state.profile_commit.lock().unwrap();
-            let mut registry = state.video_capabilities.lock().unwrap();
+            let _commit_guard = slot.profile_commit.lock().unwrap();
+            let mut registry = slot.video_capabilities.lock().unwrap();
             let removed = registry.remove(self.id);
-            state
-                .profile_revision
+            slot.profile_revision
                 .store(registry.revision(), Ordering::Release);
             (removed, !registry.is_empty())
         };
         if removed.is_some() && has_members {
             std::thread::spawn(move || {
-                if let Err(error) = reconcile_video_profile(&state) {
+                if let Err(error) = reconcile_video_profile(&slot) {
                     eprintln!("[pipeline] remaining-client profile upgrade failed: {error}");
                 }
             });
@@ -1681,20 +1812,22 @@ impl Drop for VideoMembership {
     }
 }
 
+/// `cancelled` aborts the join this membership is created for, and is set
+/// when the membership ends.
 fn begin_video_membership(
-    state: &Arc<ServerState>,
+    slot: &Arc<PipelineSlot>,
     capabilities: ClientVideoCapabilities,
+    cancelled: Arc<AtomicBool>,
 ) -> VideoMembership {
-    let _commit_guard = state.profile_commit.lock().unwrap();
-    let mut registry = state.video_capabilities.lock().unwrap();
+    let _commit_guard = slot.profile_commit.lock().unwrap();
+    let mut registry = slot.video_capabilities.lock().unwrap();
     let id = registry.insert_tentative(capabilities);
-    state
-        .profile_revision
+    slot.profile_revision
         .store(registry.revision(), Ordering::Release);
     VideoMembership {
         id,
-        cancelled: Arc::new(AtomicBool::new(false)),
-        state: Arc::downgrade(state),
+        cancelled,
+        slot: Arc::downgrade(slot),
     }
 }
 
@@ -1809,37 +1942,78 @@ fn spawn_profile_encoder_rebuild(
 // Shared pipeline thread
 // ---------------------------------------------------------------------------
 
+/// Bookkeeping of one pipeline's encode loop.
+struct EncodeTrack {
+    output: u32,
+    /// Monotonic per pipeline: a transport reads a gap as dropped units.
+    next_unit_seq: u64,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    failures: u32,
+}
+
+impl EncodeTrack {
+    fn next_unit_seq(&mut self) -> u64 {
+        let seq = self.next_unit_seq;
+        self.next_unit_seq += 1;
+        seq
+    }
+}
+
+/// The input injector follows the first running pipeline and is released with
+/// the last one.
+struct RunningPipeline(Arc<PipelineEnv>);
+
+impl RunningPipeline {
+    fn enter(env: &Arc<PipelineEnv>, capture_backend: &str, width: u32, height: u32) -> Self {
+        let mut running = env.running.lock().unwrap();
+        if *running == 0 {
+            env.input.refresh_backend(capture_backend, width, height);
+        }
+        *running += 1;
+        Self(Arc::clone(env))
+    }
+}
+
+impl Drop for RunningPipeline {
+    fn drop(&mut self) {
+        let mut running = self.0.running.lock().unwrap();
+        *running -= 1;
+        if *running == 0 {
+            self.0.input.clear_for_stop();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_shared_pipeline(
-    instance_id: u64,
+    output: u32,
     shutdown_rx: Receiver<()>,
     startup_cancelled: Arc<AtomicBool>,
     status_tx: Sender<PipelineResult>,
     video_capabilities: AggregateVideoCapabilities,
-    input: Arc<InputRuntime>,
-    control: Arc<ServerControl>,
+    env: Arc<PipelineEnv>,
     video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))] audio_bc: Arc<
-        Broadcaster<EncodedAudioPacket>,
-    >,
     capture_state: Arc<SharedCaptureState>,
     capture_cmd_rx: Receiver<CaptureCommand>,
-    input_pipeline_owner: Arc<AtomicU64>,
+    capture_control: Arc<capture::CaptureControl>,
 ) {
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    ENCODE_FAILURES.store(0, Ordering::Relaxed);
+    let input = Arc::clone(&env.input);
+    let control = Arc::clone(&env.control);
+    let mut encode_track = EncodeTrack {
+        output,
+        next_unit_seq: 0,
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        failures: 0,
+    };
     st_protocol::thread_priority::promote_current_thread(
         st_protocol::thread_priority::ThreadRole::Video,
     );
-    let (frame_tx, mut frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
-    // Capture-command processing (output switching) is only meaningful on the
-    // KMS path (Linux); on other platforms drain-suppress the unused channel.
+    let (frame_tx, frame_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = &capture_cmd_rx;
     let trace = trace_enabled();
 
-    let negotiated_fps = EncoderConfig::resolve_target_fps(video_capabilities.requested_fps);
-    capture::set_target_fps(negotiated_fps);
+    let negotiated_fps = capture_control.target_fps();
     println!(
         "[pipeline] capture fps target={} (client_request={:?}fps, ST_FPS cap={:?})",
         negotiated_fps,
@@ -1847,12 +2021,36 @@ fn run_shared_pipeline(
         EncoderConfig::fps_cap_from_env()
     );
 
+    #[cfg(target_os = "linux")]
+    let virtual_node = env.virtuals.node(output);
+    #[cfg(target_os = "linux")]
+    let is_virtual = virtual_node.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let is_virtual = false;
+    #[cfg(target_os = "linux")]
+    let mut capture_backend = match virtual_node {
+        Some(node) => PlatformCapture::for_pipewire_node(node),
+        None => PlatformCapture::new(),
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut capture_backend = PlatformCapture::new();
+    if output != outputs::SINGLE_OUTPUT && !is_virtual {
+        // Only the default output may fall back to a backend that cannot pin
+        // one: anything else would stream a monitor the client did not ask for.
+        #[cfg(target_os = "linux")]
+        if env.outputs.info(output).is_some_and(|info| info.is_primary) {
+            capture_backend.select_output(output);
+        } else {
+            capture_backend.select_exact_output(output);
+        }
+        #[cfg(not(target_os = "linux"))]
+        capture_backend.select_output(output);
+    }
     if startup_cancelled.load(Ordering::Acquire) {
         let _ = status_tx.send(PipelineResult::Error("Pipeline startup cancelled".into()));
         return;
     }
-    if let Err(e) = capture_backend.start(frame_tx) {
+    if let Err(e) = capture_backend.start(frame_tx, &capture_control) {
         let msg = format!("Failed to start capture: {e}");
         eprintln!("{msg}");
         let _ = status_tx.send(PipelineResult::Error(msg));
@@ -1922,7 +2120,7 @@ fn run_shared_pipeline(
             capture::linux::probe_display_gpu_render_node()
         });
     #[cfg(target_os = "linux")]
-    let _clock_floor = gpu_clock::ClockFloor::engage(capture_render_hint.as_deref());
+    let _clock_floor = gpu_clock::FloorLease::hold(capture_render_hint.as_deref());
     #[cfg(target_os = "linux")]
     let (config, mut encoder) = match select_linux_encoder(
         first_frame.width,
@@ -2020,63 +2218,43 @@ fn run_shared_pipeline(
         ))
     };
 
-    // Start audio pipeline — encode + relay run persistently; capture is
-    // attached on-demand against whatever PulseAudio / PipeWire daemon is
-    // visible to this process. Works because st-server runs in the user's
-    // session and inherits XDG_RUNTIME_DIR / PULSE_SERVER naturally.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let audio_pipeline_shared = {
-        let mut ap = audio::AudioPipeline::new();
-        match ap.start(audio_config.clone(), audio_bc) {
-            Ok(()) => println!("[pipeline] Audio pipeline started"),
-            Err(e) => eprintln!("[pipeline] Audio pipeline failed (video-only): {e}"),
-        }
-        ap.apply_auto_detect();
-        Arc::new(std::sync::Mutex::new(ap))
-    };
-    // System-wide mode: follow the active seat's user so audio re-attaches to
-    // whoever is logged in. No-op in per-user mode (already in the session).
-    #[cfg(target_os = "linux")]
-    session_follow::maybe_spawn(Arc::clone(&audio_pipeline_shared));
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let audio_pipeline = Arc::clone(&audio_pipeline_shared);
+    let _audio = env.audio.acquire();
+
+    // A pipeline that ended up on another backend than the one the directory
+    // enumerated (start fallback) changes what clients can pick.
+    let listed = capture_backend.list_outputs();
+    let known = env.outputs.list().0;
+    if !is_virtual && listed.is_empty() != known.iter().all(|output| output.is_virtual) {
+        let _guard = env.outputs_refresh.lock().unwrap();
+        env.refresh_outputs(Some(listed));
+    }
+    let mut rotation = output_rotation(&env.outputs, output);
+    let mut outputs_generation = env.outputs.generation();
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let stream_config = config.to_stream_config(&audio_config);
-    let initial_snapshot = capture_state.initialize_config(stream_config);
+    let initial_snapshot = capture_state.initialize_config(stream_config, rotation);
+    let stream_config = initial_snapshot.config;
 
     let capture_backend_name = capture_backend.backend_name().to_string();
-    input_pipeline_owner.store(instance_id, Ordering::Release);
-    input.refresh_backend(
-        &capture_backend_name,
-        stream_config.width,
-        stream_config.height,
-    );
+    let (upright_width, upright_height) = stream_config.display_size();
+    let _running =
+        RunningPipeline::enter(&env, &capture_backend_name, upright_width, upright_height);
+    input.set_output_geometry(output, upright_width, upright_height, rotation);
     let session_debug =
         build_session_debug(&encoder, &config, &capture_backend_name, input.as_ref());
     capture_state.initialize_debug(session_debug.clone());
 
     println!(
-        "Shared pipeline started: {}x{} (video: {:?} {:?} {:?})",
-        first_frame.width, first_frame.height, config.codec, config.dynamic_range, config.chroma,
+        "Shared pipeline started: output {output:#x} {}x{} rotation {} (video: {:?} {:?} {:?})",
+        first_frame.width,
+        first_frame.height,
+        rotation as u32 * 90,
+        config.codec,
+        config.dynamic_range,
+        config.chroma,
     );
-
-    // Publish the capturable outputs so connecting clients can offer a monitor
-    // picker. Empty on backends that can't enumerate (portal fallback, macOS,
-    // Windows) — the client then hides the picker. Default the reported
-    // selection to the primary so the client highlights it without re-sending.
-    {
-        let outputs = capture_backend.list_outputs();
-        if let Some(primary) = outputs.iter().find(|o| o.is_primary) {
-            capture_state
-                .selected_output
-                .store(primary.id, Ordering::SeqCst);
-        }
-        if outputs.len() > 1 {
-            println!("[pipeline] {} capturable outputs available", outputs.len());
-        }
-        *capture_state.available_outputs.lock().unwrap() = outputs;
-    }
 
     // Tell the control plane we started OK
     let _ = status_tx.send(PipelineResult::Started(
@@ -2107,8 +2285,7 @@ fn run_shared_pipeline(
     let mut frame_rate_tracker = adaptive_bitrate::EncodeRateTracker::new(Instant::now());
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut encode_credit = capture::FrameCredit::new(Instant::now());
-    #[cfg(target_os = "linux")]
-    let _ = capture::take_unchanged_capture_ticks();
+    let _ = capture_control.take_unchanged_ticks();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if adaptive_fps.enabled() {
         println!(
@@ -2122,22 +2299,24 @@ fn run_shared_pipeline(
             current_config.framerate
         );
     }
+    #[cfg(target_os = "linux")]
+    capture_control.set_nv12_ram(matches!(encoder, EncoderKind::Vulkan(_)));
     encode_and_broadcast(
         &mut encoder,
         &video_bc,
         input.as_ref(),
         &first_frame,
         initial_snapshot.video_epoch,
+        &mut encode_track,
     );
 
-    let mut observed_output_generation = 0u64;
     // Main loop
     'pipeline: loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
         }
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        if ENCODE_FAILURES.load(Ordering::Relaxed) >= ENCODE_FAILURE_LIMIT {
+        if encode_track.failures >= ENCODE_FAILURE_LIMIT {
             eprintln!(
                 "[pipeline] encoder failed {ENCODE_FAILURE_LIMIT} frames in a row; ending the pipeline so clients reconnect to a fresh one"
             );
@@ -2145,102 +2324,29 @@ fn run_shared_pipeline(
             encode_vulkan::forget_device();
             break;
         }
+        // The capture loop emits NV12 only for an encoder that takes it.
+        #[cfg(target_os = "linux")]
+        capture_control.set_nv12_ram(matches!(encoder, EncoderKind::Vulkan(_)));
 
-        // Apply any pending capture/output switch. Rare, user-initiated, and
-        // global to the shared stream: stop+restart capture pinned to the new
-        // monitor, rebuild the encoder if the resolution changed, then publish
-        // the new StreamConfig so every client re-syncs and gets a keyframe.
-        let mut next_command = capture_state
-            .pending_output(observed_output_generation)
-            .map(|(generation, id)| {
-                observed_output_generation = generation;
-                CaptureCommand::SelectOutput(id)
-            });
-        loop {
-            let Some(cmd) = next_command
-                .take()
-                .or_else(|| capture_cmd_rx.try_recv().ok())
-            else {
-                break;
-            };
+        // The compositor turned this output: same stream, shown rotated.
+        let generation = env.outputs.generation();
+        if generation != outputs_generation {
+            outputs_generation = generation;
+            let next = output_rotation(&env.outputs, output);
+            if next != rotation {
+                rotation = next;
+                capture_state.commit_rotation(rotation);
+                let (width, height) = upright_size(&current_config, rotation);
+                input.set_output_geometry(output, width, height, rotation);
+                println!(
+                    "[pipeline] output {output:#x} rotation is now {}",
+                    rotation as u32 * 90
+                );
+            }
+        }
+
+        while let Ok(cmd) = capture_cmd_rx.try_recv() {
             match cmd {
-                CaptureCommand::SelectOutput(id) => {
-                    #[cfg(any(target_os = "linux", target_os = "windows"))]
-                    {
-                        if !capture_backend.select_output(id) {
-                            continue;
-                        }
-                        println!("[pipeline] switching capture to output id {id}");
-                        capture_backend.stop();
-                        let (new_tx, new_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
-                        if let Err(e) = capture_backend.start(new_tx) {
-                            eprintln!(
-                            "[pipeline] capture restart after output switch failed: {e}; stopping pipeline"
-                        );
-                            break 'pipeline;
-                        }
-                        frame_rx = new_rx;
-                        let switched_frame = match frame_rx
-                            .recv_timeout(std::time::Duration::from_secs(5))
-                        {
-                            Ok(f) => f,
-                            Err(_) => {
-                                eprintln!(
-                                    "[pipeline] no frame within 5s after output switch; stopping pipeline"
-                                );
-                                break 'pipeline;
-                            }
-                        };
-                        if switched_frame.width != current_config.width
-                            || switched_frame.height != current_config.height
-                        {
-                            encoder_revision = encoder_revision.wrapping_add(1);
-                            if let Some(pending) = pending_encoder_rebuild.take() {
-                                if let RebuildPurpose::Profile(request) = pending.purpose {
-                                    request.reject(
-                                        "capture changed while the video profile was opening",
-                                    );
-                                }
-                            }
-                            let mut new_config = current_config.clone();
-                            new_config.width = switched_frame.width;
-                            new_config.height = switched_frame.height;
-                            let backend = encoder_backend(&encoder);
-                            match create_encoder_for_backend(&new_config, backend) {
-                                Ok(mut new_encoder) => {
-                                    request_next_keyframe(&mut new_encoder);
-                                    encoder = new_encoder;
-                                    current_config = new_config;
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                    "[pipeline] encoder rebuild for switched output failed: {e}; stopping pipeline"
-                                );
-                                    break 'pipeline;
-                                }
-                            }
-                        } else {
-                            request_next_keyframe(&mut encoder);
-                        }
-                        capture_state.selected_output.store(id, Ordering::SeqCst);
-                        capture_state.commit_output_selection(
-                            current_config.to_stream_config(&audio_config),
-                        );
-                        video_bc.clear_queued();
-                        input.update_stream_dimensions(current_config.width, current_config.height);
-                        println!(
-                            "[pipeline] output switch complete: {}x{}",
-                            current_config.width, current_config.height
-                        );
-                        encode_and_broadcast(
-                            &mut encoder,
-                            &video_bc,
-                            input.as_ref(),
-                            &switched_frame,
-                            capture_state.active_video_epoch(),
-                        );
-                    }
-                }
                 CaptureCommand::SetVideoCapabilities(mut request) => {
                     if !request.is_current() {
                         request.reject("video profile request was cancelled");
@@ -2356,7 +2462,7 @@ fn run_shared_pipeline(
                                     encoder = next_encoder;
                                 }
                                 current_config = next_config;
-                                capture::set_target_fps(current_config.framerate);
+                                capture_control.set_target_fps(current_config.framerate);
                                 let snapshot = if rebuilt {
                                     let snapshot = capture_state.commit_encoder_config(
                                         current_config.to_stream_config(&audio_config),
@@ -2475,7 +2581,10 @@ fn run_shared_pipeline(
                         current_config = new_config;
                         capture_state
                             .commit_encoder_config(current_config.to_stream_config(&audio_config));
-                        input.update_stream_dimensions(current_config.width, current_config.height);
+                        let (width, height) = upright_size(&current_config, rotation);
+                        input.set_output_geometry(output, width, height, rotation);
+                        // A mode change usually comes with a new arrangement.
+                        env.outputs.request_refresh();
                         video_bc.clear_queued();
                     }
                     Err(e) => {
@@ -2630,7 +2739,7 @@ fn run_shared_pipeline(
                             current_config = next_config;
                             last_encoder_reconfigure = Instant::now();
                             if fps_changed {
-                                capture::set_target_fps(current_config.framerate);
+                                capture_control.set_target_fps(current_config.framerate);
                             }
                             if fps_changed || profile_change {
                                 adaptive_fps.encoder_reconfigured(
@@ -2641,7 +2750,7 @@ fn run_shared_pipeline(
                                 frame_rate_tracker =
                                     adaptive_bitrate::EncodeRateTracker::new(Instant::now());
                                 #[cfg(target_os = "linux")]
-                                let _ = capture::take_unchanged_capture_ticks();
+                                let _ = capture_control.take_unchanged_ticks();
                             }
                             let snapshot = capture_state.commit_encoder_config(
                                 current_config.to_stream_config(&audio_config),
@@ -2654,7 +2763,7 @@ fn run_shared_pipeline(
                         }
                         Err(err) => {
                             if matches!(&pending.purpose, RebuildPurpose::FrameRate) {
-                                capture::set_target_fps(current_config.framerate);
+                                capture_control.set_target_fps(current_config.framerate);
                                 adaptive_fps.encoder_reconfigured(
                                     current_config.framerate,
                                     false,
@@ -2797,6 +2906,7 @@ fn run_shared_pipeline(
                 input.as_ref(),
                 &frame,
                 capture_state.active_video_epoch(),
+                &mut encode_track,
             );
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
@@ -2807,7 +2917,7 @@ fn run_shared_pipeline(
                 frame_rate_tracker.record(encode_us, budget_us, !frame_rx.is_empty());
                 #[cfg(target_os = "linux")]
                 frame_rate_tracker
-                    .record_unchanged_capture_ticks(capture::take_unchanged_capture_ticks());
+                    .record_unchanged_capture_ticks(capture_control.take_unchanged_ticks());
                 // Don't stack an fps rebuild on a pending bitrate/resolution one.
                 if pending_encoder_rebuild.is_none() {
                     if let Some(sample) = frame_rate_tracker.take_sample(now) {
@@ -2828,7 +2938,7 @@ fn run_shared_pipeline(
                             );
                             // Slow capture immediately to stop overrunning; the
                             // encoder swaps to the new fps when the rebuild lands.
-                            capture::set_target_fps(new_fps);
+                            capture_control.set_target_fps(new_fps);
                             encoder_revision = encoder_revision.wrapping_add(1);
                             pending_encoder_rebuild = Some(spawn_encoder_rebuild(
                                 new_config,
@@ -2847,7 +2957,7 @@ fn run_shared_pipeline(
                 frame_rate_tracker = adaptive_bitrate::EncodeRateTracker::new(Instant::now());
             }
             #[cfg(target_os = "linux")]
-            let _ = capture::take_unchanged_capture_ticks();
+            let _ = capture_control.take_unchanged_ticks();
             #[cfg(target_os = "macos")]
             unsafe {
                 CVPixelBufferRelease(frame.pixel_buffer_ptr);
@@ -2882,18 +2992,21 @@ fn run_shared_pipeline(
             e.flush();
         }
     }
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    if let Ok(mut ap) = audio_pipeline.lock() {
-        ap.stop();
-    }
     capture_backend.stop();
-    if input_pipeline_owner
-        .compare_exchange(instance_id, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        input.clear_for_stop();
+    input.forget_output(output);
+    println!("Shared pipeline stopped: output {output:#x}");
+}
+
+fn upright_size(config: &EncoderConfig, rotation: u8) -> (u32, u32) {
+    if rotation & 1 == 1 {
+        (config.height, config.width)
+    } else {
+        (config.width, config.height)
     }
-    println!("Shared pipeline stopped");
+}
+
+fn output_rotation(directory: &outputs::OutputDirectory, output: u32) -> u8 {
+    directory.info(output).map_or(0, |info| info.rotation)
 }
 
 // ---------------------------------------------------------------------------
@@ -2910,9 +3023,10 @@ fn encode_and_broadcast(
     input: &InputRuntime,
     frame: &capture::CapturedFrame,
     video_epoch: u64,
+    track: &mut EncodeTrack,
 ) -> usize {
     let captured_micros = captured_unix_micros(frame);
-    input.update_cursor(frame.cursor.as_ref());
+    input.update_cursor(track.output, frame.cursor.as_ref());
 
     if !input.control_active() {
         if let Some(cursor) = &frame.cursor {
@@ -2956,7 +3070,7 @@ fn encode_and_broadcast(
             data: nal.data,
             capture_micros: captured_micros,
             encoded_micros: unix_time_micros(),
-            source_seq: next_encoded_video_unit_seq(),
+            source_seq: track.next_unit_seq(),
             is_recovery: nal.is_recovery,
             video_epoch,
         });
@@ -2984,10 +3098,11 @@ fn encode_and_broadcast(
     input: &InputRuntime,
     frame: &capture::CapturedFrame,
     video_epoch: u64,
+    track: &mut EncodeTrack,
 ) -> usize {
     let captured_micros = captured_unix_micros(frame);
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    input.update_cursor(frame.cursor.as_ref());
+    input.update_cursor(track.output, frame.cursor.as_ref());
 
     // Composite cursor onto RAM frames before encoding when no controller owns input
     // AND the cursor is NOT already being sent separately to clients.
@@ -3072,7 +3187,7 @@ fn encode_and_broadcast(
     };
     match result {
         Ok(nals) => {
-            ENCODE_FAILURES.store(0, Ordering::Relaxed);
+            track.failures = 0;
             if trace_enabled() {
                 let log_index = TRACE_ENCODE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                 if log_index < 12 {
@@ -3091,7 +3206,7 @@ fn encode_and_broadcast(
                     data: nal.data,
                     capture_micros: captured_micros,
                     encoded_micros: unix_time_micros(),
-                    source_seq: next_encoded_video_unit_seq(),
+                    source_seq: track.next_unit_seq(),
                     is_recovery: nal.is_recovery,
                     video_epoch,
                 });
@@ -3099,7 +3214,8 @@ fn encode_and_broadcast(
             encoded_bytes
         }
         Err(e) => {
-            let failures = ENCODE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            track.failures += 1;
+            let failures = track.failures;
             if failures == 1 || failures.is_multiple_of(60) {
                 eprintln!("encode error ({failures} in a row): {e}");
             }
@@ -3255,8 +3371,8 @@ const RECOVERY_HOLD_MAX: Duration = Duration::from_millis(1500);
 #[allow(clippy::too_many_arguments)]
 fn run_transport(
     addr: SocketAddr,
-    vid_rx: Receiver<Arc<EncodedVideoFrame>>,
-    video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
+    mut video: VideoSource,
+    video_switch: Receiver<VideoSource>,
     mut aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
@@ -3314,6 +3430,8 @@ fn run_transport(
     let mut backlog_seen = false;
     let hard_ceiling_us = max_queue_latency_us();
     while running.load(Ordering::SeqCst) {
+        video.adopt_switch(&video_switch, &mut last_source_seq, &mut recovery_hold);
+        let (vid_rx, video_bc) = (&video.rx, &video.bc);
         // B3: relearn the client's UDP return port if it moved (cheap once-per-
         // iteration check). IP changes require a new authenticated connection.
         let want_dest = *media_dest.lock().unwrap();
@@ -3355,7 +3473,7 @@ fn run_transport(
             last_dup_first = Some(dup_on);
         }
         // Video: blocking recv with short timeout
-        match wait_for_media(&vid_rx, &mut aud_rx, Duration::from_millis(5)) {
+        match wait_for_media(vid_rx, &mut aud_rx, Duration::from_millis(5)) {
             Ok(frame) => {
                 // Send every encoded unit in FIFO order. Drain transient backlog by
                 // SENDING it, never by collapsing to the newest unit: encoded units
@@ -3494,7 +3612,11 @@ fn run_transport(
                     last_video_activity = std::time::Instant::now();
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                if video.ended(&video_switch) {
+                    break;
+                }
+            }
         }
 
         // Audio: drain queue (prevents buildup), only send if client enabled audio
@@ -3577,7 +3699,7 @@ fn request_video_profile(
 }
 
 fn setup_client_pipeline(
-    state: &Arc<ServerState>,
+    slot: &Arc<PipelineSlot>,
     membership_id: u64,
     cancelled: Arc<AtomicBool>,
     admission: &AdmissionPermit,
@@ -3586,9 +3708,9 @@ fn setup_client_pipeline(
         if cancelled.load(Ordering::Acquire) || !admission.is_current() {
             return Err("joining video capability membership was cancelled".into());
         }
-        state.pipeline_stop.wait(&cancelled)?;
+        slot.pipeline_stop.wait(&cancelled)?;
         let (capabilities, registry_revision) = {
-            let registry = state.video_capabilities.lock().unwrap();
+            let registry = slot.video_capabilities.lock().unwrap();
             if !registry.is_tentative(membership_id) {
                 return Err("joining video capability membership was cancelled".into());
             }
@@ -3597,8 +3719,8 @@ fn setup_client_pipeline(
 
         let mut dead_pipeline = None;
         let reservation = {
-            let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
-            let mut pipeline = state.pipeline.lock().unwrap();
+            let _lifecycle_guard = slot.pipeline_lifecycle.lock().unwrap();
+            let mut pipeline = slot.pipeline.lock().unwrap();
             if pipeline
                 .as_ref()
                 .is_some_and(|pipeline| pipeline.pipeline_handle.is_finished())
@@ -3609,7 +3731,7 @@ fn setup_client_pipeline(
             } else {
                 pipeline
                     .as_ref()
-                    .map(|pipeline| ClientPipelineReservation::new(pipeline, state))
+                    .map(|pipeline| ClientPipelineReservation::new(pipeline, slot))
                     .transpose()?
             }
         };
@@ -3623,8 +3745,8 @@ fn setup_client_pipeline(
                 &reservation.capture_state,
                 capabilities,
                 registry_revision,
-                Arc::clone(&state.profile_revision),
-                Arc::clone(&state.profile_commit),
+                Arc::clone(&slot.profile_revision),
+                Arc::clone(&slot.profile_commit),
                 Arc::clone(&cancelled),
                 Some(AdmissionStamp {
                     token: admission.token,
@@ -3634,17 +3756,17 @@ fn setup_client_pipeline(
                 Ok(snapshot) => snapshot,
                 Err(_error)
                     if !cancelled.load(Ordering::Acquire)
-                        && state.profile_revision.load(Ordering::Acquire) != registry_revision =>
+                        && slot.profile_revision.load(Ordering::Acquire) != registry_revision =>
                 {
                     continue;
                 }
                 Err(error) => return Err(error),
             };
 
-            let _commit_guard = state.profile_commit.lock().unwrap();
-            let mut registry = state.video_capabilities.lock().unwrap();
-            let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
-            let pipeline = state.pipeline.lock().unwrap();
+            let _commit_guard = slot.profile_commit.lock().unwrap();
+            let mut registry = slot.video_capabilities.lock().unwrap();
+            let _lifecycle_guard = slot.pipeline_lifecycle.lock().unwrap();
+            let pipeline = slot.pipeline.lock().unwrap();
             let pipeline_is_current = pipeline.as_ref().is_some_and(|pipeline| {
                 pipeline.instance_id == reservation.pipeline_instance_id
                     && !pipeline.pipeline_handle.is_finished()
@@ -3663,13 +3785,12 @@ fn setup_client_pipeline(
             if !registry.activate_if_revision(membership_id, registry_revision) {
                 continue;
             }
-            state
-                .profile_revision
+            slot.profile_revision
                 .store(registry.revision(), Ordering::Release);
             return Ok(reservation.commit(snapshot));
         }
 
-        if state
+        if slot
             .pipeline_starting
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -3677,24 +3798,22 @@ fn setup_client_pipeline(
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
-        let _start_guard = PipelineStartGuard(&state.pipeline_starting);
-        println!("[pipeline] Starting shared pipeline...");
-        let (started, subscription) = match SharedPipeline::start(
-            capabilities,
-            Arc::clone(&state.input),
-            Arc::clone(&state.control),
-            state,
-            Arc::clone(&cancelled),
-        ) {
-            Ok(started) => started,
-            Err(_error)
-                if !cancelled.load(Ordering::Acquire)
-                    && state.profile_revision.load(Ordering::Acquire) != registry_revision =>
-            {
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let _start_guard = PipelineStartGuard(&slot.pipeline_starting);
+        println!(
+            "[pipeline] Starting pipeline for output {:#x}...",
+            slot.output
+        );
+        let (started, subscription) =
+            match SharedPipeline::start(capabilities, slot, Arc::clone(&cancelled)) {
+                Ok(started) => started,
+                Err(_error)
+                    if !cancelled.load(Ordering::Acquire)
+                        && slot.profile_revision.load(Ordering::Acquire) != registry_revision =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         let snapshot = started
             .capture_state
             .snapshot()
@@ -3703,10 +3822,10 @@ fn setup_client_pipeline(
         let mut subscription = Some(subscription);
 
         let committed = {
-            let _commit_guard = state.profile_commit.lock().unwrap();
-            let mut registry = state.video_capabilities.lock().unwrap();
-            let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
-            let mut pipeline = state.pipeline.lock().unwrap();
+            let _commit_guard = slot.profile_commit.lock().unwrap();
+            let mut registry = slot.video_capabilities.lock().unwrap();
+            let _lifecycle_guard = slot.pipeline_lifecycle.lock().unwrap();
+            let mut pipeline = slot.pipeline.lock().unwrap();
             if !cancelled.load(Ordering::Acquire)
                 && admission.is_current()
                 && registry.revision() == registry_revision
@@ -3715,8 +3834,7 @@ fn setup_client_pipeline(
                 && registry.activate_if_revision(membership_id, registry_revision)
             {
                 let pipeline_to_commit = started.as_ref().expect("started pipeline missing");
-                state
-                    .profile_revision
+                slot.profile_revision
                     .store(registry.revision(), Ordering::Release);
                 let setup = (
                     subscription.take().expect("started subscription missing"),
@@ -3741,18 +3859,18 @@ fn setup_client_pipeline(
     }
 }
 
-fn reconcile_video_profile(state: &Arc<ServerState>) -> Result<(), String> {
+fn reconcile_video_profile(slot: &Arc<PipelineSlot>) -> Result<(), String> {
     loop {
         let (capabilities, registry_revision) = {
-            let registry = state.video_capabilities.lock().unwrap();
+            let registry = slot.video_capabilities.lock().unwrap();
             if registry.is_empty() {
                 return Ok(());
             }
             (registry.aggregate()?, registry.revision())
         };
         let capture_state = {
-            let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
-            let pipeline = state.pipeline.lock().unwrap();
+            let _lifecycle_guard = slot.pipeline_lifecycle.lock().unwrap();
+            let pipeline = slot.pipeline.lock().unwrap();
             let Some(active) = pipeline.as_ref() else {
                 return Ok(());
             };
@@ -3763,16 +3881,16 @@ fn reconcile_video_profile(state: &Arc<ServerState>) -> Result<(), String> {
             &capture_state,
             capabilities,
             registry_revision,
-            Arc::clone(&state.profile_revision),
-            Arc::clone(&state.profile_commit),
+            Arc::clone(&slot.profile_revision),
+            Arc::clone(&slot.profile_commit),
             cancelled,
             None,
         ) {
-            Ok(_) if state.profile_revision.load(Ordering::Acquire) == registry_revision => {
+            Ok(_) if slot.profile_revision.load(Ordering::Acquire) == registry_revision => {
                 return Ok(())
             }
             Ok(_) => continue,
-            Err(_error) if state.profile_revision.load(Ordering::Acquire) != registry_revision => {
+            Err(_error) if slot.profile_revision.load(Ordering::Acquire) != registry_revision => {
                 continue
             }
             Err(error) => return Err(error),
@@ -3780,53 +3898,251 @@ fn reconcile_video_profile(state: &Arc<ServerState>) -> Result<(), String> {
     }
 }
 
-/// Stop the shared pipeline if it still matches `pipeline_instance_id` and no
+/// Stop the slot's pipeline if it still matches `pipeline_instance_id` and no
 /// subscribers or reservations remain. Invoked from the video broadcaster's
 /// zero-occupancy callback, so it must be reached with no broadcaster lock held.
-fn stop_pipeline_if_idle(state: &Arc<ServerState>, pipeline_instance_id: u64) {
-    let _lifecycle_guard = state.pipeline_lifecycle.lock().unwrap();
-    let mut pipeline = state.pipeline.lock().unwrap();
+fn stop_pipeline_if_idle(slot: &Arc<PipelineSlot>, pipeline_instance_id: u64) {
+    let _lifecycle_guard = slot.pipeline_lifecycle.lock().unwrap();
+    let mut pipeline = slot.pipeline.lock().unwrap();
     let is_idle = pipeline
         .as_ref()
         .filter(|p| p.instance_id == pipeline_instance_id)
         .is_some_and(|p| p.video_bc.occupied_count() == 0);
     if is_idle {
         let pipeline = pipeline.take().expect("pipeline checked above");
-        println!("[pipeline] No viewers left, stopping shared pipeline...");
+        println!(
+            "[pipeline] No viewers left on output {:#x}, stopping its pipeline...",
+            slot.output
+        );
         let stop_handle = std::thread::spawn(move || {
             pipeline.stop();
         });
-        state.pipeline_stop.register(stop_handle);
+        slot.pipeline_stop.register(stop_handle);
     }
 }
 
-/// Unsubscribe from the shared broadcasters. The video broadcaster's
-/// zero-occupancy callback (`stop_pipeline_if_idle`) stops the pipeline once the
-/// last viewer leaves, so this only detaches. It must not hold the pipeline lock
-/// while unsubscribing video, or that callback would deadlock re-acquiring it.
+/// Unsubscribe from the slot's video broadcaster. Its zero-occupancy callback
+/// (`stop_pipeline_if_idle`) stops the pipeline once the last viewer leaves, so
+/// this only detaches. It must not hold the pipeline lock while unsubscribing,
+/// or that callback would deadlock re-acquiring it.
 fn unsubscribe_and_maybe_stop_pipeline(
-    state: &Arc<ServerState>,
+    slot: &Arc<PipelineSlot>,
     pipeline_instance_id: u64,
     vid_sub_id: u64,
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))] aud_sub_id: u64,
 ) {
     let video_bc = {
-        let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = slot.pipeline.lock().unwrap();
         let Some(p) = pipeline
             .as_ref()
             .filter(|p| p.instance_id == pipeline_instance_id)
         else {
             return;
         };
-        // Audio has no zero-occupancy callback, so unsubscribing it under the
-        // pipeline lock cannot re-enter; do it here while we hold the reference.
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        p.audio_bc.unsubscribe(aud_sub_id);
         Arc::clone(&p.video_bc)
     };
-    // Release the pipeline lock before unsubscribing video: its zero-occupancy
-    // callback re-acquires that lock to stop the pipeline.
     video_bc.unsubscribe(vid_sub_id);
+}
+
+/// A transport's video feed. Sent to a running transport when its connection
+/// moves to another output.
+struct VideoSource {
+    rx: Receiver<Arc<EncodedVideoFrame>>,
+    bc: Arc<Broadcaster<EncodedVideoFrame>>,
+}
+
+impl VideoSource {
+    /// Take over the feed of the output the connection just moved to. It
+    /// numbers its units from its own pipeline and opens on the keyframe its
+    /// subscription requested; anything before that keyframe is held back.
+    fn adopt_switch(
+        &mut self,
+        switch: &Receiver<VideoSource>,
+        last_source_seq: &mut Option<u64>,
+        recovery_hold: &mut Option<Instant>,
+    ) {
+        if let Ok(next) = switch.try_recv() {
+            *self = next;
+            *last_source_seq = None;
+            *recovery_hold = Some(Instant::now());
+        }
+    }
+
+    /// Whether a closed feed ends the transport. The pipeline a connection
+    /// leaves may close before the transport has adopted the new feed.
+    fn ended(&self, switch: &Receiver<VideoSource>) -> bool {
+        switch.is_empty()
+    }
+}
+
+/// The output a connection asks for.
+#[derive(Clone, Copy)]
+struct OutputRequest {
+    /// An `OutputInfo::id`, `OUTPUT_DEFAULT` or `OUTPUT_VIRTUAL`.
+    id: u32,
+    /// The client's display, to size an `OUTPUT_VIRTUAL` output for.
+    width: u32,
+    height: u32,
+    refresh_millihz: u32,
+}
+
+impl OutputRequest {
+    fn from_display(display: Option<ClientDisplayInfo>) -> Self {
+        let display = display.unwrap_or_default();
+        Self {
+            id: display.output_id,
+            width: display.width,
+            height: display.height,
+            refresh_millihz: display.max_refresh_millihz,
+        }
+    }
+
+    fn existing(id: u32) -> Self {
+        Self {
+            id,
+            width: 0,
+            height: 0,
+            refresh_millihz: 0,
+        }
+    }
+}
+
+/// One connection's place in the pipeline of the output it streams.
+struct StreamBinding {
+    output: u32,
+    sub: ClientSubscription,
+    snapshot: StreamSnapshot,
+    rate_control: Arc<AdaptiveBitrateState>,
+    session_debug: SessionDebugInfo,
+    capture_state: Arc<SharedCaptureState>,
+    // Dropped after `sub`: leaving the profile must follow leaving the media.
+    _membership: VideoMembership,
+    /// Keeps the virtual output this session asked for; dropped last, once
+    /// the session has left its pipeline.
+    #[cfg(target_os = "linux")]
+    _virtual_output: Option<virtual_output::VirtualLease>,
+}
+
+impl StreamBinding {
+    /// Join the pipeline of the output `request` resolves to, starting it if
+    /// nobody views that output yet. Blocks for as long as that takes.
+    fn open(
+        state: &ServerState,
+        request: OutputRequest,
+        capabilities: ClientVideoCapabilities,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        let virtual_output = match request.id {
+            OUTPUT_VIRTUAL => Some(state.env.acquire_virtual_output(request)?),
+            id => state.env.virtuals.lease(id),
+        };
+        #[cfg(target_os = "linux")]
+        let requested = virtual_output
+            .as_ref()
+            .map_or(request.id, |lease| lease.output_id);
+        #[cfg(not(target_os = "linux"))]
+        let requested = match request.id {
+            OUTPUT_VIRTUAL => return Err("this server cannot create virtual outputs".into()),
+            id => id,
+        };
+        state.env.ensure_fresh_outputs();
+        let output = state.env.outputs.resolve(requested);
+        let slot = state.slot(output);
+        let membership = begin_video_membership(&slot, capabilities, Arc::clone(&cancelled));
+        let admission = slot.admission.acquire(Arc::clone(&cancelled))?;
+        let (sub, snapshot, rate_control, session_debug, capture_state) =
+            setup_client_pipeline(&slot, membership.id, cancelled, &admission)?;
+        rate_control.register_client(sub.vid_sub_id);
+        Ok(Self {
+            output,
+            sub,
+            snapshot,
+            rate_control,
+            session_debug,
+            capture_state,
+            _membership: membership,
+            #[cfg(target_os = "linux")]
+            _virtual_output: virtual_output,
+        })
+    }
+
+    /// Move a live connection to output `id`: join its pipeline, hand the
+    /// transport the new feed, then leave the old pipeline. On failure the
+    /// connection stays where it is. `cancelled` abandons the join.
+    fn switch(
+        &mut self,
+        state: &ServerState,
+        id: u32,
+        capabilities: ClientVideoCapabilities,
+        transport: &Sender<VideoSource>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<(), String> {
+        if id == self.output {
+            return Ok(());
+        }
+        if state.env.outputs.info(id).is_none() {
+            return Err(format!("output {id:#x} is not available"));
+        }
+        let mut next = Self::open(state, OutputRequest::existing(id), capabilities, cancelled)?;
+        let rx = next
+            .sub
+            .vid_rx
+            .take()
+            .expect("committed subscription missing video receiver");
+        // The transport must hold the new feed before the old one closes.
+        transport
+            .send(VideoSource {
+                rx,
+                bc: Arc::clone(&next.sub.video_bc),
+            })
+            .map_err(|_| "media transport ended".to_string())?;
+        *self = next;
+        Ok(())
+    }
+
+    /// The stream as its pipeline currently publishes it.
+    fn current(&self) -> StreamSnapshot {
+        self.capture_state.snapshot().unwrap_or(self.snapshot)
+    }
+}
+
+impl Drop for StreamBinding {
+    fn drop(&mut self) {
+        self.rate_control.unregister_client(self.sub.vid_sub_id);
+    }
+}
+
+/// A connection's audio feed; aux sessions have none.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+struct AudioSubscription {
+    bc: Arc<Broadcaster<EncodedAudioPacket>>,
+    id: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+impl AudioSubscription {
+    fn open(hub: &AudioHub) -> Option<(Self, Receiver<Arc<EncodedAudioPacket>>)> {
+        match hub.bc.subscribe(30) {
+            Ok((id, rx)) => Some((
+                Self {
+                    bc: Arc::clone(&hub.bc),
+                    id,
+                },
+                rx,
+            )),
+            Err(error) => {
+                eprintln!("[pipeline] no audio for this client: {error}");
+                None
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+impl Drop for AudioSubscription {
+    fn drop(&mut self) {
+        self.bc.unsubscribe(self.id);
+    }
 }
 
 fn client_media_port(display: Option<ClientDisplayInfo>) -> u16 {
@@ -4102,9 +4418,6 @@ async fn handle_client(
         }
     }
 
-    let registered_client = state.control.register_client(addr);
-    let client_id = state.input.allocate_client_id();
-
     let startup_prefs = match read_client_startup_prefs(&mut stream).await {
         Ok(prefs) => prefs,
         Err(err) => {
@@ -4112,9 +4425,9 @@ async fn handle_client(
             return;
         }
     };
-    if registered_client.disconnect_requested() {
-        return;
-    }
+    let aux = startup_prefs.display.is_some_and(|display| display.aux);
+    let registered_client = state.control.register_client(addr, !aux);
+    let client_id = state.input.allocate_client_id();
     let video_capabilities = client_video_capabilities(startup_prefs.display);
     let client_requested_fps = video_capabilities.requested_fps;
     if let Some(display) = startup_prefs.display {
@@ -4132,15 +4445,11 @@ async fn handle_client(
         );
     }
 
-    // Tentative membership participates in the all-client profile before this
-    // handler can subscribe to media. The RAII guard removes it on every direct
-    // cancellation/error path and triggers an upgrade after active disconnect.
-    let video_membership = begin_video_membership(&state, video_capabilities);
+    let requested_output = OutputRequest::from_display(startup_prefs.display);
     let state2 = Arc::clone(&state);
-    let membership_id = video_membership.id;
-    let membership_cancelled = Arc::clone(&video_membership.cancelled);
-    let setup_worker_cancelled = Arc::clone(&membership_cancelled);
-    let mut setup_task = tokio::task::spawn_blocking(move || -> Result<PipelineSetup, String> {
+    let setup_cancelled = Arc::new(AtomicBool::new(false));
+    let setup_worker_cancelled = Arc::clone(&setup_cancelled);
+    let mut setup_task = tokio::task::spawn_blocking(move || {
         // Wake the display on every client connect, before any first-frame wait.
         // On Wayland (PipeWire / wlroots) and KMS the compositor/kernel stops
         // driving frames when the monitor is in DPMS off, which would otherwise
@@ -4149,10 +4458,12 @@ async fn handle_client(
         // a re-blanked display also wakes it, not only the first. Disable with
         // ST_WAKE_ON_CONNECT=0.
         trigger_screen_wake(&state2.control);
-        let admission = state2
-            .admission
-            .acquire(Arc::clone(&setup_worker_cancelled))?;
-        setup_client_pipeline(&state2, membership_id, setup_worker_cancelled, &admission)
+        StreamBinding::open(
+            &state2,
+            requested_output,
+            video_capabilities,
+            setup_worker_cancelled,
+        )
     });
     let setup = loop {
         tokio::select! {
@@ -4166,15 +4477,15 @@ async fn handle_client(
                     Ok(Ok(0)) | Ok(Err(_))
                 );
                 if registered_client.disconnect_requested() || peer_closed {
-                    membership_cancelled.store(true, Ordering::Release);
+                    setup_cancelled.store(true, Ordering::Release);
                     return;
                 }
             }
         }
     };
 
-    let (sub, startup_snapshot, rate_control, session_debug, capture_state) = match setup {
-        Ok(s) => s,
+    let mut binding = match setup {
+        Ok(binding) => binding,
         Err(e) => {
             eprintln!("Pipeline error for {addr}: {e}");
             let msg = ControlMessage::Error(e).serialize();
@@ -4185,21 +4496,14 @@ async fn handle_client(
         }
     };
     if registered_client.disconnect_requested() {
-        rate_control.unregister_client(sub.vid_sub_id);
         let _ = state.input.release_control(client_id);
-        unsubscribe_and_maybe_stop_pipeline(
-            &state,
-            sub.pipeline_instance_id,
-            sub.vid_sub_id,
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            sub.aud_sub_id,
-        );
         return;
     }
-    rate_control.register_client(sub.vid_sub_id);
-    let mut bitrate_controller = ClientRateController::from_state(rate_control.as_ref());
+    state.input.set_client_output(client_id, binding.output);
+    let mut bitrate_controller = ClientRateController::from_state(binding.rate_control.as_ref());
+    let mut bitrate_ceiling_kbps = None::<u32>;
     let controller_state = state.input.controller_state_for(client_id);
-    let stream_config = startup_snapshot.config;
+    let stream_config = binding.snapshot.config;
     if let Some(requested_fps) = client_requested_fps {
         if stream_config.framerate as u32 != requested_fps {
             println!(
@@ -4223,29 +4527,15 @@ async fn handle_client(
 
     // Send stream/session metadata first. The client will bind UDP, start its
     // receive path, and acknowledge readiness before we start transport.
-    let mut control_buf = ControlMessage::StreamConfig(stream_config).serialize();
-    control_buf
-        .extend_from_slice(&ControlMessage::SessionDebugInfo(session_debug.clone()).serialize());
-    control_buf.extend_from_slice(
-        &ControlMessage::InputSession(InputSession {
+    let (control_buf, mut outputs_generation) = startup_bundle(
+        &state,
+        &binding,
+        InputSession {
             client_id,
             credential: input_credential,
-        })
-        .serialize(),
+        },
+        controller_state,
     );
-    control_buf.extend_from_slice(
-        &ControlMessage::InputCapabilities(state.input.capabilities()).serialize(),
-    );
-    control_buf.extend_from_slice(&ControlMessage::ControllerState(controller_state).serialize());
-    let available_outputs = capture_state.outputs();
-    if available_outputs.len() > 1 {
-        control_buf
-            .extend_from_slice(&ControlMessage::AvailableOutputs(available_outputs).serialize());
-        // Tell the client which output is currently captured so it can
-        // highlight it (server→client `SelectOutput` means "current selection").
-        control_buf
-            .extend_from_slice(&ControlMessage::SelectOutput(capture_state.selected()).serialize());
-    }
     if let Err(e) = stream.write_all(&control_buf).await {
         eprintln!("Failed to send stream config to {addr}: {e}");
     } else if trace_enabled() {
@@ -4264,41 +4554,17 @@ async fn handle_client(
         }
         Ok(false) => {
             eprintln!("[client {addr}] timed out waiting for media-ready ack");
-            rate_control.unregister_client(sub.vid_sub_id);
             let _ = state.input.release_control(client_id);
-            unsubscribe_and_maybe_stop_pipeline(
-                &state,
-                sub.pipeline_instance_id,
-                sub.vid_sub_id,
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                sub.aud_sub_id,
-            );
             return;
         }
         Err(err) => {
             eprintln!("[client {addr}] failed waiting for media-ready ack: {err}");
-            rate_control.unregister_client(sub.vid_sub_id);
             let _ = state.input.release_control(client_id);
-            unsubscribe_and_maybe_stop_pipeline(
-                &state,
-                sub.pipeline_instance_id,
-                sub.vid_sub_id,
-                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-                sub.aud_sub_id,
-            );
             return;
         }
     }
     if registered_client.disconnect_requested() {
-        rate_control.unregister_client(sub.vid_sub_id);
         let _ = state.input.release_control(client_id);
-        unsubscribe_and_maybe_stop_pipeline(
-            &state,
-            sub.pipeline_instance_id,
-            sub.vid_sub_id,
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            sub.aud_sub_id,
-        );
         return;
     }
 
@@ -4308,17 +4574,28 @@ async fn handle_client(
     // Start per-client unified transport (video + audio on single UDP socket)
     let transport_running = Arc::new(AtomicBool::new(true));
 
-    sub.video_bc.request_keyframe();
-    let vid_rx = sub
-        .vid_rx
-        .expect("committed subscription missing video receiver");
+    binding.sub.video_bc.request_keyframe();
+    let video = VideoSource {
+        rx: binding
+            .sub
+            .vid_rx
+            .take()
+            .expect("committed subscription missing video receiver"),
+        bc: Arc::clone(&binding.sub.video_bc),
+    };
+    let (video_switch_tx, video_switch_rx) = bounded::<VideoSource>(1);
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let aud_rx = sub.aud_rx;
+    let (_audio_subscription, aud_rx) = match (!aux)
+        .then(|| AudioSubscription::open(&state.env.audio))
+        .flatten()
+    {
+        Some((subscription, rx)) => (Some(subscription), Some(rx)),
+        None => (None, None),
+    };
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     let aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
-    let video_bc = Arc::clone(&sub.video_bc);
     // A2: adaptive FEC strength shared from the control loop to the sender.
     let mut fec_controller = adaptive_bitrate::FecController::from_env();
     let fec_pct_shared = Arc::new(AtomicU16::new(fec_controller.current_pct()));
@@ -4349,8 +4626,8 @@ async fn handle_client(
     let transport_handle = std::thread::spawn(move || {
         run_transport(
             transport_addr,
-            vid_rx,
-            video_bc,
+            video,
+            video_switch_rx,
             aud_rx,
             audio_enabled_transport,
             transport_running_clone,
@@ -4371,19 +4648,26 @@ async fn handle_client(
         eprintln!("[trace][server] sent StreamStarted to {addr}");
     }
 
-    println!("[pipeline] Client {addr} subscribed (transport started)");
+    println!(
+        "[pipeline] Client {addr} subscribed to output {:#x}{} (transport started)",
+        binding.output,
+        if aux { " as an aux session" } else { "" }
+    );
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
     let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
     let suppressed_paths = clipboard::new_suppressed_paths();
-    let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
-        "server",
-        clipboard_control_tx,
-        file_detect_tx,
-        Arc::clone(&suppressed_paths),
-        std::env::var_os("ST_SYSTEM_MODE")
-            .is_some()
-            .then(|| Arc::clone(state.control.session_clipboard())),
-    );
+    // The client's primary session already syncs its clipboard.
+    let mut clipboard_sync = (!aux).then(|| {
+        clipboard::ClipboardSync::start_with_file_detection(
+            "server",
+            clipboard_control_tx,
+            file_detect_tx,
+            Arc::clone(&suppressed_paths),
+            std::env::var_os("ST_SYSTEM_MODE")
+                .is_some()
+                .then(|| Arc::clone(state.control.session_clipboard())),
+        )
+    });
     let mut ft_manager = file_transfer::FileTransferManager::start_auto_accept(
         st_protocol::file_transfer::TransportMode::Direct,
         file_transfer::new_shared_state(),
@@ -4395,9 +4679,8 @@ async fn handle_client(
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     let mut last_controller_state = controller_state;
-    let mut last_config_generation = startup_snapshot.generation;
-    let mut last_video_epoch = startup_snapshot.video_epoch;
-    let mut last_selection_generation = startup_snapshot.selection_generation;
+    let mut last_config_generation = binding.snapshot.generation;
+    let mut last_video_epoch = binding.snapshot.video_epoch;
     // Direct-path liveness: the OS TCP keepalive default is ~2h, so a silent
     // network drop (wifi off, NAT rebind, peer crash without RST) would leave
     // this loop spinning on the 16ms read timeout forever, holding the
@@ -4426,24 +4709,26 @@ async fn handle_client(
             }
             last_controller_state = controller_state;
         }
-        // An output switch (any client) reconfigures the shared stream — push
-        // the new StreamConfig so this client re-inits its decoder for the new
-        // resolution. The rebuilt encoder already starts with a keyframe.
-        if let Some(snapshot) = capture_state.snapshot().filter(|snapshot| {
-            snapshot.generation != last_config_generation
-                || snapshot.video_epoch != last_video_epoch
-                || snapshot.selection_generation != last_selection_generation
-        }) {
+        // The pipeline reconfigured the stream (resolution, encoder profile,
+        // rotation): push the new StreamConfig so this client follows. A
+        // rebuilt encoder already starts with a keyframe.
+        let snapshot = binding.current();
+        if snapshot.generation != last_config_generation || snapshot.video_epoch != last_video_epoch
+        {
             last_config_generation = snapshot.generation;
-            let mut buf = ControlMessage::StreamConfig(snapshot.config).serialize();
-            buf.extend_from_slice(
-                &ControlMessage::SelectOutput(capture_state.selected()).serialize(),
-            );
-            if stream.write_all(&buf).await.is_err() {
+            last_video_epoch = snapshot.video_epoch;
+            if stream
+                .write_all(&ControlMessage::StreamConfig(snapshot.config).serialize())
+                .await
+                .is_err()
+            {
                 break;
             }
-            last_video_epoch = snapshot.video_epoch;
-            last_selection_generation = snapshot.selection_generation;
+        }
+        if let Some(message) = outputs_update(&state, &mut outputs_generation) {
+            if stream.write_all(&message).await.is_err() {
+                break;
+            }
         }
         let mut clipboard_write_failed = false;
         while let Ok(message) = clipboard_control_rx.try_recv() {
@@ -4471,7 +4756,10 @@ async fn handle_client(
             break;
         }
         let mut cursor_write_failed = false;
-        for message in state.input.cursor_messages(client_id, &mut cursor_versions) {
+        for message in state
+            .input
+            .cursor_messages(binding.output, &mut cursor_versions)
+        {
             if stream.write_all(&message.serialize()).await.is_err() {
                 cursor_write_failed = true;
                 break;
@@ -4506,7 +4794,7 @@ async fn handle_client(
                                 && last_transport_recovery_keyframe.elapsed()
                                     >= Duration::from_millis(250)
                             {
-                                sub.video_bc.request_keyframe();
+                                binding.sub.video_bc.request_keyframe();
                                 last_transport_recovery_keyframe = Instant::now();
                                 if trace_enabled() {
                                     eprintln!(
@@ -4535,7 +4823,8 @@ async fn handle_client(
                             // ABR can downshift on WiFi queue growth (zero loss).
                             let backlog_us = send_backlog_shared.load(Ordering::Relaxed);
                             bitrate_controller.note_send_backlog_us(backlog_us);
-                            bitrate_controller.note_encoder_kbps(rate_control.encoder_kbps());
+                            bitrate_controller
+                                .note_encoder_kbps(binding.rate_control.encoder_kbps());
                             let prev_kbps = bitrate_controller.recommended_kbps();
                             let next_kbps = bitrate_controller.apply_feedback(feedback);
                             if next_kbps < prev_kbps {
@@ -4548,11 +4837,16 @@ async fn handle_client(
                                     backlog_us,
                                 );
                             }
-                            rate_control.update_client_target(sub.vid_sub_id, next_kbps);
+                            binding
+                                .rate_control
+                                .update_client_target(binding.sub.vid_sub_id, next_kbps);
                         }
                         ControlMessage::ClientBitratePreference(max_kbps) => {
                             // B4: clamp this client's ABR ceiling to its declared max.
-                            rate_control.set_client_ceiling(sub.vid_sub_id, max_kbps);
+                            bitrate_ceiling_kbps = Some(max_kbps);
+                            binding
+                                .rate_control
+                                .set_client_ceiling(binding.sub.vid_sub_id, max_kbps);
                             if trace_enabled() {
                                 eprintln!(
                                     "[trace][server] client {addr} declared bitrate ceiling {max_kbps} kbps"
@@ -4565,7 +4859,7 @@ async fn handle_client(
                                 client_send_micros: ping.client_send_micros,
                                 server_recv_micros,
                                 server_send_micros: unix_time_micros(),
-                                bitrate_kbps: rate_control.current_target_kbps(),
+                                bitrate_kbps: binding.rate_control.current_target_kbps(),
                             });
                             let _ = stream.write_all(&pong.serialize()).await;
                         }
@@ -4583,14 +4877,46 @@ async fn handle_client(
                             let _ = stream.write_all(&state_msg.serialize()).await;
                         }
                         ControlMessage::RequestKeyframe => {
-                            sub.video_bc.request_keyframe();
+                            binding.sub.video_bc.request_keyframe();
                         }
                         ControlMessage::SelectOutput(id) => {
-                            println!("[client {addr}] requested capture output {id}");
-                            capture_state.request_output(id);
+                            let reply = tokio::task::block_in_place(|| {
+                                select_output(
+                                    &state,
+                                    &mut binding,
+                                    id,
+                                    video_capabilities,
+                                    &video_switch_tx,
+                                    &addr,
+                                    || {
+                                        !registered_client.disconnect_requested()
+                                            && !state.control.shutdown_requested()
+                                    },
+                                )
+                            });
+                            if reply.switched {
+                                state.input.set_client_output(client_id, binding.output);
+                                if let Some(ceiling) = bitrate_ceiling_kbps {
+                                    binding
+                                        .rate_control
+                                        .set_client_ceiling(binding.sub.vid_sub_id, ceiling);
+                                }
+                                // The link is the same one: keep what it taught us.
+                                binding.rate_control.update_client_target(
+                                    binding.sub.vid_sub_id,
+                                    bitrate_controller.recommended_kbps(),
+                                );
+                                cursor_versions = CursorVersionCursor::default();
+                            }
+                            last_config_generation = reply.snapshot.generation;
+                            last_video_epoch = reply.snapshot.video_epoch;
+                            last_inbound = Instant::now();
+                            let _ = stream.write_all(&reply.message).await;
                         }
                         ControlMessage::ClipboardText(text) => {
-                            clipboard_sync.set_remote_text(text);
+                            if let Some(sync) = clipboard_sync.as_mut() {
+                                sync.set_remote_text(text);
+                            }
                         }
                         ControlMessage::TextInput(text) => {
                             let _ = state.input.handle_text_input(client_id, &text);
@@ -4689,24 +5015,114 @@ async fn handle_client(
     }
 
     println!("Client {addr} disconnected.");
-    clipboard_sync.stop();
+    if let Some(mut sync) = clipboard_sync {
+        sync.stop();
+    }
     ft_manager.stop();
     transport_running.store(false, Ordering::SeqCst);
-    rate_control.unregister_client(sub.vid_sub_id);
     let _ = state.input.release_control(client_id);
     drop(input_registration);
-
-    unsubscribe_and_maybe_stop_pipeline(
-        &state,
-        sub.pipeline_instance_id,
-        sub.vid_sub_id,
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        sub.aud_sub_id,
-    );
+    drop(binding);
 
     let _ = transport_handle.join();
 
     println!("Waiting for clients...");
+}
+
+/// Everything a client needs before it reports ready for media, and the
+/// output-directory generation the bundle reflects.
+fn startup_bundle(
+    state: &ServerState,
+    binding: &StreamBinding,
+    session: InputSession,
+    controller_state: ControllerState,
+) -> (Vec<u8>, u64) {
+    let mut bundle = ControlMessage::StreamConfig(binding.snapshot.config).serialize();
+    bundle.extend_from_slice(
+        &ControlMessage::SessionDebugInfo(binding.session_debug.clone()).serialize(),
+    );
+    bundle.extend_from_slice(&ControlMessage::InputSession(session).serialize());
+    bundle.extend_from_slice(
+        &ControlMessage::InputCapabilities(state.input.capabilities()).serialize(),
+    );
+    bundle.extend_from_slice(&ControlMessage::ControllerState(controller_state).serialize());
+    let mut generation = u64::MAX;
+    bundle.extend(outputs_update(state, &mut generation).unwrap_or_default());
+    (bundle, generation)
+}
+
+/// `AvailableOutputs`, when the directory changed since `*seen`.
+fn outputs_update(state: &ServerState, seen: &mut u64) -> Option<Vec<u8>> {
+    let generation = state.env.outputs.generation();
+    if generation == *seen {
+        return None;
+    }
+    *seen = generation;
+    let (outputs, virtual_supported) = state.env.outputs.list();
+    Some(
+        ControlMessage::AvailableOutputs {
+            outputs,
+            virtual_supported,
+        }
+        .serialize(),
+    )
+}
+
+/// What a client gets back for `SelectOutput`.
+struct SelectOutputReply {
+    switched: bool,
+    snapshot: StreamSnapshot,
+    /// `StreamConfig` naming the output now streamed, whether or not the
+    /// connection moved; after a move also the new pipeline's debug info.
+    message: Vec<u8>,
+}
+
+/// Carry out a client's `SelectOutput`. Joining another output's pipeline can
+/// take as long as starting it, so it runs beside the caller, which keeps
+/// `service`-ing its session; `service` returning `false` (the session is
+/// ending) abandons the join. The old feed keeps flowing meanwhile.
+fn select_output(
+    state: &ServerState,
+    binding: &mut StreamBinding,
+    id: u32,
+    capabilities: ClientVideoCapabilities,
+    transport: &Sender<VideoSource>,
+    peer: &dyn std::fmt::Display,
+    mut service: impl FnMut() -> bool,
+) -> SelectOutputReply {
+    let previous = binding.output;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let outcome = std::thread::scope(|scope| {
+        let worker = scope
+            .spawn(|| binding.switch(state, id, capabilities, transport, Arc::clone(&cancelled)));
+        while !worker.is_finished() {
+            if !service() {
+                cancelled.store(true, Ordering::Release);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        worker.join().expect("output switch worker panicked")
+    });
+    match outcome {
+        Ok(()) if binding.output != previous => {
+            println!("[client {peer}] now streaming output {:#x}", binding.output)
+        }
+        Ok(()) => {}
+        Err(error) => eprintln!("[client {peer}] switch to output {id:#x} failed: {error}"),
+    }
+    let switched = binding.output != previous;
+    let snapshot = binding.current();
+    let mut message = ControlMessage::StreamConfig(snapshot.config).serialize();
+    if switched {
+        message.extend_from_slice(
+            &ControlMessage::SessionDebugInfo(binding.session_debug.clone()).serialize(),
+        );
+    }
+    SelectOutputReply {
+        switched,
+        snapshot,
+        message,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4789,6 +5205,7 @@ fn probe_backends() {
             "wayland" => "Wayland screencopy (ST_CAPTURE override)",
             "x11" => "X11 XShm (ST_CAPTURE override)",
             "ext-image-copy" => "ext-image-copy-capture-v1 (ST_CAPTURE override)",
+            "synthetic" => "synthetic test outputs (ST_CAPTURE override)",
             _ => "unknown ST_CAPTURE value",
         }
     } else {
@@ -5166,6 +5583,8 @@ fn spawn_relay_task(state: Arc<ServerState>, api_url: String) {
     });
 }
 
+const TUNNEL_START_KBPS: u32 = 8_000;
+
 /// Handle a client connection over a tunnel link: a hole-punched UDP socket
 /// or a TCP fallback tunnel (direct upgrade or API-server relay). All control
 /// and media traffic flows through the single link.
@@ -5240,33 +5659,25 @@ fn handle_punched_client(
         }
     };
 
-    let registered_client = state.control.register_client(peer);
+    let aux = client_display.aux;
+    let registered_client = state.control.register_client(peer, !aux);
     let client_id = state.input.allocate_client_id();
 
     let video_capabilities = client_video_capabilities(Some(client_display));
-    let video_membership = begin_video_membership(&state, video_capabilities);
 
     // --- Start/subscribe to pipeline ---
     trigger_screen_wake(&state.control);
     let (setup_tx, setup_rx) = bounded(1);
     let setup_state = Arc::clone(&state);
-    let setup_cancelled = Arc::clone(&video_membership.cancelled);
+    let setup_cancelled = Arc::new(AtomicBool::new(false));
     let setup_worker_cancelled = Arc::clone(&setup_cancelled);
-    let membership_id = video_membership.id;
     std::thread::spawn(move || {
-        let result = match setup_state
-            .admission
-            .acquire(Arc::clone(&setup_worker_cancelled))
-        {
-            Ok(admission) => setup_client_pipeline(
-                &setup_state,
-                membership_id,
-                setup_worker_cancelled,
-                &admission,
-            ),
-            Err(error) => Err(error),
-        };
-        let _ = setup_tx.send(result);
+        let _ = setup_tx.send(StreamBinding::open(
+            &setup_state,
+            OutputRequest::from_display(Some(client_display)),
+            video_capabilities,
+            setup_worker_cancelled,
+        ));
     });
     let setup_deadline = Instant::now() + Duration::from_secs(35);
     let setup = loop {
@@ -5289,8 +5700,8 @@ fn handle_punched_client(
         }
     };
 
-    let (sub, startup_snapshot, rate_control, session_debug, capture_state) = match setup {
-        Ok(s) => s,
+    let mut binding = match setup {
+        Ok(binding) => binding,
         Err(e) => {
             eprintln!("[{tag}] Pipeline error for {peer}: {e}");
             let _ = punched.send_control(&ControlMessage::Error(e).serialize());
@@ -5298,35 +5709,31 @@ fn handle_punched_client(
         }
     };
 
-    rate_control.register_client(sub.vid_sub_id);
+    // An internet path of unknown capacity starts low and climbs (+20% every
+    // 2 s while clean): the LAN start rate into a thin uplink lost the first
+    // seconds of the session, sometimes all of it.
+    binding.rate_control.update_client_target(
+        binding.sub.vid_sub_id,
+        TUNNEL_START_KBPS.min(binding.rate_control.current_target_kbps()),
+    );
+
+    state.input.set_client_output(client_id, binding.output);
     let controller_state = state.input.controller_state_for(client_id);
-    let stream_config = startup_snapshot.config;
     let input_credential = input::generate_input_credential();
     let input_registration = state
         .input
         .register_tunnel_client(client_id, input_credential);
 
     // --- Send startup control bundle ---
-    let mut control_buf = ControlMessage::StreamConfig(stream_config).serialize();
-    control_buf.extend_from_slice(&ControlMessage::SessionDebugInfo(session_debug).serialize());
-    control_buf.extend_from_slice(
-        &ControlMessage::InputSession(InputSession {
+    let (control_buf, mut outputs_generation) = startup_bundle(
+        &state,
+        &binding,
+        InputSession {
             client_id,
             credential: input_credential,
-        })
-        .serialize(),
+        },
+        controller_state,
     );
-    control_buf.extend_from_slice(
-        &ControlMessage::InputCapabilities(state.input.capabilities()).serialize(),
-    );
-    control_buf.extend_from_slice(&ControlMessage::ControllerState(controller_state).serialize());
-    let available_outputs = capture_state.outputs();
-    if available_outputs.len() > 1 {
-        control_buf
-            .extend_from_slice(&ControlMessage::AvailableOutputs(available_outputs).serialize());
-        control_buf
-            .extend_from_slice(&ControlMessage::SelectOutput(capture_state.selected()).serialize());
-    }
     let _ = punched.send_control(&control_buf);
 
     // Wait for ClientReadyForMedia.
@@ -5350,33 +5757,36 @@ fn handle_punched_client(
     }
     if !ready {
         eprintln!("[{tag}] Timeout waiting for ClientReadyForMedia from {peer}");
-        rate_control.unregister_client(sub.vid_sub_id);
         let _ = state.input.release_control(client_id);
-        unsubscribe_and_maybe_stop_pipeline(
-            &state,
-            sub.pipeline_instance_id,
-            sub.vid_sub_id,
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            sub.aud_sub_id,
-        );
         return;
     }
 
     // --- Start transport (video + audio) over punched socket ---
     let audio_enabled = Arc::new(AtomicBool::new(true));
     let transport_running = Arc::new(AtomicBool::new(true));
-    sub.video_bc.request_keyframe();
-    let vid_rx = sub
-        .vid_rx
-        .expect("committed subscription missing video receiver");
+    binding.sub.video_bc.request_keyframe();
+    let video = VideoSource {
+        rx: binding
+            .sub
+            .vid_rx
+            .take()
+            .expect("committed subscription missing video receiver"),
+        bc: Arc::clone(&binding.sub.video_bc),
+    };
+    let (video_switch_tx, video_switch_rx) = bounded::<VideoSource>(1);
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let aud_rx = sub.aud_rx;
+    let (_audio_subscription, aud_rx) = match (!aux)
+        .then(|| AudioSubscription::open(&state.env.audio))
+        .flatten()
+    {
+        Some((subscription, rx)) => (Some(subscription), Some(rx)),
+        None => (None, None),
+    };
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     let aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>> = None;
     let transport_running_clone = Arc::clone(&transport_running);
     let audio_enabled_transport = Arc::clone(&audio_enabled);
     let punched_transport = Arc::clone(&punched);
-    let video_bc = Arc::clone(&sub.video_bc);
     // A2: adaptive FEC strength shared from the control loop to the sender.
     // Reliable (TCP) links pin every loss-recovery knob to zero — there is no
     // packet loss to recover from, so the extra bytes are pure overhead.
@@ -5411,8 +5821,8 @@ fn handle_punched_client(
     let transport_handle = std::thread::spawn(move || {
         run_punched_transport(
             punched_transport,
-            vid_rx,
-            video_bc,
+            video,
+            video_switch_rx,
             aud_rx,
             audio_enabled_transport,
             transport_running_clone,
@@ -5428,15 +5838,18 @@ fn handle_punched_client(
     let (clipboard_control_tx, clipboard_control_rx) = bounded::<ControlMessage>(8);
     let (file_detect_tx, file_detect_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(8);
     let suppressed_paths = clipboard::new_suppressed_paths();
-    let mut clipboard_sync = clipboard::ClipboardSync::start_with_file_detection(
-        "server-punched",
-        clipboard_control_tx,
-        file_detect_tx,
-        Arc::clone(&suppressed_paths),
-        std::env::var_os("ST_SYSTEM_MODE")
-            .is_some()
-            .then(|| Arc::clone(state.control.session_clipboard())),
-    );
+    // The client's primary session already syncs its clipboard.
+    let mut clipboard_sync = (!aux).then(|| {
+        clipboard::ClipboardSync::start_with_file_detection(
+            "server-punched",
+            clipboard_control_tx,
+            file_detect_tx,
+            Arc::clone(&suppressed_paths),
+            std::env::var_os("ST_SYSTEM_MODE")
+                .is_some()
+                .then(|| Arc::clone(state.control.session_clipboard())),
+        )
+    });
     let mut ft_manager = file_transfer::FileTransferManager::start_auto_accept(
         st_protocol::file_transfer::TransportMode::Punched,
         file_transfer::new_shared_state(),
@@ -5444,13 +5857,13 @@ fn handle_punched_client(
     );
 
     // --- Control loop: read from punched socket ---
-    let mut bitrate_controller = ClientRateController::from_state(rate_control.as_ref());
+    let mut bitrate_controller = ClientRateController::from_state(binding.rate_control.as_ref());
+    let mut bitrate_ceiling_kbps = None::<u32>;
     let mut cursor_versions = CursorVersionCursor::default();
     let mut last_transport_recovery_keyframe = Instant::now() - Duration::from_secs(1);
     let mut last_controller_state = controller_state;
-    let mut last_config_generation = startup_snapshot.generation;
-    let mut last_video_epoch = startup_snapshot.video_epoch;
-    let mut last_selection_generation = startup_snapshot.selection_generation;
+    let mut last_config_generation = binding.snapshot.generation;
+    let mut last_video_epoch = binding.snapshot.video_epoch;
     let _ = punched.set_nonblocking(false);
     let _ = punched.set_read_timeout(Some(Duration::from_millis(50)));
 
@@ -5463,8 +5876,12 @@ fn handle_punched_client(
     const PUNCHED_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5);
     let mut last_peer_activity = Instant::now();
 
+    // A tunnel client says goodbye (`Shutdown`); the silence timeout is for
+    // the ones that vanish.
+    let mut client_left = false;
     loop {
-        if registered_client.disconnect_requested()
+        if client_left
+            || registered_client.disconnect_requested()
             || state.control.shutdown_requested()
             || cancel.load(Ordering::Relaxed)
         {
@@ -5488,24 +5905,21 @@ fn handle_punched_client(
                 .send_control(&ControlMessage::ControllerState(controller_state).serialize());
             last_controller_state = controller_state;
         }
-        // Re-sync this client's decoder after an output switch reconfigured the
-        // shared stream (see direct-path handler for rationale).
-        if let Some(snapshot) = capture_state.snapshot().filter(|snapshot| {
-            snapshot.generation != last_config_generation
-                || snapshot.video_epoch != last_video_epoch
-                || snapshot.selection_generation != last_selection_generation
-        }) {
+        // The pipeline reconfigured the stream (see direct-path handler).
+        let snapshot = binding.current();
+        if snapshot.generation != last_config_generation || snapshot.video_epoch != last_video_epoch
+        {
             last_config_generation = snapshot.generation;
+            last_video_epoch = snapshot.video_epoch;
             if punched
                 .send_control(&ControlMessage::StreamConfig(snapshot.config).serialize())
                 .is_err()
             {
                 break;
             }
-            let _ = punched
-                .send_control(&ControlMessage::SelectOutput(capture_state.selected()).serialize());
-            last_video_epoch = snapshot.video_epoch;
-            last_selection_generation = snapshot.selection_generation;
+        }
+        if let Some(message) = outputs_update(&state, &mut outputs_generation) {
+            let _ = punched.send_control(&message);
         }
         while let Ok(message) = clipboard_control_rx.try_recv() {
             let _ = punched.send_control(&message.serialize());
@@ -5527,6 +5941,7 @@ fn handle_punched_client(
                 while let Some((msg, used)) = ControlMessage::deserialize(&data[offset..]) {
                     offset += used;
                     match msg {
+                        ControlMessage::Shutdown => client_left = true,
                         ControlMessage::SetAudio(enabled) => {
                             audio_enabled.store(enabled, Ordering::Relaxed);
                         }
@@ -5552,7 +5967,8 @@ fn handle_punched_client(
                             // Bufferbloat: feed the server-side encode→send backlog.
                             let backlog_us = send_backlog_shared.load(Ordering::Relaxed);
                             bitrate_controller.note_send_backlog_us(backlog_us);
-                            bitrate_controller.note_encoder_kbps(rate_control.encoder_kbps());
+                            bitrate_controller
+                                .note_encoder_kbps(binding.rate_control.encoder_kbps());
                             let prev_kbps = bitrate_controller.recommended_kbps();
                             let next_kbps = bitrate_controller.apply_feedback(fb);
                             if next_kbps < prev_kbps {
@@ -5565,18 +5981,23 @@ fn handle_punched_client(
                                     backlog_us,
                                 );
                             }
-                            rate_control.update_client_target(sub.vid_sub_id, next_kbps);
+                            binding
+                                .rate_control
+                                .update_client_target(binding.sub.vid_sub_id, next_kbps);
                             if (fb.lost_packets > 0 || fb.dropped_frames > 0)
                                 && last_transport_recovery_keyframe.elapsed()
                                     >= Duration::from_millis(250)
                             {
-                                sub.video_bc.request_keyframe();
+                                binding.sub.video_bc.request_keyframe();
                                 last_transport_recovery_keyframe = Instant::now();
                             }
                         }
                         ControlMessage::ClientBitratePreference(max_kbps) => {
                             // B4: clamp this client's ABR ceiling to its declared max.
-                            rate_control.set_client_ceiling(sub.vid_sub_id, max_kbps);
+                            bitrate_ceiling_kbps = Some(max_kbps);
+                            binding
+                                .rate_control
+                                .set_client_ceiling(binding.sub.vid_sub_id, max_kbps);
                         }
                         ControlMessage::AcquireControl => {
                             let next_state = state.input.acquire_control(client_id);
@@ -5592,13 +6013,46 @@ fn handle_punched_client(
                             let _ = punched.send_control(&state_msg.serialize());
                         }
                         ControlMessage::RequestKeyframe => {
-                            sub.video_bc.request_keyframe();
+                            binding.sub.video_bc.request_keyframe();
                         }
                         ControlMessage::SelectOutput(id) => {
-                            capture_state.request_output(id);
+                            let reply = select_output(
+                                &state,
+                                &mut binding,
+                                id,
+                                video_capabilities,
+                                &video_switch_tx,
+                                &peer,
+                                || {
+                                    punched.tick();
+                                    !registered_client.disconnect_requested()
+                                        && !punched.is_closed()
+                                        && !cancel.load(Ordering::Relaxed)
+                                },
+                            );
+                            if reply.switched {
+                                state.input.set_client_output(client_id, binding.output);
+                                if let Some(ceiling) = bitrate_ceiling_kbps {
+                                    binding
+                                        .rate_control
+                                        .set_client_ceiling(binding.sub.vid_sub_id, ceiling);
+                                }
+                                // The link is the same one: keep what it taught us.
+                                binding.rate_control.update_client_target(
+                                    binding.sub.vid_sub_id,
+                                    bitrate_controller.recommended_kbps(),
+                                );
+                                cursor_versions = CursorVersionCursor::default();
+                            }
+                            last_config_generation = reply.snapshot.generation;
+                            last_video_epoch = reply.snapshot.video_epoch;
+                            last_peer_activity = Instant::now();
+                            let _ = punched.send_control(&reply.message);
                         }
                         ControlMessage::ClipboardText(text) => {
-                            clipboard_sync.set_remote_text(text);
+                            if let Some(sync) = clipboard_sync.as_mut() {
+                                sync.set_remote_text(text);
+                            }
                         }
                         ControlMessage::TextInput(text) => {
                             let _ = state.input.handle_text_input(client_id, &text);
@@ -5690,27 +6144,25 @@ fn handle_punched_client(
         }
 
         // Send cursor updates.
-        for message in state.input.cursor_messages(client_id, &mut cursor_versions) {
+        for message in state
+            .input
+            .cursor_messages(binding.output, &mut cursor_versions)
+        {
             let serialized: Vec<u8> = message.serialize();
             let _ = punched.send_control(&serialized);
         }
     }
 
     // Cleanup.
-    clipboard_sync.stop();
+    if let Some(mut sync) = clipboard_sync {
+        sync.stop();
+    }
     ft_manager.stop();
     transport_running.store(false, Ordering::SeqCst);
     let _ = state.input.release_control(client_id);
     drop(input_registration);
     let _ = transport_handle.join();
-    rate_control.unregister_client(sub.vid_sub_id);
-    unsubscribe_and_maybe_stop_pipeline(
-        &state,
-        sub.pipeline_instance_id,
-        sub.vid_sub_id,
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        sub.aud_sub_id,
-    );
+    drop(binding);
     println!("[{tag}] Client {peer} disconnected");
 }
 
@@ -5719,8 +6171,8 @@ fn handle_punched_client(
 #[allow(clippy::too_many_arguments)]
 fn run_punched_transport(
     punched: Arc<dyn st_protocol::tcp_tunnel::TunnelLink>,
-    vid_rx: Receiver<Arc<EncodedVideoFrame>>,
-    video_bc: Arc<Broadcaster<EncodedVideoFrame>>,
+    mut video: VideoSource,
+    video_switch: Receiver<VideoSource>,
     mut aud_rx: Option<Receiver<Arc<EncodedAudioPacket>>>,
     audio_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
@@ -5758,6 +6210,8 @@ fn run_punched_transport(
     const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
     let mut last_keepalive = Instant::now();
     while running.load(Ordering::SeqCst) {
+        video.adopt_switch(&video_switch, &mut last_source_seq, &mut recovery_hold);
+        let (vid_rx, video_bc) = (&video.rx, &video.bc);
         if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
             let _ = sender.send_keepalive();
             last_keepalive = Instant::now();
@@ -5777,7 +6231,7 @@ fn run_punched_transport(
             sender.set_dup_first(dup_on);
             last_dup_first = Some(dup_on);
         }
-        match wait_for_media(&vid_rx, &mut aud_rx, Duration::from_millis(5)) {
+        match wait_for_media(vid_rx, &mut aud_rx, Duration::from_millis(5)) {
             Ok(frame) => {
                 // FIFO drain — send every encoded unit in order, never collapse to
                 // newest. See run_client_transport for the rationale: dropping an
@@ -5886,7 +6340,11 @@ fn run_punched_transport(
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                if video.ended(&video_switch) {
+                    break;
+                }
+            }
         }
         if let Some(ref aud) = aud_rx {
             let send_audio = audio_enabled.load(Ordering::Relaxed);
@@ -5996,18 +6454,24 @@ fn build_server_state(
     listen_port: u16,
     tunnel_state: Option<Arc<api_client::ApiTunnelState>>,
 ) -> Arc<ServerState> {
-    let input = InputRuntime::new();
+    let outputs = Arc::new(outputs::OutputDirectory::default());
+    let input = InputRuntime::new(Arc::clone(&outputs));
     input.spawn_listener(listen_port);
+    let env = Arc::new(PipelineEnv {
+        input: Arc::clone(&input),
+        control: Arc::clone(&control),
+        outputs,
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        audio: AudioHub::new(),
+        running: Mutex::new(0),
+        outputs_refresh: Mutex::new(()),
+        #[cfg(target_os = "linux")]
+        virtuals: Arc::new(virtual_output::VirtualOutputs::default()),
+    });
+    env.spawn_output_watcher();
     Arc::new(ServerState {
-        pipeline: Mutex::new(None),
-        pipeline_starting: AtomicBool::new(false),
-        pipeline_stop: Arc::new(PipelineStopCoordinator::default()),
-        admission: Arc::new(AdmissionCoordinator::default()),
-        pipeline_lifecycle: Mutex::new(()),
-        profile_revision: Arc::new(AtomicU64::new(0)),
-        profile_commit: Arc::new(Mutex::new(())),
-        input_pipeline_owner: Arc::new(AtomicU64::new(0)),
-        video_capabilities: Mutex::new(VideoCapabilityRegistry::default()),
+        env,
+        slots: Mutex::new(HashMap::new()),
         input,
         control,
         listen_port,
@@ -6258,6 +6722,8 @@ mod video_transition_tests {
             hdr: false,
             chroma: VideoChromaSampling::Yuv420,
             packet_duration_ms: 5,
+            output_id: 0,
+            rotation: 0,
         }
     }
 
@@ -6270,26 +6736,47 @@ mod video_transition_tests {
     #[test]
     fn startup_snapshot_observes_concurrent_config_generation() {
         let (command_tx, _command_rx) = bounded(1);
-        let state = SharedCaptureState::new(command_tx);
-        let startup = state.initialize_config(config(VideoCodec::Hevc, 120));
+        let state = SharedCaptureState::new(command_tx, 7);
+        let startup = state.initialize_config(config(VideoCodec::Hevc, 120), 3);
         let current = state.commit_encoder_config(config(VideoCodec::H264, 60));
 
         assert!(current.generation > startup.generation);
         assert_eq!(state.snapshot(), Some(current));
         assert_ne!(startup.video_epoch, current.video_epoch);
+        // Every published config names the pipeline's output and rotation.
+        assert_eq!((startup.config.output_id, startup.config.rotation), (7, 3));
+        assert_eq!((current.config.output_id, current.config.rotation), (7, 3));
+    }
+
+    /// A connection that moves between two outputs streaming the same profile
+    /// must still see a new epoch, or it would keep decoding into the old one.
+    #[test]
+    fn pipelines_never_share_a_media_epoch() {
+        let (first_tx, _first_rx) = bounded(1);
+        let (second_tx, _second_rx) = bounded(1);
+        let first = SharedCaptureState::new(first_tx, 1);
+        let second = SharedCaptureState::new(second_tx, 2);
+        let a = first.initialize_config(config(VideoCodec::H264, 60), 0);
+        let b = second.initialize_config(config(VideoCodec::H264, 60), 0);
+        let a2 = first.commit_encoder_config(config(VideoCodec::H264, 60));
+
+        assert!(a.video_epoch != b.video_epoch && b.video_epoch != a2.video_epoch);
+        assert_ne!(a.config, b.config);
     }
 
     #[test]
-    fn same_resolution_output_switch_publishes_new_selection_and_media_epoch() {
+    fn a_rotation_change_republishes_the_config_in_the_same_epoch() {
         let (command_tx, _command_rx) = bounded(1);
-        let state = SharedCaptureState::new(command_tx);
-        let initial = state.initialize_config(config(VideoCodec::H264, 60));
-        let switched = state.commit_output_selection(config(VideoCodec::H264, 60));
+        let state = SharedCaptureState::new(command_tx, 1);
+        let initial = state.initialize_config(config(VideoCodec::H264, 60), 0);
+        state.commit_rotation(0);
+        assert_eq!(state.snapshot(), Some(initial));
 
-        assert_eq!(switched.generation, initial.generation);
-        assert!(switched.selection_generation > initial.selection_generation);
-        assert!(switched.video_epoch > initial.video_epoch);
-        assert_eq!(switched.config.video_epoch, switched.video_epoch);
+        state.commit_rotation(1);
+        let turned = state.snapshot().unwrap();
+        assert!(turned.generation > initial.generation);
+        assert_eq!(turned.video_epoch, initial.video_epoch);
+        assert_eq!(turned.config.rotation, 1);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::{
-    target_fps, CaptureBackend, CapturedCursor, CapturedFrame, D3D11FrameTexture, FrameData,
+    CaptureBackend, CaptureControl, CapturedCursor, CapturedFrame, D3D11FrameTexture, FrameData,
     RamPool,
 };
 use crossbeam_channel::{Sender, TrySendError};
@@ -81,21 +81,25 @@ impl PlatformCapture {
 }
 
 impl CaptureBackend for PlatformCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         match &mut self.backend {
             Backend::Dxgi(capture) => {
-                match capture.start(tx.clone()) {
+                match capture.start(tx.clone(), control) {
                     Ok(()) => Ok(()),
                     Err(dxgi_err) => {
                         eprintln!("[capture] DXGI duplication failed ({dxgi_err}), falling back to GDI...");
                         let mut gdi = GdiCapture::new();
-                        gdi.start(tx)?;
+                        gdi.start(tx, control)?;
                         self.backend = Backend::Gdi(gdi);
                         Ok(())
                     }
                 }
             }
-            Backend::Gdi(capture) => capture.start(tx),
+            Backend::Gdi(capture) => capture.start(tx, control),
         }
     }
 
@@ -105,10 +109,6 @@ impl CaptureBackend for PlatformCapture {
             Backend::Gdi(capture) => capture.stop(),
         }
     }
-}
-
-fn frame_interval() -> Duration {
-    Duration::from_secs_f64(1.0 / target_fps().max(1) as f64)
 }
 
 fn sleep_until(deadline: Instant) {
@@ -133,7 +133,11 @@ impl DxgiCapture {
 }
 
 impl CaptureBackend for DxgiCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("DXGI capture already running".into());
         }
@@ -141,8 +145,9 @@ impl CaptureBackend for DxgiCapture {
         let session = DxgiCaptureSession::new()?;
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
+        let control = Arc::clone(control);
         self.handle = Some(thread::spawn(move || {
-            run_dxgi_capture_loop(session, tx, running)
+            run_dxgi_capture_loop(session, tx, running, control)
         }));
         Ok(())
     }
@@ -170,7 +175,11 @@ impl GdiCapture {
 }
 
 impl CaptureBackend for GdiCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("GDI capture already running".into());
         }
@@ -178,8 +187,9 @@ impl CaptureBackend for GdiCapture {
         let session = GdiCaptureSession::new()?;
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
+        let control = Arc::clone(control);
         self.handle = Some(thread::spawn(move || {
-            run_gdi_capture_loop(session, tx, running)
+            run_gdi_capture_loop(session, tx, running, control)
         }));
         Ok(())
     }
@@ -196,6 +206,7 @@ fn run_dxgi_capture_loop(
     mut session: DxgiCaptureSession,
     tx: Sender<CapturedFrame>,
     running: Arc<AtomicBool>,
+    control: Arc<CaptureControl>,
 ) {
     st_protocol::thread_priority::promote_current_thread(
         st_protocol::thread_priority::ThreadRole::Capture,
@@ -204,7 +215,7 @@ fn run_dxgi_capture_loop(
     let mut next_capture_at = Instant::now();
 
     while running.load(Ordering::SeqCst) {
-        let target_interval = frame_interval();
+        let target_interval = control.frame_interval();
         sleep_until(next_capture_at);
         next_capture_at = Instant::now() + target_interval;
 
@@ -254,11 +265,12 @@ fn run_gdi_capture_loop(
     mut session: GdiCaptureSession,
     tx: Sender<CapturedFrame>,
     running: Arc<AtomicBool>,
+    control: Arc<CaptureControl>,
 ) {
     st_protocol::thread_priority::promote_current_thread(
         st_protocol::thread_priority::ThreadRole::Capture,
     );
-    let mut target_interval = frame_interval();
+    let mut target_interval = control.frame_interval();
     let mut next_metrics_check = Instant::now();
     let mut next_capture_at = Instant::now();
 
@@ -271,7 +283,7 @@ fn run_gdi_capture_loop(
                 thread::sleep(Duration::from_millis(250));
                 continue;
             }
-            target_interval = frame_interval();
+            target_interval = control.frame_interval();
             next_metrics_check = frame_started + Duration::from_secs(1);
         }
         next_capture_at = frame_started + target_interval;

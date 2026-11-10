@@ -684,7 +684,7 @@ pub struct KmsStabilizer {
     // rejects `gbm_bo_create` with `GBM_BO_USE_LINEAR` for renderable targets).
     ram_target: Option<RamTarget>,
     /// NV12 readback target, `(w/4)x(3h/2)` RGBA8 texels holding packed Y then
-    /// CbCr rows. Built on demand while an encoder holds an `Nv12Claim`.
+    /// CbCr rows. Built on demand while `nv12_preferred`.
     nv12_target: Option<RamTarget>,
     nv12_program: Option<(glow::Program, Option<glow::UniformLocation>)>,
     ram_pool: RamPool,
@@ -706,9 +706,8 @@ pub struct KmsStabilizer {
     render_node: String,
     width: u32,
     height: u32,
-    /// Tests pin the readback format; the global claim count is shared.
-    #[cfg(test)]
-    force_nv12: Option<bool>,
+    /// The encoder takes `FrameData::RamNv12`; mirrors `CaptureControl::nv12_ram`.
+    pub nv12_preferred: bool,
 }
 
 /// glReadPixels fallback render target: a normal RGBA8 GL texture + FBO, not a
@@ -781,8 +780,7 @@ impl KmsStabilizer {
             render_node: render_node.to_string(),
             width: 0,
             height: 0,
-            #[cfg(test)]
-            force_nv12: None,
+            nv12_preferred: false,
         })
     }
 
@@ -863,12 +861,7 @@ impl KmsStabilizer {
         width: u32,
         height: u32,
     ) -> Result<FrameData, String> {
-        #[cfg(test)]
-        let preferred = self
-            .force_nv12
-            .unwrap_or_else(crate::capture::nv12_ram_preferred);
-        #[cfg(not(test))]
-        let preferred = crate::capture::nv12_ram_preferred();
+        let preferred = self.nv12_preferred;
         let dst = if preferred && width.is_multiple_of(2) && height.is_multiple_of(2) {
             DstFormat::Nv12
         } else {
@@ -2128,7 +2121,7 @@ pub(crate) mod tests {
     pub(crate) fn nv12_stabilizer(node: &str, copy_engine: bool) -> KmsStabilizer {
         let mut stab = KmsStabilizer::new(node).expect("stabilizer");
         stab.ram_mode = true;
-        stab.force_nv12 = Some(true);
+        stab.nv12_preferred = true;
         stab.vk_tried = !copy_engine;
         // Measure the requested path, not the chooser's pick.
         stab.chooser.retry_at = Instant::now() + Duration::from_secs(86_400);
@@ -2201,7 +2194,7 @@ pub(crate) mod tests {
             paint_source(&stab, &src, w, h);
             let planes = std::slice::from_ref(&src.plane);
 
-            stab.force_nv12 = Some(true);
+            stab.nv12_preferred = true;
             let FrameData::RamNv12(nv12) = stab.stabilize(planes, fourcc, w, h).unwrap() else {
                 panic!("{label}: expected NV12 output");
             };
@@ -2227,7 +2220,7 @@ pub(crate) mod tests {
                 "{label}: bottom CbCr {uv_bottom:?}"
             );
 
-            stab.force_nv12 = Some(false);
+            stab.nv12_preferred = false;
             let FrameData::Ram(bgra) = stab.stabilize(planes, fourcc, w, h).unwrap() else {
                 panic!("{label}: expected BGRA without a claim");
             };
@@ -2291,7 +2284,7 @@ pub(crate) mod tests {
                 std::env::set_var("ST_GPU_PRIO", "0");
             }
             let mut stab = KmsStabilizer::new(&node).expect("stabilizer");
-            stab.force_nv12 = Some(nv12);
+            stab.nv12_preferred = nv12;
             if !fence {
                 stab.gles.fence = None;
             }

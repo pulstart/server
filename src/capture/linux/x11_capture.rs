@@ -6,8 +6,9 @@
 ///
 /// NOTE: Does NOT work on XWayland — the root window doesn't contain Wayland desktop content.
 /// On Wayland, use wlr-screencopy (grim) or PipeWire instead.
-use super::super::{CaptureBackend, CapturedCursor, CapturedFrame, FrameData, RamPool};
-use super::target_frame_interval;
+use super::super::{
+    CaptureBackend, CaptureControl, CapturedCursor, CapturedFrame, FrameData, RamPool,
+};
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -197,7 +198,11 @@ impl X11Capture {
 }
 
 impl CaptureBackend for X11Capture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("X11 capture already running".into());
         }
@@ -339,6 +344,7 @@ impl CaptureBackend for X11Capture {
             has_xfixes,
         };
 
+        let control = Arc::clone(control);
         let handle = thread::spawn(move || {
             st_protocol::thread_priority::promote_current_thread(
                 st_protocol::thread_priority::ThreadRole::Capture,
@@ -405,7 +411,7 @@ impl CaptureBackend for X11Capture {
 
                 // Re-read: adaptive fps retargets a running capture.
 
-                let target_interval = target_frame_interval();
+                let target_interval = control.frame_interval();
 
                 let elapsed = frame_start.elapsed();
                 if elapsed < target_interval {

@@ -1,7 +1,6 @@
 #![allow(non_snake_case)]
 
-use super::super::{CaptureBackend, CapturedFrame, FrameData, RamPool};
-use super::target_fps;
+use super::super::{CaptureBackend, CaptureControl, CapturedFrame, FrameData, RamPool};
 use crossbeam_channel::{Sender, TrySendError};
 use libloading::Library;
 use std::cell::Cell;
@@ -572,7 +571,11 @@ impl NvfbcCapture {
 }
 
 impl CaptureBackend for NvfbcCapture {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String> {
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("Capture already running".into());
         }
@@ -582,7 +585,7 @@ impl CaptureBackend for NvfbcCapture {
         if !status.can_create_now {
             return Err("Cannot create NVFBC capture session".into());
         }
-        capturer.start(target_fps())?;
+        capturer.start(control.target_fps())?;
 
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);

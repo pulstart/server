@@ -1,5 +1,4 @@
 use crossbeam_channel::Sender;
-use st_protocol::control::OutputInfo;
 
 #[cfg(target_os = "windows")]
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -8,61 +7,66 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-static TARGET_FPS: AtomicU32 = AtomicU32::new(60);
-static CAPTURE_KICK: AtomicBool = AtomicBool::new(false);
-
-/// Ask a damage-driven capture loop for a frame now: a keyframe request on a
-/// static screen would otherwise wait out the keepalive.
-pub fn kick_capture() {
-    CAPTURE_KICK.store(true, Ordering::Release);
+/// What one pipeline's encode loop tells its own capture loop. Each streamed
+/// output runs its own pipeline, so none of this may be process-global.
+pub struct CaptureControl {
+    target_fps: AtomicU32,
+    kick: AtomicBool,
+    unchanged_ticks: AtomicU32,
+    nv12_ram: AtomicBool,
 }
 
-#[cfg(target_os = "linux")]
-pub fn take_capture_kick() -> bool {
-    CAPTURE_KICK.swap(false, Ordering::AcqRel)
-}
-
-#[cfg(target_os = "linux")]
-static UNCHANGED_CAPTURE_TICKS: AtomicU32 = AtomicU32::new(0);
-
-/// Intentional damage skips are successful capture opportunities, not overload.
-#[cfg(target_os = "linux")]
-pub fn record_unchanged_capture_tick() {
-    UNCHANGED_CAPTURE_TICKS.fetch_add(1, Ordering::Relaxed);
-}
-
-#[cfg(target_os = "linux")]
-pub fn take_unchanged_capture_ticks() -> u32 {
-    UNCHANGED_CAPTURE_TICKS.swap(0, Ordering::Relaxed)
-}
-
-#[cfg(target_os = "linux")]
-static NV12_RAM_CLAIMS: AtomicU32 = AtomicU32::new(0);
-
-/// Held by an encoder that consumes [`FrameData::RamNv12`]. While any claim is
-/// alive, backends that already convert on the GPU emit NV12 instead of BGRA,
-/// cutting readback 62% and skipping a CPU colour conversion.
-#[cfg(target_os = "linux")]
-pub struct Nv12Claim(());
-
-#[cfg(target_os = "linux")]
-impl Nv12Claim {
-    pub fn new() -> Self {
-        NV12_RAM_CLAIMS.fetch_add(1, Ordering::AcqRel);
-        Self(())
+impl CaptureControl {
+    pub fn new(fps: u32) -> Arc<Self> {
+        Arc::new(Self {
+            target_fps: AtomicU32::new(fps.max(1)),
+            kick: AtomicBool::new(false),
+            unchanged_ticks: AtomicU32::new(0),
+            nv12_ram: AtomicBool::new(false),
+        })
     }
-}
 
-#[cfg(target_os = "linux")]
-impl Drop for Nv12Claim {
-    fn drop(&mut self) {
-        NV12_RAM_CLAIMS.fetch_sub(1, Ordering::AcqRel);
+    pub fn set_target_fps(&self, fps: u32) {
+        self.target_fps.store(fps.max(1), Ordering::Relaxed);
     }
-}
 
-#[cfg(target_os = "linux")]
-pub fn nv12_ram_preferred() -> bool {
-    NV12_RAM_CLAIMS.load(Ordering::Acquire) > 0
+    pub fn target_fps(&self) -> u32 {
+        self.target_fps.load(Ordering::Relaxed)
+    }
+
+    pub fn frame_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(1.0 / self.target_fps() as f64)
+    }
+
+    /// Ask a damage-driven capture loop for a frame now: a keyframe request on
+    /// a static screen would otherwise wait out the keepalive.
+    pub fn kick(&self) {
+        self.kick.store(true, Ordering::Release);
+    }
+
+    pub fn take_kick(&self) -> bool {
+        self.kick.swap(false, Ordering::AcqRel)
+    }
+
+    /// Intentional damage skips are successful capture opportunities, not overload.
+    pub fn record_unchanged_tick(&self) {
+        self.unchanged_ticks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn take_unchanged_ticks(&self) -> u32 {
+        self.unchanged_ticks.swap(0, Ordering::Relaxed)
+    }
+
+    /// Set while the pipeline's encoder consumes [`FrameData::RamNv12`]:
+    /// backends that already convert on the GPU then emit NV12 instead of
+    /// BGRA, cutting readback 62% and skipping a CPU colour conversion.
+    pub fn set_nv12_ram(&self, preferred: bool) {
+        self.nv12_ram.store(preferred, Ordering::Release);
+    }
+
+    pub fn nv12_ram(&self) -> bool {
+        self.nv12_ram.load(Ordering::Acquire)
+    }
 }
 
 /// A single plane of a DMA-BUF (GPU-accessible buffer exported via DRM).
@@ -436,31 +440,38 @@ pub fn composite_cursor_with_stride(
     }
 }
 
+/// One display a backend can capture, as the backend sees it. The desktop
+/// arrangement comes from the compositor (`crate::outputs`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureOutput {
+    pub id: u32,
+    pub name: String,
+    /// Scanout mode size.
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+    /// The scanout plane rotates the buffer itself, so captured frames are
+    /// upright whatever rotation the compositor reports.
+    pub plane_rotated: bool,
+}
+
 pub trait CaptureBackend: Send {
-    fn start(&mut self, tx: Sender<CapturedFrame>) -> Result<(), String>;
+    fn start(
+        &mut self,
+        tx: Sender<CapturedFrame>,
+        control: &Arc<CaptureControl>,
+    ) -> Result<(), String>;
     fn stop(&mut self);
 
     /// Displays this backend can capture. An empty list means the backend
     /// cannot enumerate outputs (the caller then treats the single active
     /// stream as the only "output" and hides the picker).
-    fn list_outputs(&self) -> Vec<OutputInfo> {
+    fn list_outputs(&self) -> Vec<CaptureOutput> {
         Vec::new()
     }
 
-    /// Select which output to capture, by `OutputInfo::id`. Returns `true` when
-    /// the selection actually changed and the capture must be restarted
-    /// (`stop()` then `start()`) for it to take effect.
-    fn select_output(&mut self, _id: u32) -> bool {
-        false
-    }
-}
-
-pub fn set_target_fps(fps: u32) {
-    TARGET_FPS.store(fps.max(1), Ordering::Relaxed);
-}
-
-pub fn target_fps() -> u32 {
-    TARGET_FPS.load(Ordering::Relaxed).max(1)
+    /// Pin the capture to one output, by `OutputInfo::id`, before `start()`.
+    fn select_output(&mut self, _id: u32) {}
 }
 
 /// Token bucket pacing frames to a target interval: one credit per interval,
@@ -507,6 +518,19 @@ impl FrameCredit {
 
     pub fn take(&mut self) {
         self.credit = (self.credit - 1.0).max(-1.0);
+    }
+}
+
+/// Outputs a new pipeline could be pinned to; empty when the platform's
+/// backend cannot pin one (the server then streams a single default output).
+pub fn enumerate_outputs() -> Vec<CaptureOutput> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::enumerate_outputs()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
     }
 }
 

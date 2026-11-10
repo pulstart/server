@@ -182,6 +182,32 @@ fn active_uid() -> Option<u32> {
     active_uid_from_loginctl().or_else(active_uid_from_seat_file)
 }
 
+/// Runtime dir of the active session's user: where its Wayland and PipeWire
+/// sockets live.
+pub fn active_runtime_dir() -> Option<std::path::PathBuf> {
+    Some(format!("/run/user/{}", active_uid()?).into())
+}
+
+/// Make `command` run inside the active session — as its user, against its
+/// runtime dir and Wayland socket — so compositor tools answer for the
+/// desktop being streamed. `None` when no user session is active.
+pub fn run_as_active_user(command: &mut std::process::Command) -> Option<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+    let run_dir = active_runtime_dir()?;
+    let metadata = std::fs::metadata(&run_dir).ok()?;
+    let (uid, gid) = (metadata.uid(), metadata.gid());
+    let wayland = std::fs::read_dir(&run_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .find(|name| name.starts_with("wayland-") && !name.ends_with(".lock"));
+    command.uid(uid).gid(gid).env("XDG_RUNTIME_DIR", &run_dir);
+    if let Some(wayland) = wayland {
+        command.env("WAYLAND_DISPLAY", wayland);
+    }
+    Some(())
+}
+
 fn active_uid_from_loginctl() -> Option<u32> {
     let session = loginctl_value(&["show-seat", "seat0", "--value", "-p", "ActiveSession"])?;
     if session.is_empty() {

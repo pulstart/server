@@ -544,6 +544,9 @@ impl EncoderConfig {
                 ChromaSampling::Yuv444 => VideoChromaSampling::Yuv444,
             },
             packet_duration_ms: audio.packet_duration_ms.min(u8::MAX as u32) as u8,
+            // Stamped with the epoch: only the pipeline knows its output.
+            output_id: 0,
+            rotation: 0,
         }
     }
 }

@@ -473,7 +473,9 @@ impl ServerControl {
         });
     }
 
-    pub fn register_client(self: &Arc<Self>, addr: SocketAddr) -> RegisteredClient {
+    /// `announce` raises the connect notice; a client's extra (aux) sessions
+    /// register quietly, or every monitor it shows would notify.
+    pub fn register_client(self: &Arc<Self>, addr: SocketAddr, announce: bool) -> RegisteredClient {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let disconnect_requested = Arc::new(AtomicBool::new(false));
         let snapshot = ConnectedClientSnapshot {
@@ -487,12 +489,14 @@ impl ServerControl {
         };
         self.clients.lock().unwrap().insert(id, entry);
         self.bump_version();
-        let body = format!("Client connected: {addr}");
-        if std::env::var_os("ST_SYSTEM_MODE").is_some() {
-            let mut notice = self.notice.lock().unwrap();
-            *notice = (notice.0 + 1, body);
-        } else {
-            show_notification(body);
+        if announce {
+            let body = format!("Client connected: {addr}");
+            if std::env::var_os("ST_SYSTEM_MODE").is_some() {
+                let mut notice = self.notice.lock().unwrap();
+                *notice = (notice.0 + 1, body);
+            } else {
+                show_notification(body);
+            }
         }
         RegisteredClient {
             snapshot,
