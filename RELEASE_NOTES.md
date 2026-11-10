@@ -1,3 +1,43 @@
+# 0.10.0
+
+Wire format changed: update hosts and clients together (client 0.13.0).
+
+- Multi-screen. A host with several monitors streams each of them: every
+  connection picks its output (the primary by default) and can move to
+  another one live, and a client with several monitors opens one stream
+  per monitor. Each streamed output has its own capture and encode
+  pipeline, started with its first viewer and stopped with its last.
+  Linux hosts on KMS capture; arrangement, rotation and the primary come
+  from KDE (kscreen-doctor). Rotated monitors are shown upright. Windows
+  and macOS hosts still stream one output.
+- Absolute mouse input landed in the wrong place on any host with more
+  than one monitor; it is now mapped into the streamed output's part of
+  the desktop.
+- A client with more screens than the host can ask for a virtual monitor
+  (KWin; opt-in with `ST_VIRTUAL_OUTPUT=1` until it has been validated on
+  a live desktop).
+- Sessions over the internet (hole-punched) no longer die after packet
+  loss. A lost control packet was retransmitted with a spent encryption
+  nonce, the client rejected every retransmit, and the next bitrate change
+  never reached it: video froze while packets kept arriving and the client
+  gave up a few seconds later.
+- Internet sessions start at 8 Mbit/s and climb while the link is clean
+  (they used to start at the LAN rate). Under heavy loss the bitrate drops
+  straight below what the link still carried instead of stepping down 20%
+  at a time for half a minute.
+- The host follows a client whose address changes mid-session (Wi-Fi to
+  mobile data, NAT rebind) when it is reachable from the new address
+  (router port mapping).
+- A client that leaves a hole-punched session says so; the host frees the
+  session at once instead of after 5 s of silence, so reconnecting right
+  away works.
+- After a failed poll of the signaling server the host retries in 1 s
+  instead of 10 s; it could not see connection requests while it waited.
+
+The multi-monitor capture path (output pinning, rotation, pointer mapping)
+has been exercised with synthetic outputs and unit tests, not yet on a
+live multi-monitor session.
+
 # 0.9.25
 
 Server-only release; no wire format change.
